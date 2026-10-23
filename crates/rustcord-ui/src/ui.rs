@@ -26,7 +26,16 @@ impl Fonts {
 }
 
 fn format_timestamp(iso: &str) -> String {
-    iso.get(11..16).unwrap_or("--:--").to_string()
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
+        .unwrap_or_else(|_| "--:--".to_string())
+}
+
+fn same_group_window(a: &str, b: &str) -> bool {
+    let (Ok(a), Ok(b)) = (chrono::DateTime::parse_from_rfc3339(a), chrono::DateTime::parse_from_rfc3339(b)) else {
+        return false;
+    };
+    (b - a).num_minutes().abs() < 5
 }
 
 fn draw_markdown(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, content: &str, revealed_spoilers: &mut std::collections::HashSet<usize>, id_seed: &str) {
@@ -184,6 +193,102 @@ fn scaled_image_size(natural: [f32; 2]) -> [f32; 2] {
 
 const AVATAR_SIZE: [f32; 2] = [40.0, 40.0];
 const MESSAGE_GAP: f32 = 12.0;
+const RAIL_WIDTH: f32 = 72.0;
+const RAIL_ICON_SIZE: [f32; 2] = [48.0, 48.0];
+const RAIL_PADDING_TOP: f32 = 12.0;
+const CHANNEL_LIST_WIDTH: f32 = 220.0;
+
+fn draw_rail_circle(ui: &Ui, color: [f32; 4]) {
+    let p_min = ui.cursor_screen_pos();
+    let p_max = [p_min[0] + RAIL_ICON_SIZE[0], p_min[1] + RAIL_ICON_SIZE[1]];
+    let center = [(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0];
+    ui.get_window_draw_list()
+        .add_circle(center, RAIL_ICON_SIZE[0] / 2.0, color)
+        .filled(true)
+        .build();
+}
+
+fn draw_circular_image_button_placeholder(ui: &Ui, id: &str, label: &str, size: [f32; 2]) -> bool {
+    let p_min = ui.cursor_screen_pos();
+    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
+    let center = [(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0];
+    let text_size = ui.calc_text_size(label);
+    ui.set_cursor_screen_pos([center[0] - text_size[0] / 2.0, center[1] - text_size[1] / 2.0]);
+    ui.text(label);
+    ui.set_cursor_screen_pos(p_min);
+    let clicked = ui.invisible_button(id, size);
+    if ui.is_item_hovered() {
+        ui.get_window_draw_list()
+            .add_circle(center, size[0].min(size[1]) / 2.0 + 2.0, [1.0, 1.0, 1.0, 0.5])
+            .thickness(2.0)
+            .build();
+    }
+    clicked
+}
+
+const USER_ROW_AVATAR_SIZE: [f32; 2] = [28.0, 28.0];
+
+fn draw_user_row(
+    ui: &Ui,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    user: &rustcord_client::models::User,
+    name: &str,
+    selected: bool,
+) -> bool {
+    let row_start = ui.cursor_pos();
+    let row_height = USER_ROW_AVATAR_SIZE[1] + 4.0;
+
+    let clicked = ui
+        .selectable_config(format!("##row_{}", user.id))
+        .selected(selected)
+        .size([0.0, row_height])
+        .build();
+
+    ui.set_cursor_pos([row_start[0] + 4.0, row_start[1] + 2.0]);
+    let avatar_url = rustcord_client::cdn::avatar_url(user, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+    if let Some((texture_id, _)) = textures.get(&avatar_url) {
+        draw_circular_image(ui, texture_id, USER_ROW_AVATAR_SIZE);
+    } else {
+        textures.request(&avatar_url, cmd_tx);
+        ui.dummy(USER_ROW_AVATAR_SIZE);
+    }
+    ui.same_line();
+    let text_x = ui.cursor_pos()[0];
+    ui.set_cursor_pos([text_x, row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0]);
+    ui.text(name);
+
+    ui.set_cursor_pos([row_start[0], row_start[1] + row_height]);
+    clicked
+}
+
+fn draw_circular_image(ui: &Ui, texture_id: imgui::TextureId, size: [f32; 2]) {
+    let p_min = ui.cursor_screen_pos();
+    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
+    ui.get_window_draw_list()
+        .add_image_rounded(texture_id, p_min, p_max, size[0].min(size[1]) / 2.0)
+        .build();
+    ui.dummy(size);
+}
+
+fn draw_circular_image_button(ui: &Ui, id: &str, texture_id: imgui::TextureId, size: [f32; 2]) -> bool {
+    let p_min = ui.cursor_screen_pos();
+    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_image_rounded(texture_id, p_min, p_max, size[0].min(size[1]) / 2.0).build();
+    let clicked = ui.invisible_button(id, size);
+    if ui.is_item_hovered() {
+        draw_list
+            .add_circle(
+                [(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0],
+                size[0].min(size[1]) / 2.0 + 2.0,
+                [1.0, 1.0, 1.0, 0.5],
+            )
+            .thickness(2.0)
+            .build();
+    }
+    clicked
+}
 
 fn draw_attachment(
     ui: &Ui,
@@ -216,36 +321,40 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
     ui.window("servers")
         .position([0.0, 0.0], imgui::Condition::Always)
-        .size([64.0, display_h], imgui::Condition::Always)
+        .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
         .no_decoration()
         .draw_background(true)
         .build(|| {
-            let dm_button_color = if state.selected_guild.is_none() {
-                state.theme.accent_hover
-            } else {
-                state.theme.accent
-            };
-            let token = ui.push_style_color(imgui::StyleColor::Button, dm_button_color);
-            if ui.button_with_size("DM", [48.0, 48.0]) {
+            let rail_center_x = (RAIL_WIDTH - RAIL_ICON_SIZE[0]) / 2.0;
+
+            ui.set_cursor_pos([rail_center_x, RAIL_PADDING_TOP]);
+            let dm_color = if state.selected_guild.is_none() { state.theme.accent_hover } else { state.theme.accent };
+            draw_rail_circle(ui, dm_color);
+            if draw_circular_image_button_placeholder(ui, "dm_button", "DM", RAIL_ICON_SIZE) {
                 state.selected_guild = None;
                 state.selected_channel = None;
             }
-            token.pop();
+
+            ui.set_cursor_pos([8.0, RAIL_PADDING_TOP + RAIL_ICON_SIZE[1] + 8.0]);
             ui.separator();
+            let after_separator_y = ui.cursor_pos()[1];
+            ui.set_cursor_pos([rail_center_x, after_separator_y]);
 
             for guild in &state.guilds {
                 let icon_url = rustcord_client::cdn::guild_icon_url(guild, 64);
                 let clicked = if let Some(url) = &icon_url {
                     if let Some((texture_id, _)) = textures.get(url) {
-                        ui.image_button(format!("guild_icon_{}", guild.id), texture_id, [48.0, 48.0])
+                        draw_circular_image_button(ui, &format!("guild_icon_{}", guild.id), texture_id, RAIL_ICON_SIZE)
                     } else {
                         textures.request(url, cmd_tx);
                         let label = guild.name.chars().take(2).collect::<String>();
-                        ui.button_with_size(&label, [48.0, 48.0])
+                        draw_rail_circle(ui, state.theme.panel);
+                        draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, RAIL_ICON_SIZE)
                     }
                 } else {
                     let label = guild.name.chars().take(2).collect::<String>();
-                    ui.button_with_size(&label, [48.0, 48.0])
+                    draw_rail_circle(ui, state.theme.panel);
+                    draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, RAIL_ICON_SIZE)
                 };
                 if clicked {
                     let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild.id.clone() });
@@ -255,20 +364,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 if ui.is_item_hovered() {
                     ui.tooltip_text(&guild.name);
                 }
-            }
-            ui.set_cursor_pos([8.0, display_h - 56.0]);
-            if ui.button_with_size("Out", [48.0, 48.0]) {
-                let _ = cmd_tx.send(UiCommand::Logout);
-                *state = AppState {
-                    theme: state.theme.clone(),
-                    ..Default::default()
-                };
+                let next_y = ui.cursor_pos()[1];
+                ui.set_cursor_pos([rail_center_x, next_y]);
             }
         });
 
     ui.window("channels")
-        .position([64.0, 0.0], imgui::Condition::Always)
-        .size([200.0, display_h], imgui::Condition::Always)
+        .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
+        .size([CHANNEL_LIST_WIDTH, display_h], imgui::Condition::Always)
         .no_decoration()
         .draw_background(true)
         .build(|| {
@@ -315,30 +418,34 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 ui.separator();
 
                 if state.show_friends_list {
-                    let friends: Vec<(String, String)> = state
-                        .friends()
-                        .into_iter()
-                        .map(|r| (r.user.id.clone(), r.user.global_name.clone().unwrap_or_else(|| r.user.username.clone())))
-                        .collect();
+                    let friends: Vec<rustcord_client::models::User> =
+                        state.friends().into_iter().map(|r| r.user.clone()).collect();
                     if friends.is_empty() {
                         ui.text_disabled("No friends found.");
                     }
-                    for (user_id, name) in &friends {
-                        if ui.selectable(name) {
-                            let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user_id.clone() });
+                    for user in &friends {
+                        let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+                        if draw_user_row(ui, cmd_tx, textures, user, &name, false) {
+                            let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
                         }
                     }
                 } else {
-                    let dms: Vec<(String, String)> = state
+                    let dms: Vec<(String, String, Option<rustcord_client::models::User>)> = state
                         .filtered_dm_channels()
                         .into_iter()
-                        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm)))
+                        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned()))
                         .collect();
                     if dms.is_empty() {
                         ui.text_disabled("No direct messages.");
                     }
-                    for (channel_id, name) in &dms {
-                        if ui.selectable(name) {
+                    for (channel_id, name, recipient) in &dms {
+                        let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
+                        let clicked = if let Some(user) = recipient {
+                            draw_user_row(ui, cmd_tx, textures, user, name, is_selected)
+                        } else {
+                            ui.selectable_config(name).selected(is_selected).build()
+                        };
+                        if clicked {
                             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
                             state.selected_channel = Some(channel_id.clone());
                         }
@@ -354,8 +461,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_settings_dialog(ui, state, cmd_tx);
 
     ui.window("chat")
-        .position([264.0, 0.0], imgui::Condition::Always)
-        .size([display_w - 264.0, display_h], imgui::Condition::Always)
+        .position([RAIL_WIDTH + CHANNEL_LIST_WIDTH, 0.0], imgui::Condition::Always)
+        .size([display_w - RAIL_WIDTH - CHANNEL_LIST_WIDTH, display_h], imgui::Condition::Always)
         .no_decoration()
         .draw_background(true)
         .build(|| {
@@ -376,41 +483,71 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         ui.text_disabled("Loading older messages...");
                     }
 
-                    for msg in &messages {
-                        let author = msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
-                        let avatar_url = rustcord_client::cdn::avatar_url(&msg.author, 64)
-                            .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&msg.author));
+                    let content_x_offset = AVATAR_SIZE[0] + 12.0;
+
+                    for (idx, msg) in messages.iter().enumerate() {
+                        let starts_group = match messages.get(idx.wrapping_sub(1)) {
+                            Some(prev) if idx > 0 => {
+                                prev.author.id != msg.author.id || !same_group_window(&prev.timestamp, &msg.timestamp)
+                            }
+                            _ => true,
+                        };
 
                         let row_start = ui.cursor_pos();
-                        if let Some((texture_id, _)) = textures.get(&avatar_url) {
-                            imgui::Image::new(texture_id, AVATAR_SIZE).build(ui);
+
+                        if starts_group {
+                            let author = msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
+                            let avatar_url = rustcord_client::cdn::avatar_url(&msg.author, 64)
+                                .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&msg.author));
+
+                            if let Some((texture_id, _)) = textures.get(&avatar_url) {
+                                draw_circular_image(ui, texture_id, AVATAR_SIZE);
+                            } else {
+                                textures.request(&avatar_url, cmd_tx);
+                                ui.dummy(AVATAR_SIZE);
+                            }
+
+                            ui.set_cursor_pos([row_start[0] + content_x_offset, row_start[1]]);
+                            ui.group(|| {
+                                ui.text_colored(state.theme.accent, &author);
+                                ui.same_line();
+                                let time = format_timestamp(&msg.timestamp);
+                                let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+                                ui.set_window_font_scale(0.85);
+                                ui.text(time);
+                                ui.set_window_font_scale(1.0);
+                                token.pop();
+
+                                if !msg.content.is_empty() {
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
+                                }
+                                for attachment in &msg.attachments {
+                                    draw_attachment(ui, cmd_tx, textures, attachment);
+                                }
+                            });
+
+                            let group_height = AVATAR_SIZE[1].max(ui.item_rect_size()[1]);
+                            ui.set_cursor_pos([row_start[0], row_start[1] + group_height]);
                         } else {
-                            textures.request(&avatar_url, cmd_tx);
-                            ui.dummy(AVATAR_SIZE);
+                            ui.set_cursor_pos([row_start[0] + content_x_offset, row_start[1]]);
+                            ui.group(|| {
+                                if !msg.content.is_empty() {
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
+                                }
+                                for attachment in &msg.attachments {
+                                    draw_attachment(ui, cmd_tx, textures, attachment);
+                                }
+                            });
+                            ui.set_cursor_pos([row_start[0], row_start[1] + ui.item_rect_size()[1]]);
                         }
 
-                        ui.set_cursor_pos([row_start[0] + AVATAR_SIZE[0] + 12.0, row_start[1]]);
-                        ui.group(|| {
-                            ui.text_colored(state.theme.accent, &author);
-                            ui.same_line();
-                            let time = format_timestamp(&msg.timestamp);
-                            let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-                            ui.set_window_font_scale(0.85);
-                            ui.text(time);
-                            ui.set_window_font_scale(1.0);
-                            token.pop();
-
-                            if !msg.content.is_empty() {
-                                draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
+                        let next_starts_group = match messages.get(idx + 1) {
+                            Some(next) => {
+                                next.author.id != msg.author.id || !same_group_window(&msg.timestamp, &next.timestamp)
                             }
-
-                            for attachment in &msg.attachments {
-                                draw_attachment(ui, cmd_tx, textures, attachment);
-                            }
-                        });
-
-                        ui.set_cursor_pos([row_start[0], row_start[1] + AVATAR_SIZE[1].max(ui.item_rect_size()[1])]);
-                        ui.dummy([0.0, MESSAGE_GAP]);
+                            None => true,
+                        };
+                        ui.dummy([0.0, if next_starts_group { MESSAGE_GAP } else { 2.0 }]);
                     }
 
                     let scroll_y = ui.scroll_y();
@@ -515,7 +652,7 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     let avatar_url =
         rustcord_client::cdn::avatar_url(&user, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
     if let Some((texture_id, _)) = textures.get(&avatar_url) {
-        imgui::Image::new(texture_id, [28.0, 28.0]).build(ui);
+        draw_circular_image(ui, texture_id, [28.0, 28.0]);
     } else {
         textures.request(&avatar_url, cmd_tx);
         ui.dummy([28.0, 28.0]);
