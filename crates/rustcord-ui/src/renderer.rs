@@ -75,11 +75,14 @@ impl AppWindow {
         platform.attach_window(context.io_mut(), &window, HiDpiMode::Default);
         context.set_ini_filename(None);
 
-        let font_size = (13.0 * hidpi_factor) as f32;
+        let font_size = (16.0 * hidpi_factor) as f32;
         context.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        context.fonts().add_font(&[FontSource::DefaultFontData {
+        context.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+            size_pixels: font_size,
             config: Some(FontConfig {
-                oversample_h: 1,
+                oversample_h: 2,
+                oversample_v: 2,
                 pixel_snap_h: true,
                 size_pixels: font_size,
                 ..Default::default()

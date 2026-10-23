@@ -65,6 +65,23 @@ pub struct Message {
     pub mentions: Vec<User>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]
+#[repr(u8)]
+pub enum RelationshipType {
+    Friend = 1,
+    Blocked = 2,
+    IncomingRequest = 3,
+    OutgoingRequest = 4,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Relationship {
+    pub id: Snowflake,
+    #[serde(rename = "type")]
+    pub kind: RelationshipType,
+    pub user: User,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Attachment {
     pub id: Snowflake,

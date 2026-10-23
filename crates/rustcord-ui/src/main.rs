@@ -73,6 +73,18 @@ pub fn drain_backend_events(state: &mut AppState, event_rx: &mut mpsc::Unbounded
             BackendEvent::MessagesLoaded { channel_id, messages } => {
                 state.messages.insert(channel_id, messages);
             }
+            BackendEvent::RelationshipsLoaded(relationships) => {
+                state.relationships = relationships;
+            }
+            BackendEvent::DmOpened(channel) => {
+                let channel_id = channel.id.clone();
+                if !state.dm_channels.iter().any(|c| c.id == channel.id) {
+                    state.dm_channels.insert(0, channel);
+                }
+                state.selected_guild = None;
+                state.selected_channel = Some(channel_id);
+                state.show_friends_list = false;
+            }
         }
     }
 }

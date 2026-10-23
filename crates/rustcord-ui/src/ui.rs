@@ -17,11 +17,25 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) 
         .no_decoration()
         .draw_background(true)
         .build(|| {
+            let dm_button_color = if state.selected_guild.is_none() {
+                state.theme.accent_hover
+            } else {
+                state.theme.accent
+            };
+            let token = ui.push_style_color(imgui::StyleColor::Button, dm_button_color);
+            if ui.button_with_size("DM", [48.0, 48.0]) {
+                state.selected_guild = None;
+                state.selected_channel = None;
+            }
+            token.pop();
+            ui.separator();
+
             for guild in &state.guilds {
                 let label = guild.name.chars().take(2).collect::<String>();
                 if ui.button_with_size(&label, [48.0, 48.0]) {
                     let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild.id.clone() });
                     state.selected_guild = Some(guild.id.clone());
+                    state.selected_channel = None;
                 }
             }
             ui.set_cursor_pos([8.0, display_h - 56.0]);
@@ -41,32 +55,74 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) 
         .draw_background(true)
         .build(|| {
             if state.selected_guild.is_some() {
-                let channels: Vec<(String, String)> = state
-                    .text_channels_for_selected_guild()
+                let groups: Vec<(Option<String>, Vec<(String, String)>)> = state
+                    .grouped_channels_for_selected_guild()
                     .into_iter()
-                    .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone())))
+                    .map(|g| {
+                        let channels = g
+                            .channels
+                            .into_iter()
+                            .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone())))
+                            .collect();
+                        (g.name.map(str::to_string), channels)
+                    })
                     .collect();
-                if channels.is_empty() {
+                if groups.is_empty() {
                     ui.text_disabled("No text channels loaded yet.");
                 }
-                for (channel_id, name) in &channels {
-                    if ui.selectable(format!("# {name}")) {
-                        let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
-                        state.selected_channel = Some(channel_id.clone());
+                for (category_name, channels) in &groups {
+                    if let Some(name) = category_name {
+                        ui.spacing();
+                        let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+                        ui.text(name.to_uppercase());
+                        token.pop();
+                    }
+                    for (channel_id, name) in channels {
+                        if ui.selectable(format!("# {name}")) {
+                            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+                            state.selected_channel = Some(channel_id.clone());
+                        }
                     }
                 }
             } else {
-                ui.text("Direct Messages");
+                ui.input_text("##search", &mut state.dm_search)
+                    .hint("Search friends or DMs")
+                    .build();
+
+                let friends_label = if state.show_friends_list { "< Back to DMs" } else { "Friends" };
+                if ui.selectable(friends_label) {
+                    state.show_friends_list = !state.show_friends_list;
+                }
                 ui.separator();
-                for dm in &state.dm_channels {
-                    let name = dm
-                        .recipients
-                        .first()
-                        .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
-                        .unwrap_or_else(|| dm.id.clone());
-                    if ui.selectable(&name) {
-                        let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: dm.id.clone() });
-                        state.selected_channel = Some(dm.id.clone());
+
+                if state.show_friends_list {
+                    let friends: Vec<(String, String)> = state
+                        .friends()
+                        .into_iter()
+                        .map(|r| (r.user.id.clone(), r.user.global_name.clone().unwrap_or_else(|| r.user.username.clone())))
+                        .collect();
+                    if friends.is_empty() {
+                        ui.text_disabled("No friends found.");
+                    }
+                    for (user_id, name) in &friends {
+                        if ui.selectable(name) {
+                            let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user_id.clone() });
+                        }
+                    }
+                } else {
+                    let dms: Vec<(String, String)> = state
+                        .filtered_dm_channels()
+                        .into_iter()
+                        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm)))
+                        .collect();
+                    if dms.is_empty() {
+                        ui.text_disabled("No direct messages.");
+                    }
+                    for (channel_id, name) in &dms {
+                        if ui.selectable(name) {
+                            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+                            state.selected_channel = Some(channel_id.clone());
+                        }
                     }
                 }
             }

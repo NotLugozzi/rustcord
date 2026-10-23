@@ -163,6 +163,18 @@ impl RestClient {
         self.get("/users/@me/channels").await
     }
 
+    pub async fn relationships(&self) -> Result<Vec<crate::models::Relationship>, ClientError> {
+        self.get("/users/@me/relationships").await
+    }
+
+    pub async fn create_dm(&self, recipient_id: &str) -> Result<Channel, ClientError> {
+        #[derive(Serialize)]
+        struct Body<'a> {
+            recipient_id: &'a str,
+        }
+        self.post("/users/@me/channels", &Body { recipient_id }).await
+    }
+
     pub async fn guild_channels(&self, guild_id: &str) -> Result<Vec<Channel>, ClientError> {
         self.get(&format!("/guilds/{guild_id}/channels")).await
     }

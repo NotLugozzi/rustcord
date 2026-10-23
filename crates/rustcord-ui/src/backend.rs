@@ -12,6 +12,7 @@ pub enum UiCommand {
     SelectGuild { guild_id: String },
     SelectChannel { channel_id: String },
     SendMessage { channel_id: String, content: String },
+    OpenDmWithUser { user_id: String },
     Logout,
 }
 
@@ -25,6 +26,8 @@ pub enum BackendEvent {
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
     MessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
+    RelationshipsLoaded(Vec<rustcord_client::models::Relationship>),
+    DmOpened(rustcord_client::models::Channel),
 }
 
 pub fn spawn(
@@ -98,6 +101,19 @@ pub fn spawn(
                 }
                 UiCommand::LoginWithToken { token } => {
                     start_session(token, &mut rest, &event_tx).await;
+                }
+                UiCommand::OpenDmWithUser { user_id } => {
+                    if let Some(client) = &rest {
+                        match client.create_dm(&user_id).await {
+                            Ok(channel) => {
+                                let _ = event_tx.send(BackendEvent::DmOpened(channel));
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to open dm with {user_id}: {e}");
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to open DM: {e}")));
+                            }
+                        }
+                    }
                 }
                 UiCommand::Logout => {
                     session_store::clear_token();
@@ -192,5 +208,9 @@ async fn start_session(
 
     if let Ok(dms) = client.dm_channels().await {
         let _ = event_tx.send(BackendEvent::DmChannelsLoaded(dms));
+    }
+
+    if let Ok(relationships) = client.relationships().await {
+        let _ = event_tx.send(BackendEvent::RelationshipsLoaded(relationships));
     }
 }
