@@ -17,14 +17,21 @@ Use at your own risk.
 - [x] Gateway connection, READY/MESSAGE_CREATE handling
 - [x] Server list, channel list (grouped by category), DM list, chat view
 - [x] Friends list, DM/friend search
-- [x] Sending messages
-- [x] TOML-based theming
+- [x] Sending messages, chronologically ordered with timestamps, scrollback (load older history)
+- [x] Image/GIF attachments: receive (static + animated, up to 3 concurrent animations) and send
+- [x] DM list sorted by most recent activity
+- [x] TOML-based theming (switchable live from Settings)
 - [x] Persisted login (OS keychain)
+- [x] Markdown: bold, italic, strikethrough, underline, spoilers, blockquotes, headers, inline/block code, links
+- [x] Typing indicators (send + receive)
+- [x] Real avatars (users) and guild icons
+- [x] User bar with settings dialog (account info, logout, theme switcher)
 - [ ] Per-channel permission filtering (all guild channels show regardless of your actual access)
+- [ ] Custom emote rendering/sending
 - [ ] Voice calls (not yet implemented)
-- [ ] Message editing/deleting, reactions, typing indicators
-- [ ] Attachments/embeds rendering
-- [ ] Real avatars/guild icons (currently text initials)
+- [ ] Message editing/deleting, reactions
+- [ ] Non-image attachments/embeds rendering
+- [ ] Guild folders
 
 ## Build prerequisites (Linux)
 

@@ -183,12 +183,81 @@ impl RestClient {
         self.get(&format!("/channels/{channel_id}/messages?limit={limit}")).await
     }
 
+    pub async fn messages_before(
+        &self,
+        channel_id: &str,
+        before: &str,
+        limit: u32,
+    ) -> Result<Vec<Message>, ClientError> {
+        self.get(&format!("/channels/{channel_id}/messages?limit={limit}&before={before}")).await
+    }
+
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message, ClientError> {
         #[derive(Serialize)]
         struct Body<'a> {
             content: &'a str,
         }
         self.post(&format!("/channels/{channel_id}/messages"), &Body { content }).await
+    }
+
+    pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/channels/{channel_id}/typing"))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
+    pub async fn send_message_with_attachment(
+        &self,
+        channel_id: &str,
+        content: &str,
+        filename: &str,
+        file_bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<Message, ClientError> {
+        #[derive(Serialize)]
+        struct PayloadAttachment<'a> {
+            id: u32,
+            filename: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Payload<'a> {
+            content: &'a str,
+            attachments: Vec<PayloadAttachment<'a>>,
+        }
+        let payload = Payload {
+            content,
+            attachments: vec![PayloadAttachment { id: 0, filename }],
+        };
+        let payload_json = serde_json::to_string(&payload)?;
+
+        let file_part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename.to_string())
+            .mime_str(content_type)
+            .map_err(|e| ClientError::Api { status: 0, message: e.to_string() })?;
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", payload_json)
+            .part("files[0]", file_part);
+
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/channels/{channel_id}/messages"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(resp.json::<Message>().await?)
     }
 
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {

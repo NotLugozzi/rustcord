@@ -13,6 +13,7 @@ const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 pub enum GatewayEvent {
     Ready { user: User, guilds: Vec<Guild> },
     MessageCreate(Message),
+    TypingStart { channel_id: String, user_id: String },
     Unknown { op_name: String, raw: Value },
 }
 
@@ -117,6 +118,11 @@ impl Gateway {
             Some("MESSAGE_CREATE") => {
                 let message: Message = serde_json::from_value(data)?;
                 GatewayEvent::MessageCreate(message)
+            }
+            Some("TYPING_START") => {
+                let channel_id = data["channel_id"].as_str().unwrap_or_default().to_string();
+                let user_id = data["user_id"].as_str().unwrap_or_default().to_string();
+                GatewayEvent::TypingStart { channel_id, user_id }
             }
             Some(other) => GatewayEvent::Unknown { op_name: other.to_string(), raw: data },
             None => return Ok(()),

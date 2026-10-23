@@ -5,14 +5,28 @@ use rustcord_client::gateway::{Gateway, GatewayEvent};
 use rustcord_client::rest::{CaptchaChallenge, LoginResponse, LoginSession, RestClient};
 use tokio::sync::mpsc;
 
+fn mime_guess_from_path(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
 pub enum UiCommand {
     LoginWithPassword { email: String, password: String },
     LoginWithToken { token: String },
     SubmitMfa { ticket: String, code: String },
     SelectGuild { guild_id: String },
     SelectChannel { channel_id: String },
+    LoadOlderMessages { channel_id: String, before: String },
     SendMessage { channel_id: String, content: String },
+    SendAttachment { channel_id: String, content: String, path: std::path::PathBuf },
+    DownloadImage { url: String },
     OpenDmWithUser { user_id: String },
+    StartTyping { channel_id: String },
     Logout,
 }
 
@@ -26,8 +40,10 @@ pub enum BackendEvent {
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
     MessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
+    OlderMessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
     RelationshipsLoaded(Vec<rustcord_client::models::Relationship>),
     DmOpened(rustcord_client::models::Channel),
+    ImageDownloaded { url: String, bytes: Vec<u8> },
 }
 
 pub fn spawn(
@@ -91,11 +107,68 @@ pub fn spawn(
                         }
                     }
                 }
+                UiCommand::LoadOlderMessages { channel_id, before } => {
+                    if let Some(client) = &rest {
+                        match client.messages_before(&channel_id, &before, 50).await {
+                            Ok(messages) => {
+                                let _ = event_tx.send(BackendEvent::OlderMessagesLoaded { channel_id, messages });
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to load older messages for {channel_id}: {e}");
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to load older messages: {e}")));
+                            }
+                        }
+                    }
+                }
                 UiCommand::SendMessage { channel_id, content } => {
                     if let Some(client) = &rest {
                         if let Err(e) = client.send_message(&channel_id, &content).await {
                             tracing::warn!("send failed: {e}");
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to send message: {e}")));
+                        }
+                    }
+                }
+                UiCommand::SendAttachment { channel_id, content, path } => {
+                    if let Some(client) = &rest {
+                        let filename = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "file".into());
+                        let content_type = mime_guess_from_path(&path);
+                        match tokio::fs::read(&path).await {
+                            Ok(bytes) => {
+                                if let Err(e) = client
+                                    .send_message_with_attachment(&channel_id, &content, &filename, bytes, content_type)
+                                    .await
+                                {
+                                    tracing::warn!("attachment send failed: {e}");
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachment: {e}")));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to read file: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::DownloadImage { url } => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        match reqwest::get(&url).await.and_then(|r| r.error_for_status()) {
+                            Ok(resp) => match resp.bytes().await {
+                                Ok(bytes) => {
+                                    let _ = event_tx.send(BackendEvent::ImageDownloaded { url, bytes: bytes.to_vec() });
+                                }
+                                Err(e) => tracing::warn!("failed to read image bytes for {url}: {e}"),
+                            },
+                            Err(e) => tracing::warn!("failed to download image {url}: {e}"),
+                        }
+                    });
+                }
+                UiCommand::StartTyping { channel_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.trigger_typing(&channel_id).await {
+                            tracing::warn!("failed to send typing indicator: {e}");
                         }
                     }
                 }

@@ -1,6 +1,7 @@
 use crate::app_state::AppState;
 use crate::backend::{BackendEvent, UiCommand};
 use crate::drain_backend_events;
+use crate::images::TextureCache;
 use crate::ui;
 use imgui::{FontConfig, FontSource};
 use imgui_wgpu::{Renderer, RendererConfig};
@@ -21,6 +22,7 @@ struct ImguiState {
     renderer: Renderer,
     last_frame: Instant,
     last_cursor: Option<imgui::MouseCursor>,
+    fonts: crate::ui::Fonts,
 }
 
 struct AppWindow {
@@ -31,6 +33,7 @@ struct AppWindow {
     surface: wgpu::Surface<'static>,
     hidpi_factor: f64,
     imgui: ImguiState,
+    textures: TextureCache,
 }
 
 impl AppWindow {
@@ -76,18 +79,46 @@ impl AppWindow {
         context.set_ini_filename(None);
 
         let font_size = (16.0 * hidpi_factor) as f32;
+        let mono_size = (14.0 * hidpi_factor) as f32;
         context.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        context.fonts().add_font(&[FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
-            size_pixels: font_size,
-            config: Some(FontConfig {
+
+        let make_config = |size_pixels: f32| {
+            Some(FontConfig {
                 oversample_h: 2,
                 oversample_v: 2,
                 pixel_snap_h: true,
-                size_pixels: font_size,
+                size_pixels,
                 ..Default::default()
-            }),
+            })
+        };
+
+        let regular = context.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+            size_pixels: font_size,
+            config: make_config(font_size),
         }]);
+        let bold = context.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+            size_pixels: font_size,
+            config: make_config(font_size),
+        }]);
+        let italic = context.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/Inter-Italic.ttf"),
+            size_pixels: font_size,
+            config: make_config(font_size),
+        }]);
+        let bold_italic = context.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"),
+            size_pixels: font_size,
+            config: make_config(font_size),
+        }]);
+        let mono = context.fonts().add_font(&[FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+            size_pixels: mono_size,
+            config: make_config(mono_size),
+        }]);
+
+        let fonts = crate::ui::Fonts { regular, bold, italic, bold_italic, mono };
 
         let renderer_config = RendererConfig {
             texture_format: surface_desc.format,
@@ -101,6 +132,7 @@ impl AppWindow {
             renderer,
             last_frame: Instant::now(),
             last_cursor: None,
+            fonts,
         };
 
         Self {
@@ -111,6 +143,7 @@ impl AppWindow {
             surface,
             hidpi_factor: hidpi_factor,
             imgui,
+            textures: TextureCache::default(),
         }
     }
 
@@ -124,7 +157,11 @@ impl AppWindow {
     }
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
-        drain_backend_events(state, event_rx);
+        let image_downloads = drain_backend_events(state, event_rx);
+        for (url, bytes) in image_downloads {
+            self.textures.ingest(url, &bytes, &self.device, &self.queue, &mut self.imgui.renderer);
+        }
+        self.textures.tick();
 
         let imgui = &mut self.imgui;
         let now = Instant::now();
@@ -145,8 +182,11 @@ impl AppWindow {
             .prepare_frame(imgui.context.io_mut(), &self.window)
             .expect("prepare_frame failed");
 
+        state.theme.apply(imgui.context.style_mut());
+
+        let fonts = imgui.fonts;
         let frame_ui = imgui.context.frame();
-        ui::draw(frame_ui, state, cmd_tx);
+        ui::draw(frame_ui, state, cmd_tx, &mut self.textures, &fonts);
 
         if imgui.last_cursor != frame_ui.mouse_cursor() {
             imgui.last_cursor = frame_ui.mouse_cursor();

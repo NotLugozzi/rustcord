@@ -1,6 +1,10 @@
 use rustcord_client::models::{Channel, ChannelType, Guild, Message, Relationship, RelationshipType, User};
 use std::collections::HashMap;
 
+fn snowflake_value(id: &str) -> u64 {
+    id.parse().unwrap_or(0)
+}
+
 pub struct ChannelGroup<'a> {
     pub name: Option<&'a str>,
     pub channels: Vec<&'a Channel>,
@@ -28,14 +32,73 @@ pub struct AppState {
     pub logged_in: bool,
     pub theme: crate::theme::Theme,
     pub status_message: Option<String>,
+    pub last_seen_message_count: HashMap<String, usize>,
+    pub loading_older_messages: bool,
+    pub pending_attachment: Option<std::path::PathBuf>,
+    pub revealed_spoilers: std::collections::HashSet<usize>,
+    pub typing_users: HashMap<String, HashMap<String, std::time::Instant>>,
+    pub last_typing_sent: Option<std::time::Instant>,
+    pub show_settings: bool,
 }
 
+const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl AppState {
-    pub fn push_message(&mut self, message: Message) {
-        self.messages
-            .entry(message.channel_id.clone())
+    pub fn note_typing(&mut self, channel_id: String, user_id: String) {
+        self.typing_users
+            .entry(channel_id)
             .or_default()
-            .push(message);
+            .insert(user_id, std::time::Instant::now());
+    }
+
+    pub fn typing_users_for(&self, channel_id: &str) -> Vec<&str> {
+        let Some(users) = self.typing_users.get(channel_id) else { return Vec::new() };
+        let now = std::time::Instant::now();
+        users
+            .iter()
+            .filter(|(_, started)| now.duration_since(**started) < TYPING_EXPIRY)
+            .map(|(user_id, _)| user_id.as_str())
+            .collect()
+    }
+
+    pub fn typing_display_name(&self, channel_id: &str, user_id: &str) -> String {
+        if let Some(dm) = self.dm_channels.iter().find(|c| c.id == channel_id) {
+            if let Some(user) = dm.recipients.iter().find(|u| u.id == user_id) {
+                return user.global_name.clone().unwrap_or_else(|| user.username.clone());
+            }
+        }
+        if let Some(messages) = self.messages.get(channel_id) {
+            if let Some(msg) = messages.iter().rev().find(|m| m.author.id == user_id) {
+                return msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
+            }
+        }
+        "Someone".to_string()
+    }
+
+    pub fn push_message(&mut self, message: Message) {
+        if let Some(dm) = self.dm_channels.iter_mut().find(|c| c.id == message.channel_id) {
+            dm.last_message_id = Some(message.id.clone());
+        }
+        let list = self.messages.entry(message.channel_id.clone()).or_default();
+        let new_id = snowflake_value(&message.id);
+        let insert_at = list.partition_point(|m| snowflake_value(&m.id) <= new_id);
+        list.insert(insert_at, message);
+    }
+
+    pub fn set_message_history(&mut self, channel_id: String, mut messages: Vec<Message>) {
+        messages.sort_by_key(|m| snowflake_value(&m.id));
+        self.messages.insert(channel_id, messages);
+    }
+
+    pub fn prepend_message_history(&mut self, channel_id: String, mut older: Vec<Message>) {
+        older.sort_by_key(|m| snowflake_value(&m.id));
+        let existing = self.messages.entry(channel_id).or_default();
+        older.extend(std::mem::take(existing));
+        *existing = older;
+    }
+
+    pub fn last_message_timestamp(&self, channel_id: &str) -> Option<&str> {
+        self.messages.get(channel_id)?.last().map(|m| m.timestamp.as_str())
     }
 
     pub fn active_messages(&self) -> &[Message] {
@@ -55,10 +118,15 @@ impl AppState {
 
     pub fn filtered_dm_channels(&self) -> Vec<&Channel> {
         let query = self.dm_search.trim().to_lowercase();
-        self.dm_channels
+        let mut dms: Vec<&Channel> = self
+            .dm_channels
             .iter()
             .filter(|dm| query.is_empty() || Self::dm_display_name(dm).to_lowercase().contains(&query))
-            .collect()
+            .collect();
+        dms.sort_by_key(|dm| {
+            std::cmp::Reverse(dm.last_message_id.as_deref().map(snowflake_value).unwrap_or(0))
+        });
+        dms
     }
 
     pub fn friends(&self) -> Vec<&Relationship> {

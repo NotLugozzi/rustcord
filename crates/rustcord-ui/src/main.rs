@@ -1,5 +1,7 @@
 mod app_state;
 mod backend;
+mod images;
+mod markdown;
 mod renderer;
 mod session_store;
 mod theme;
@@ -34,7 +36,11 @@ fn main() {
     renderer::run(state, cmd_tx, event_rx);
 }
 
-pub fn drain_backend_events(state: &mut AppState, event_rx: &mut mpsc::UnboundedReceiver<BackendEvent>) {
+pub fn drain_backend_events(
+    state: &mut AppState,
+    event_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+) -> Vec<(String, Vec<u8>)> {
+    let mut image_downloads = Vec::new();
     while let Ok(event) = event_rx.try_recv() {
         match event {
             BackendEvent::LoggedIn => {
@@ -61,7 +67,13 @@ pub fn drain_backend_events(state: &mut AppState, event_rx: &mut mpsc::Unbounded
                 state.guilds = guilds;
             }
             BackendEvent::Gateway(GatewayEvent::MessageCreate(message)) => {
+                if let Some(typing) = state.typing_users.get_mut(&message.channel_id) {
+                    typing.remove(&message.author.id);
+                }
                 state.push_message(message);
+            }
+            BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
+                state.note_typing(channel_id, user_id);
             }
             BackendEvent::Gateway(GatewayEvent::Unknown { .. }) => {}
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
@@ -71,7 +83,11 @@ pub fn drain_backend_events(state: &mut AppState, event_rx: &mut mpsc::Unbounded
                 state.dm_channels = channels;
             }
             BackendEvent::MessagesLoaded { channel_id, messages } => {
-                state.messages.insert(channel_id, messages);
+                state.set_message_history(channel_id, messages);
+            }
+            BackendEvent::OlderMessagesLoaded { channel_id, messages } => {
+                state.loading_older_messages = false;
+                state.prepend_message_history(channel_id, messages);
             }
             BackendEvent::RelationshipsLoaded(relationships) => {
                 state.relationships = relationships;
@@ -85,6 +101,10 @@ pub fn drain_backend_events(state: &mut AppState, event_rx: &mut mpsc::Unbounded
                 state.selected_channel = Some(channel_id);
                 state.show_friends_list = false;
             }
+            BackendEvent::ImageDownloaded { url, bytes } => {
+                image_downloads.push((url, bytes));
+            }
         }
     }
+    image_downloads
 }
