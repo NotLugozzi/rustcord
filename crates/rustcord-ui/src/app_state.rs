@@ -1,4 +1,4 @@
-use rustcord_client::models::{Channel, ChannelType, Guild, Message, Relationship, RelationshipType, User};
+use rustcord_client::models::{Channel, ChannelType, Guild, Message, Presence, Relationship, RelationshipType, User};
 use std::collections::HashMap;
 
 fn snowflake_value(id: &str) -> u64 {
@@ -39,11 +39,36 @@ pub struct AppState {
     pub typing_users: HashMap<String, HashMap<String, std::time::Instant>>,
     pub last_typing_sent: Option<std::time::Instant>,
     pub show_settings: bool,
+    pub profile_popout: Option<User>,
+    pub image_lightbox: Option<String>,
+    pub reply_target: Option<Message>,
+    pub presences: HashMap<String, Presence>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AppState {
+    pub fn presence_for(&self, user_id: &str) -> rustcord_client::models::PresenceStatus {
+        if self.current_user.as_ref().is_some_and(|u| u.id == user_id) {
+            return rustcord_client::models::PresenceStatus::Online;
+        }
+        self.presences.get(user_id).map(|p| p.status).unwrap_or(rustcord_client::models::PresenceStatus::Offline)
+    }
+
+    pub fn platform_for(&self, user_id: &str) -> Option<&'static str> {
+        let presence = self.presences.get(user_id)?;
+        let cs = &presence.client_status;
+        if cs.mobile.is_some() {
+            Some("Mobile")
+        } else if cs.desktop.is_some() {
+            Some("Desktop")
+        } else if cs.web.is_some() {
+            Some("Web")
+        } else {
+            None
+        }
+    }
+
     pub fn note_typing(&mut self, channel_id: String, user_id: String) {
         self.typing_users
             .entry(channel_id)

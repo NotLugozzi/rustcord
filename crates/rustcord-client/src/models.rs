@@ -63,6 +63,8 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     #[serde(default)]
     pub mentions: Vec<User>,
+    #[serde(default)]
+    pub referenced_message: Option<Box<Message>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]
@@ -80,6 +82,49 @@ pub struct Relationship {
     #[serde(rename = "type")]
     pub kind: RelationshipType,
     pub user: User,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PresenceStatus {
+    Online,
+    Idle,
+    Dnd,
+    Offline,
+    Invisible,
+}
+
+impl Default for PresenceStatus {
+    fn default() -> Self {
+        Self::Offline
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+pub struct ClientStatus {
+    pub desktop: Option<PresenceStatus>,
+    pub mobile: Option<PresenceStatus>,
+    pub web: Option<PresenceStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Presence {
+    pub user: PartialUser,
+    #[serde(default)]
+    pub status: PresenceStatus,
+    #[serde(default)]
+    pub client_status: ClientStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PartialUser {
+    pub id: Snowflake,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct MergedPresences {
+    #[serde(default)]
+    pub friends: Vec<Presence>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

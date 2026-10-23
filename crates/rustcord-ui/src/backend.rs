@@ -22,8 +22,16 @@ pub enum UiCommand {
     SelectGuild { guild_id: String },
     SelectChannel { channel_id: String },
     LoadOlderMessages { channel_id: String, before: String },
-    SendMessage { channel_id: String, content: String },
-    SendAttachment { channel_id: String, content: String, path: std::path::PathBuf },
+    SendMessage { channel_id: String, content: String, reply_to: Option<String> },
+    SendAttachment { channel_id: String, content: String, path: std::path::PathBuf, reply_to: Option<String> },
+    SendAttachmentBytes {
+        channel_id: String,
+        content: String,
+        filename: String,
+        bytes: Vec<u8>,
+        content_type: String,
+        reply_to: Option<String>,
+    },
     DownloadImage { url: String },
     OpenDmWithUser { user_id: String },
     StartTyping { channel_id: String },
@@ -120,15 +128,15 @@ pub fn spawn(
                         }
                     }
                 }
-                UiCommand::SendMessage { channel_id, content } => {
+                UiCommand::SendMessage { channel_id, content, reply_to } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.send_message(&channel_id, &content).await {
+                        if let Err(e) = client.send_message_reply(&channel_id, &content, reply_to.as_deref()).await {
                             tracing::warn!("send failed: {e}");
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to send message: {e}")));
                         }
                     }
                 }
-                UiCommand::SendAttachment { channel_id, content, path } => {
+                UiCommand::SendAttachment { channel_id, content, path, reply_to } => {
                     if let Some(client) = &rest {
                         let filename = path
                             .file_name()
@@ -138,7 +146,14 @@ pub fn spawn(
                         match tokio::fs::read(&path).await {
                             Ok(bytes) => {
                                 if let Err(e) = client
-                                    .send_message_with_attachment(&channel_id, &content, &filename, bytes, content_type)
+                                    .send_message_with_attachment_reply(
+                                        &channel_id,
+                                        &content,
+                                        &filename,
+                                        bytes,
+                                        content_type,
+                                        reply_to.as_deref(),
+                                    )
                                     .await
                                 {
                                     tracing::warn!("attachment send failed: {e}");
@@ -148,6 +163,24 @@ pub fn spawn(
                             Err(e) => {
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to read file: {e}")));
                             }
+                        }
+                    }
+                }
+                UiCommand::SendAttachmentBytes { channel_id, content, filename, bytes, content_type, reply_to } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client
+                            .send_message_with_attachment_reply(
+                                &channel_id,
+                                &content,
+                                &filename,
+                                bytes,
+                                &content_type,
+                                reply_to.as_deref(),
+                            )
+                            .await
+                        {
+                            tracing::warn!("pasted attachment send failed: {e}");
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachment: {e}")));
                         }
                     }
                 }

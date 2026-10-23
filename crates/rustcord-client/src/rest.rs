@@ -193,11 +193,30 @@ impl RestClient {
     }
 
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message, ClientError> {
+        self.send_message_reply(channel_id, content, None).await
+    }
+
+    pub async fn send_message_reply(
+        &self,
+        channel_id: &str,
+        content: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Message, ClientError> {
+        #[derive(Serialize)]
+        struct MessageReference<'a> {
+            message_id: &'a str,
+        }
         #[derive(Serialize)]
         struct Body<'a> {
             content: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message_reference: Option<MessageReference<'a>>,
         }
-        self.post(&format!("/channels/{channel_id}/messages"), &Body { content }).await
+        let body = Body {
+            content,
+            message_reference: reply_to.map(|id| MessageReference { message_id: id }),
+        };
+        self.post(&format!("/channels/{channel_id}/messages"), &body).await
     }
 
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ClientError> {
@@ -222,19 +241,39 @@ impl RestClient {
         file_bytes: Vec<u8>,
         content_type: &str,
     ) -> Result<Message, ClientError> {
+        self.send_message_with_attachment_reply(channel_id, content, filename, file_bytes, content_type, None)
+            .await
+    }
+
+    pub async fn send_message_with_attachment_reply(
+        &self,
+        channel_id: &str,
+        content: &str,
+        filename: &str,
+        file_bytes: Vec<u8>,
+        content_type: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Message, ClientError> {
         #[derive(Serialize)]
         struct PayloadAttachment<'a> {
             id: u32,
             filename: &'a str,
         }
         #[derive(Serialize)]
+        struct MessageReference<'a> {
+            message_id: &'a str,
+        }
+        #[derive(Serialize)]
         struct Payload<'a> {
             content: &'a str,
             attachments: Vec<PayloadAttachment<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message_reference: Option<MessageReference<'a>>,
         }
         let payload = Payload {
             content,
             attachments: vec![PayloadAttachment { id: 0, filename }],
+            message_reference: reply_to.map(|id| MessageReference { message_id: id }),
         };
         let payload_json = serde_json::to_string(&payload)?;
 

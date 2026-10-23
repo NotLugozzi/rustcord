@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Guild, Message, User};
+use crate::models::{Guild, MergedPresences, Message, Presence, User};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -11,9 +11,10 @@ const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
-    Ready { user: User, guilds: Vec<Guild> },
+    Ready { user: User, guilds: Vec<Guild>, friend_presences: Vec<Presence> },
     MessageCreate(Message),
     TypingStart { channel_id: String, user_id: String },
+    PresenceUpdate(Presence),
     Unknown { op_name: String, raw: Value },
 }
 
@@ -113,7 +114,26 @@ impl Gateway {
             Some("READY") => {
                 let user: User = serde_json::from_value(data["user"].clone())?;
                 let guilds: Vec<Guild> = serde_json::from_value(data["guilds"].clone())?;
-                GatewayEvent::Ready { user, guilds }
+                let friend_presences = match data.get("merged_presences") {
+                    Some(v) => {
+                        tracing::info!("merged_presences raw: {v}");
+                        match serde_json::from_value::<MergedPresences>(v.clone()) {
+                            Ok(mp) => {
+                                tracing::info!("parsed {} friend presences", mp.friends.len());
+                                mp.friends
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to parse merged_presences: {e}");
+                                Vec::new()
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!("READY payload has no merged_presences field");
+                        Vec::new()
+                    }
+                };
+                GatewayEvent::Ready { user, guilds, friend_presences }
             }
             Some("MESSAGE_CREATE") => {
                 let message: Message = serde_json::from_value(data)?;
@@ -123,6 +143,10 @@ impl Gateway {
                 let channel_id = data["channel_id"].as_str().unwrap_or_default().to_string();
                 let user_id = data["user_id"].as_str().unwrap_or_default().to_string();
                 GatewayEvent::TypingStart { channel_id, user_id }
+            }
+            Some("PRESENCE_UPDATE") => {
+                let presence: Presence = serde_json::from_value(data)?;
+                GatewayEvent::PresenceUpdate(presence)
             }
             Some(other) => GatewayEvent::Unknown { op_name: other.to_string(), raw: data },
             None => return Ok(()),

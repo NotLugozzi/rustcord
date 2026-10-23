@@ -1,5 +1,6 @@
 mod app_state;
 mod backend;
+mod clipboard;
 mod images;
 mod markdown;
 mod renderer;
@@ -62,9 +63,12 @@ pub fn drain_backend_events(
             BackendEvent::Error(err) => {
                 state.status_message = Some(err);
             }
-            BackendEvent::Gateway(GatewayEvent::Ready { user, guilds }) => {
+            BackendEvent::Gateway(GatewayEvent::Ready { user, guilds, friend_presences }) => {
                 state.current_user = Some(user);
                 state.guilds = guilds;
+                for presence in friend_presences {
+                    state.presences.insert(presence.user.id.clone(), presence);
+                }
             }
             BackendEvent::Gateway(GatewayEvent::MessageCreate(message)) => {
                 if let Some(typing) = state.typing_users.get_mut(&message.channel_id) {
@@ -74,6 +78,9 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
                 state.note_typing(channel_id, user_id);
+            }
+            BackendEvent::Gateway(GatewayEvent::PresenceUpdate(presence)) => {
+                state.presences.insert(presence.user.id.clone(), presence);
             }
             BackendEvent::Gateway(GatewayEvent::Unknown { .. }) => {}
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {

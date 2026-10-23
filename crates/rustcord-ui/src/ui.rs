@@ -226,7 +226,39 @@ fn draw_circular_image_button_placeholder(ui: &Ui, id: &str, label: &str, size: 
     clicked
 }
 
+fn clickable_text(ui: &Ui, id: &str, text: &str, color: [f32; 4]) -> bool {
+    let start = ui.cursor_pos();
+    ui.text_colored(color, text);
+    let size = ui.item_rect_size();
+    ui.set_cursor_pos(start);
+    let clicked = ui.invisible_button(id, size);
+    ui.set_cursor_pos(start);
+    ui.text_colored(color, text);
+    clicked
+}
+
 const USER_ROW_AVATAR_SIZE: [f32; 2] = [28.0, 28.0];
+
+struct UserRowResult {
+    row_clicked: bool,
+    avatar_clicked: bool,
+}
+
+fn status_color(status: rustcord_client::models::PresenceStatus) -> [f32; 4] {
+    use rustcord_client::models::PresenceStatus::*;
+    match status {
+        Online => [0.23, 0.79, 0.35, 1.0],
+        Idle => [0.95, 0.68, 0.11, 1.0],
+        Dnd => [0.91, 0.23, 0.23, 1.0],
+        Offline | Invisible => [0.50, 0.52, 0.56, 1.0],
+    }
+}
+
+fn draw_status_dot(ui: &Ui, center: [f32; 2], radius: f32, status: rustcord_client::models::PresenceStatus, bg_color: [f32; 4]) {
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_circle(center, radius + 2.0, bg_color).filled(true).build();
+    draw_list.add_circle(center, radius, status_color(status)).filled(true).build();
+}
 
 fn draw_user_row(
     ui: &Ui,
@@ -235,31 +267,53 @@ fn draw_user_row(
     user: &rustcord_client::models::User,
     name: &str,
     selected: bool,
-) -> bool {
+    status: rustcord_client::models::PresenceStatus,
+    platform: Option<&str>,
+    row_bg_color: [f32; 4],
+) -> UserRowResult {
     let row_start = ui.cursor_pos();
     let row_height = USER_ROW_AVATAR_SIZE[1] + 4.0;
 
-    let clicked = ui
+    let row_clicked = ui
         .selectable_config(format!("##row_{}", user.id))
         .selected(selected)
         .size([0.0, row_height])
         .build();
 
     ui.set_cursor_pos([row_start[0] + 4.0, row_start[1] + 2.0]);
+    let avatar_screen_pos = ui.cursor_screen_pos();
     let avatar_url = rustcord_client::cdn::avatar_url(user, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
-    if let Some((texture_id, _)) = textures.get(&avatar_url) {
-        draw_circular_image(ui, texture_id, USER_ROW_AVATAR_SIZE);
+    let avatar_clicked = if let Some((texture_id, _)) = textures.get(&avatar_url) {
+        draw_circular_image_button(ui, &format!("avatar_row_{}", user.id), texture_id, USER_ROW_AVATAR_SIZE)
     } else {
         textures.request(&avatar_url, cmd_tx);
         ui.dummy(USER_ROW_AVATAR_SIZE);
-    }
+        false
+    };
+    draw_status_dot(
+        ui,
+        [avatar_screen_pos[0] + USER_ROW_AVATAR_SIZE[0] - 3.0, avatar_screen_pos[1] + USER_ROW_AVATAR_SIZE[1] - 3.0],
+        5.0,
+        status,
+        row_bg_color,
+    );
+
     ui.same_line();
     let text_x = ui.cursor_pos()[0];
-    ui.set_cursor_pos([text_x, row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0]);
-    ui.text(name);
+    let text_y = row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0;
+    ui.set_cursor_pos([text_x, text_y]);
+    let name_clicked = clickable_text(ui, &format!("name_row_{}", user.id), name, ui.style_color(imgui::StyleColor::Text));
+    if let Some(platform) = platform {
+        ui.same_line();
+        let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
+        ui.set_window_font_scale(0.8);
+        ui.text(platform);
+        ui.set_window_font_scale(1.0);
+        token.pop();
+    }
 
     ui.set_cursor_pos([row_start[0], row_start[1] + row_height]);
-    clicked
+    UserRowResult { row_clicked, avatar_clicked: avatar_clicked || name_clicked }
 }
 
 fn draw_circular_image(ui: &Ui, texture_id: imgui::TextureId, size: [f32; 2]) {
@@ -295,13 +349,26 @@ fn draw_attachment(
     cmd_tx: &UnboundedSender<UiCommand>,
     textures: &mut TextureCache,
     attachment: &rustcord_client::models::Attachment,
+    lightbox: &mut Option<String>,
 ) {
     if !is_image_attachment(attachment.content_type.as_deref(), &attachment.filename) {
         ui.text_disabled(format!("[attachment: {}]", attachment.filename));
         return;
     }
     if let Some((texture_id, natural_size)) = textures.get(&attachment.url) {
-        imgui::Image::new(texture_id, scaled_image_size(natural_size)).build(ui);
+        let size = scaled_image_size(natural_size);
+        let p_min = ui.cursor_screen_pos();
+        imgui::Image::new(texture_id, size).build(ui);
+        if ui.is_item_clicked() {
+            *lightbox = Some(attachment.url.clone());
+        }
+        if ui.is_item_hovered() {
+            let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
+            ui.get_window_draw_list()
+                .add_rect(p_min, p_max, [1.0, 1.0, 1.0, 0.12])
+                .filled(true)
+                .build();
+        }
     } else if textures.is_failed(&attachment.url) {
         ui.text_disabled(format!("[failed to load image: {}]", attachment.filename));
     } else {
@@ -425,7 +492,22 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                     for user in &friends {
                         let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
-                        if draw_user_row(ui, cmd_tx, textures, user, &name, false) {
+                        let status = state.presence_for(&user.id);
+                        let platform = state.platform_for(&user.id).map(str::to_string);
+                        let result = draw_user_row(
+                            ui,
+                            cmd_tx,
+                            textures,
+                            user,
+                            &name,
+                            false,
+                            status,
+                            platform.as_deref(),
+                            state.theme.panel,
+                        );
+                        if result.avatar_clicked {
+                            state.profile_popout = Some(user.clone());
+                        } else if result.row_clicked {
                             let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
                         }
                     }
@@ -440,12 +522,29 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                     for (channel_id, name, recipient) in &dms {
                         let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
-                        let clicked = if let Some(user) = recipient {
-                            draw_user_row(ui, cmd_tx, textures, user, name, is_selected)
+                        let (row_clicked, avatar_clicked) = if let Some(user) = recipient {
+                            let status = state.presence_for(&user.id);
+                            let platform = state.platform_for(&user.id).map(str::to_string);
+                            let result = draw_user_row(
+                                ui,
+                                cmd_tx,
+                                textures,
+                                user,
+                                name,
+                                is_selected,
+                                status,
+                                platform.as_deref(),
+                                state.theme.panel,
+                            );
+                            (result.row_clicked, result.avatar_clicked)
                         } else {
-                            ui.selectable_config(name).selected(is_selected).build()
+                            (ui.selectable_config(name).selected(is_selected).build(), false)
                         };
-                        if clicked {
+                        if avatar_clicked {
+                            if let Some(user) = recipient {
+                                state.profile_popout = Some(user.clone());
+                            }
+                        } else if row_clicked {
                             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
                             state.selected_channel = Some(channel_id.clone());
                         }
@@ -459,6 +558,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         });
 
     draw_settings_dialog(ui, state, cmd_tx);
+    draw_profile_popout(ui, state, cmd_tx, textures);
 
     ui.window("chat")
         .position([RAIL_WIDTH + CHANNEL_LIST_WIDTH, 0.0], imgui::Condition::Always)
@@ -486,30 +586,59 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     let content_x_offset = AVATAR_SIZE[0] + 12.0;
 
                     for (idx, msg) in messages.iter().enumerate() {
-                        let starts_group = match messages.get(idx.wrapping_sub(1)) {
-                            Some(prev) if idx > 0 => {
-                                prev.author.id != msg.author.id || !same_group_window(&prev.timestamp, &msg.timestamp)
-                            }
-                            _ => true,
-                        };
+                        let starts_group = msg.referenced_message.is_some()
+                            || match messages.get(idx.wrapping_sub(1)) {
+                                Some(prev) if idx > 0 => {
+                                    prev.author.id != msg.author.id || !same_group_window(&prev.timestamp, &msg.timestamp)
+                                }
+                                _ => true,
+                            };
 
                         let row_start = ui.cursor_pos();
+                        let row_screen_start = ui.cursor_screen_pos();
+                        let mut content_top = row_start[1];
+
+                        if let Some(replied) = &msg.referenced_message {
+                            let replied_author =
+                                replied.author.global_name.clone().unwrap_or_else(|| replied.author.username.clone());
+                            let preview: String = replied.content.chars().take(80).collect();
+                            let preview = if replied.content.chars().count() > 80 { format!("{preview}...") } else { preview };
+                            ui.set_cursor_pos([row_start[0] + content_x_offset, row_start[1]]);
+                            let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+                            ui.set_window_font_scale(0.85);
+                            let label = if preview.is_empty() {
+                                format!("\u{2514} Replying to {replied_author}")
+                            } else {
+                                format!("\u{2514} Replying to {replied_author}: {preview}")
+                            };
+                            ui.text(label);
+                            ui.set_window_font_scale(1.0);
+                            token.pop();
+                            content_top = ui.cursor_pos()[1];
+                        }
 
                         if starts_group {
                             let author = msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
                             let avatar_url = rustcord_client::cdn::avatar_url(&msg.author, 64)
                                 .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&msg.author));
 
-                            if let Some((texture_id, _)) = textures.get(&avatar_url) {
-                                draw_circular_image(ui, texture_id, AVATAR_SIZE);
+                            ui.set_cursor_pos([row_start[0], content_top]);
+                            let avatar_clicked = if let Some((texture_id, _)) = textures.get(&avatar_url) {
+                                draw_circular_image_button(ui, &format!("avatar_{}", msg.id), texture_id, AVATAR_SIZE)
                             } else {
                                 textures.request(&avatar_url, cmd_tx);
                                 ui.dummy(AVATAR_SIZE);
+                                false
+                            };
+                            if avatar_clicked {
+                                state.profile_popout = Some(msg.author.clone());
                             }
 
-                            ui.set_cursor_pos([row_start[0] + content_x_offset, row_start[1]]);
+                            ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
-                                ui.text_colored(state.theme.accent, &author);
+                                if clickable_text(ui, &format!("name_{}", msg.id), &author, state.theme.accent) {
+                                    state.profile_popout = Some(msg.author.clone());
+                                }
                                 ui.same_line();
                                 let time = format_timestamp(&msg.timestamp);
                                 let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
@@ -522,28 +651,48 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
                                 }
                                 for attachment in &msg.attachments {
-                                    draw_attachment(ui, cmd_tx, textures, attachment);
+                                    draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
                             });
 
                             let group_height = AVATAR_SIZE[1].max(ui.item_rect_size()[1]);
-                            ui.set_cursor_pos([row_start[0], row_start[1] + group_height]);
+                            ui.set_cursor_pos([row_start[0], content_top + group_height]);
                         } else {
-                            ui.set_cursor_pos([row_start[0] + content_x_offset, row_start[1]]);
+                            ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
                                 if !msg.content.is_empty() {
                                     draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
                                 }
                                 for attachment in &msg.attachments {
-                                    draw_attachment(ui, cmd_tx, textures, attachment);
+                                    draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
                             });
-                            ui.set_cursor_pos([row_start[0], row_start[1] + ui.item_rect_size()[1]]);
+                            ui.set_cursor_pos([row_start[0], content_top + ui.item_rect_size()[1]]);
                         }
+
+                        let row_end_screen = ui.cursor_screen_pos();
+                        let row_width = ui.window_content_region_max()[0] - row_start[0];
+                        let abs_min = row_screen_start;
+                        let abs_max = [row_screen_start[0] + row_width, row_end_screen[1]];
+                        let mouse_pos = ui.io().mouse_pos;
+                        let mouse_in_row = mouse_pos[0] >= abs_min[0]
+                            && mouse_pos[0] <= abs_max[0]
+                            && mouse_pos[1] >= abs_min[1]
+                            && mouse_pos[1] <= abs_max[1];
+                        if mouse_in_row && ui.is_mouse_clicked(imgui::MouseButton::Right) {
+                            ui.open_popup(format!("msg_ctx_menu_{}", msg.id));
+                        }
+                        ui.popup(format!("msg_ctx_menu_{}", msg.id), || {
+                            if ui.menu_item("Reply") {
+                                state.reply_target = Some(msg.clone());
+                            }
+                        });
 
                         let next_starts_group = match messages.get(idx + 1) {
                             Some(next) => {
-                                next.author.id != msg.author.id || !same_group_window(&msg.timestamp, &next.timestamp)
+                                next.referenced_message.is_some()
+                                    || next.author.id != msg.author.id
+                                    || !same_group_window(&msg.timestamp, &next.timestamp)
                             }
                             None => true,
                         };
@@ -597,6 +746,17 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
             ui.separator();
 
+            if let Some(reply_msg) = state.reply_target.clone() {
+                let reply_author = reply_msg.author.global_name.clone().unwrap_or_else(|| reply_msg.author.username.clone());
+                let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+                ui.text(format!("Replying to {reply_author}"));
+                token.pop();
+                ui.same_line();
+                if ui.small_button("x##cancel_reply") {
+                    state.reply_target = None;
+                }
+            }
+
             if let Some(path) = state.pending_attachment.clone() {
                 let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 ui.text_colored(state.theme.accent, format!("Attached: {name}"));
@@ -622,6 +782,24 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .enter_returns_true(true)
                 .build();
 
+            let compose_focused = ui.is_item_focused();
+            if compose_focused && ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::V) {
+                if let Some(channel_id) = state.selected_channel.clone() {
+                    if let Some((filename, bytes)) = crate::clipboard::read_image_as_png() {
+                        let content = std::mem::take(&mut state.compose_buf);
+                        let reply_to = state.reply_target.take().map(|m| m.id);
+                        let _ = cmd_tx.send(UiCommand::SendAttachmentBytes {
+                            channel_id,
+                            content,
+                            filename,
+                            bytes,
+                            content_type: "image/png".to_string(),
+                            reply_to,
+                        });
+                    }
+                }
+            }
+
             if state.compose_buf != before_edit && !state.compose_buf.is_empty() {
                 if let Some(channel_id) = &state.selected_channel {
                     let should_send = state
@@ -637,26 +815,37 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if enter_pressed {
                 if let Some(channel_id) = state.selected_channel.clone() {
                     let content = std::mem::take(&mut state.compose_buf);
+                    let reply_to = state.reply_target.take().map(|m| m.id);
                     if let Some(path) = state.pending_attachment.take() {
-                        let _ = cmd_tx.send(UiCommand::SendAttachment { channel_id, content, path });
+                        let _ = cmd_tx.send(UiCommand::SendAttachment { channel_id, content, path, reply_to });
                     } else if !content.trim().is_empty() {
-                        let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content });
+                        let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to });
                     }
                 }
             }
         });
+
+    draw_image_lightbox(ui, state, textures);
 }
 
 fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let Some(user) = state.current_user.clone() else { return };
     let avatar_url =
         rustcord_client::cdn::avatar_url(&user, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
+    let avatar_screen_pos = ui.cursor_screen_pos();
     if let Some((texture_id, _)) = textures.get(&avatar_url) {
         draw_circular_image(ui, texture_id, [28.0, 28.0]);
     } else {
         textures.request(&avatar_url, cmd_tx);
         ui.dummy([28.0, 28.0]);
     }
+    draw_status_dot(
+        ui,
+        [avatar_screen_pos[0] + 25.0, avatar_screen_pos[1] + 25.0],
+        5.0,
+        state.presence_for(&user.id),
+        state.theme.background,
+    );
     ui.same_line();
 
     let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
@@ -665,6 +854,93 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
 
     if ui.small_button("Settings") {
         state.show_settings = !state.show_settings;
+    }
+}
+
+fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCache) {
+    let Some(url) = state.image_lightbox.clone() else { return };
+    let Some((texture_id, natural_size)) = textures.get(&url) else { return };
+
+    let [display_w, display_h] = ui.io().display_size;
+    let max_w = display_w * 0.85;
+    let max_h = display_h * 0.85;
+    let [nw, nh] = natural_size;
+    let scale = if nw > 0.0 && nh > 0.0 { (max_w / nw).min(max_h / nh).min(1.0) } else { 1.0 };
+    let size = [nw * scale, nh * scale];
+
+    ui.window("##lightbox_backdrop")
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([display_w, display_h], imgui::Condition::Always)
+        .no_decoration()
+        .no_inputs()
+        .draw_background(true)
+        .bg_alpha(0.85)
+        .build(|| {});
+
+    let close_clicked = ui
+        .window("##lightbox")
+        .position([display_w / 2.0 - size[0] / 2.0, display_h / 2.0 - size[1] / 2.0], imgui::Condition::Always)
+        .size(size, imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(false)
+        .build(|| {
+            imgui::Image::new(texture_id, size).build(ui);
+            ui.is_item_clicked()
+        })
+        .unwrap_or(false);
+
+    if close_clicked || ui.is_key_pressed(imgui::Key::Escape) {
+        state.image_lightbox = None;
+    }
+}
+
+fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
+    let Some(user) = state.profile_popout.clone() else { return };
+    let [display_w, display_h] = ui.io().display_size;
+    let mut open = true;
+    let mut message_clicked = false;
+    ui.window(format!("Profile##{}", user.id))
+        .opened(&mut open)
+        .position([display_w / 2.0 - 160.0, display_h / 2.0 - 140.0], imgui::Condition::Appearing)
+        .size([320.0, 280.0], imgui::Condition::Appearing)
+        .build(|| {
+            let avatar_url =
+                rustcord_client::cdn::avatar_url(&user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
+            let avatar_screen_pos = ui.cursor_screen_pos();
+            if let Some((texture_id, _)) = textures.get(&avatar_url) {
+                draw_circular_image(ui, texture_id, [80.0, 80.0]);
+            } else {
+                textures.request(&avatar_url, cmd_tx);
+                ui.dummy([80.0, 80.0]);
+            }
+            draw_status_dot(
+                ui,
+                [avatar_screen_pos[0] + 70.0, avatar_screen_pos[1] + 70.0],
+                8.0,
+                state.presence_for(&user.id),
+                state.theme.panel,
+            );
+
+            let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+            ui.text(&display_name);
+            if let Some(platform) = state.platform_for(&user.id) {
+                ui.same_line();
+                ui.text_disabled(format!("({platform})"));
+            }
+            ui.text_disabled(format!("@{}", user.username));
+            ui.separator();
+            ui.text(format!("User ID: {}", user.id));
+            if user.bot {
+                ui.text_disabled("BOT");
+            }
+            ui.spacing();
+            if ui.button("Message") {
+                let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
+                message_clicked = true;
+            }
+        });
+    if !open || message_clicked {
+        state.profile_popout = None;
     }
 }
 
