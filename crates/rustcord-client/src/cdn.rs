@@ -1,4 +1,4 @@
-use crate::models::{Guild, User};
+use crate::models::{Emoji, Guild, User};
 
 const CDN_BASE: &str = "https://cdn.discordapp.com";
 
@@ -19,4 +19,9 @@ pub fn guild_icon_url(guild: &Guild, size: u32) -> Option<String> {
     let hash = guild.icon.as_ref()?;
     let ext = if hash.starts_with("a_") { "gif" } else { "png" };
     Some(format!("{CDN_BASE}/icons/{}/{hash}.{ext}?size={size}", guild.id))
+}
+
+pub fn custom_emoji_url(emoji: &Emoji, size: u32) -> String {
+    let ext = if emoji.animated { "gif" } else { "png" };
+    format!("{CDN_BASE}/emojis/{}.{ext}?size={size}", emoji.id)
 }

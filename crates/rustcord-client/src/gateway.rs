@@ -12,6 +12,7 @@ const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
     Ready { user: User, guilds: Vec<Guild>, friend_presences: Vec<Presence> },
+    Presences(Vec<Presence>),
     MessageCreate(Message),
     TypingStart { channel_id: String, user_id: String },
     PresenceUpdate(Presence),
@@ -103,8 +104,17 @@ impl Gateway {
                         return Err(ClientError::GatewayClosed("stream ended".into()));
                     };
                     let frame = frame?;
-                    if let WsMessage::Text(text) = frame {
-                        self.handle_frame(&text, &tx)?;
+                    match frame {
+                        WsMessage::Ping(payload) => write.send(WsMessage::Pong(payload)).await?,
+                        WsMessage::Text(text) => {
+                            let payload: Payload = serde_json::from_str(&text)?;
+                            if payload.op == 1 {
+                                write.send(WsMessage::Text(json!({ "op": 1, "d": null }).to_string())).await?;
+                                continue;
+                            }
+                            self.handle_frame(&text, &tx)?;
+                        }
+                        _ => {}
                     }
                 }
                 Some(frame) = outgoing.recv() => {
@@ -127,26 +137,26 @@ impl Gateway {
             Some("READY") => {
                 let user: User = serde_json::from_value(data["user"].clone())?;
                 let guilds: Vec<Guild> = serde_json::from_value(data["guilds"].clone())?;
-                let friend_presences = match data.get("merged_presences") {
+                let mut friend_presences = parse_presence_list(data.get("presences"));
+                match data.get("merged_presences") {
                     Some(v) => {
-                        tracing::info!("merged_presences raw: {v}");
-                        match serde_json::from_value::<MergedPresences>(v.clone()) {
-                            Ok(mp) => {
-                                tracing::info!("parsed {} friend presences", mp.friends.len());
-                                mp.friends
-                            }
-                            Err(e) => {
-                                tracing::error!("failed to parse merged_presences: {e}");
-                                Vec::new()
-                            }
-                        }
+                        friend_presences.extend(parse_merged_presences(v));
                     }
                     None => {
-                        tracing::warn!("READY payload has no merged_presences field");
-                        Vec::new()
+                        tracing::debug!("READY has no merged_presences field");
                     }
-                };
+                }
+                deduplicate_presences(&mut friend_presences);
+                tracing::info!("READY supplied {} friend presences", friend_presences.len());
                 GatewayEvent::Ready { user, guilds, friend_presences }
+            }
+            Some("READY_SUPPLEMENTAL") => {
+                let mut presences = parse_presence_list(data.get("presences"));
+                if let Some(merged) = data.get("merged_presences") {
+                    presences.extend(parse_merged_presences(merged));
+                }
+                deduplicate_presences(&mut presences);
+                GatewayEvent::Presences(presences)
             }
             Some("MESSAGE_CREATE") => {
                 let message: Message = serde_json::from_value(data)?;
@@ -180,4 +190,31 @@ impl Gateway {
         let _ = tx.send(event);
         Ok(())
     }
+}
+
+fn parse_presence_list(value: Option<&Value>) -> Vec<Presence> {
+    let Some(Value::Array(items)) = value else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|item| match serde_json::from_value::<Presence>(item.clone()) {
+            Ok(presence) => Some(presence),
+            Err(error) => {
+                tracing::debug!("ignoring malformed presence entry: {error}");
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_merged_presences(value: &Value) -> Vec<Presence> {
+    if let Ok(merged) = serde_json::from_value::<MergedPresences>(value.clone()) {
+        return merged.friends;
+    }
+    tracing::debug!("could not parse merged presences as a whole; parsing entries individually");
+    parse_presence_list(value.get("friends"))
+}
+
+fn deduplicate_presences(presences: &mut Vec<Presence>) {
+    let mut seen = std::collections::HashSet::new();
+    presences.retain(|presence| seen.insert(presence.user.id.clone()));
 }

@@ -23,6 +23,14 @@ pub struct Guild {
     pub unavailable: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Emoji {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub animated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]
 #[repr(u8)]
 pub enum ChannelType {
