@@ -80,6 +80,8 @@ pub enum UiCommand {
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
+    JoinVoiceChannel { guild_id: String, channel_id: String },
+    LeaveVoiceChannel { guild_id: String },
     Logout,
 }
 
@@ -100,6 +102,9 @@ pub enum BackendEvent {
     RelationshipsLoaded(Vec<rustcord_client::models::Relationship>),
     DmOpened(rustcord_client::models::Channel),
     ImageDownloaded { url: String, image: crate::images::Decoded },
+    VoiceConnecting,
+    VoiceConnected,
+    VoiceDisconnected,
 }
 
 pub fn spawn(
@@ -327,12 +332,78 @@ pub fn spawn(
                     presence::set_enabled(conn_id, enabled);
                     presence::publish(&event_tx);
                 }
+                UiCommand::JoinVoiceChannel { guild_id, channel_id } => {
+                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                        let frame = rustcord_client::gateway::voice_state_update_frame(&guild_id, Some(&channel_id), false, false);
+                        let _ = tx.send(frame);
+                    }
+                    let _ = event_tx.send(BackendEvent::VoiceConnecting);
+                }
+                UiCommand::LeaveVoiceChannel { guild_id } => {
+                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                        let frame = rustcord_client::gateway::voice_state_update_frame(&guild_id, None, false, false);
+                        let _ = tx.send(frame);
+                    }
+                    let _ = event_tx.send(BackendEvent::VoiceDisconnected);
+                }
                 UiCommand::Logout => {
                     session_store::clear_token();
                     rest = None;
                     login_session = None;
                 }
             }
+        }
+    });
+}
+
+#[derive(Default)]
+struct VoicePending {
+    session_id: Option<String>,
+    guild_id: Option<String>,
+    channel_id: Option<String>,
+    token: Option<String>,
+    endpoint: Option<String>,
+}
+
+fn try_spawn_voice_gateway(
+    pending_session: &mut Option<VoicePending>,
+    my_user_id: &Option<String>,
+    forward_tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    let Some(pending) = pending_session.as_ref() else { return };
+    let (Some(session_id), Some(guild_id), Some(token), Some(endpoint), Some(user_id)) = (
+        pending.session_id.clone(),
+        pending.guild_id.clone(),
+        pending.token.clone(),
+        pending.endpoint.clone(),
+        my_user_id.clone(),
+    ) else {
+        return;
+    };
+    *pending_session = None;
+
+    let voice_gateway = rustcord_client::voice_gateway::VoiceGateway::new(endpoint, guild_id, user_id, session_id, token);
+    let (vg_tx, mut vg_rx) = mpsc::unbounded_channel();
+    let (_vg_out_tx, vg_out_rx) = mpsc::unbounded_channel();
+    let forward_tx = forward_tx.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = vg_rx.recv().await {
+            use rustcord_client::voice_gateway::VoiceGatewayEvent;
+            match ev {
+                VoiceGatewayEvent::Connecting => {}
+                VoiceGatewayEvent::Ready { .. } => {
+                    let _ = forward_tx.send(BackendEvent::VoiceConnected);
+                }
+                VoiceGatewayEvent::Disconnected { .. } => {
+                    let _ = forward_tx.send(BackendEvent::VoiceDisconnected);
+                }
+                _ => {}
+            }
+        }
+    });
+    tokio::spawn(async move {
+        if let Err(e) = voice_gateway.run(vg_tx, vg_out_rx).await {
+            tracing::warn!("voice gateway task exited: {e}");
         }
     });
 }
@@ -446,7 +517,35 @@ async fn start_session(
     *GATEWAY_TX.lock().unwrap() = Some(out_tx);
     let forward_tx = event_tx.clone();
     tokio::spawn(async move {
+        let mut my_user_id: Option<String> = None;
+        let mut pending_session: Option<VoicePending> = None;
         while let Some(ev) = gw_rx.recv().await {
+            match &ev {
+                GatewayEvent::Ready { user, .. } => {
+                    my_user_id = Some(user.id.clone());
+                }
+                GatewayEvent::VoiceStateUpdate(vs) if my_user_id.as_deref() == Some(vs.user_id.as_str()) => {
+                    tracing::info!("own voice state: guild_id={:?} channel_id={:?} session_id={}", vs.guild_id, vs.channel_id, vs.session_id);
+                    if vs.channel_id.is_some() {
+                        let pending = pending_session.get_or_insert_with(VoicePending::default);
+                        pending.session_id = Some(vs.session_id.clone());
+                        pending.guild_id = vs.guild_id.clone();
+                        pending.channel_id = vs.channel_id.clone();
+                        try_spawn_voice_gateway(&mut pending_session, &my_user_id, &forward_tx);
+                    } else {
+                        pending_session = None;
+                    }
+                }
+                GatewayEvent::VoiceServerUpdate { token: voice_server_token, guild_id, endpoint } => {
+                    tracing::info!("voice server update: guild_id={} endpoint={:?} token_len={}", guild_id, endpoint, voice_server_token.len());
+                    let pending = pending_session.get_or_insert_with(VoicePending::default);
+                    pending.token = Some(voice_server_token.clone());
+                    pending.guild_id = Some(guild_id.clone());
+                    pending.endpoint = endpoint.clone();
+                    try_spawn_voice_gateway(&mut pending_session, &my_user_id, &forward_tx);
+                }
+                _ => {}
+            }
             let _ = forward_tx.send(BackendEvent::Gateway(ev));
         }
     });

@@ -149,7 +149,25 @@ pub fn drain_backend_events(
                     list.retain(|m| m.id != id);
                 }
             }
+            BackendEvent::Gateway(GatewayEvent::VoiceStateUpdate(voice_state)) => {
+                if state.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) {
+                    state.connected_voice_channel = voice_state.guild_id.clone().zip(voice_state.channel_id.clone());
+                }
+                state.apply_voice_state(voice_state);
+            }
+            BackendEvent::Gateway(GatewayEvent::VoiceServerUpdate { .. }) => {}
             BackendEvent::Gateway(GatewayEvent::Unknown { .. }) => {}
+            BackendEvent::VoiceConnecting => {
+                state.voice_connecting = true;
+            }
+            BackendEvent::VoiceConnected => {
+                state.voice_connecting = false;
+            }
+            BackendEvent::VoiceDisconnected => {
+                state.voice_connecting = false;
+                state.connected_voice_channel = None;
+                state.pending_voice_channel = None;
+            }
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
                 state.guild_channels.insert(guild_id, channels);
             }

@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Guild, MergedPresences, Message, Presence, User};
+use crate::models::{Guild, MergedPresences, Message, Presence, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +23,8 @@ pub enum GatewayEvent {
     PresenceUpdate(Presence),
     MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String> },
     MessageDelete { channel_id: String, id: String },
+    VoiceStateUpdate(VoiceState),
+    VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
     Unknown { op_name: String, raw: Value },
 }
 
@@ -57,6 +59,19 @@ struct Resume<'a> {
 
 pub fn presence_frame(status: &str, activities: &[Value]) -> String {
     json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
+}
+
+pub fn voice_state_update_frame(guild_id: &str, channel_id: Option<&str>, self_mute: bool, self_deaf: bool) -> String {
+    json!({
+        "op": 4,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
+        }
+    })
+    .to_string()
 }
 
 #[derive(Default)]
@@ -296,6 +311,15 @@ impl Gateway {
                 let presence: Presence = serde_json::from_value(data)?;
                 GatewayEvent::PresenceUpdate(presence)
             }
+            Some("VOICE_STATE_UPDATE") => {
+                let voice_state: VoiceState = serde_json::from_value(data)?;
+                GatewayEvent::VoiceStateUpdate(voice_state)
+            }
+            Some("VOICE_SERVER_UPDATE") => GatewayEvent::VoiceServerUpdate {
+                token: data["token"].as_str().unwrap_or_default().to_string(),
+                guild_id: data["guild_id"].as_str().unwrap_or_default().to_string(),
+                endpoint: data["endpoint"].as_str().map(str::to_string),
+            },
             Some(other) => GatewayEvent::Unknown { op_name: other.to_string(), raw: data },
             None => return Ok(()),
         };

@@ -103,6 +103,10 @@ pub struct AppState {
     pub emoji_picker_category: usize,
     pub emoji_autocomplete_selected: usize,
     pub gateway_connected: bool,
+    pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
+    pub connected_voice_channel: Option<(String, String)>,
+    pub pending_voice_channel: Option<(String, String)>,
+    pub voice_connecting: bool,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -265,6 +269,31 @@ impl AppState {
                         .is_some_and(|n| n.to_lowercase().contains(&query))
             })
             .collect()
+    }
+
+    pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
+        let Some(guild_id) = voice_state.guild_id.clone() else { return };
+        let states = self.voice_channel_states.entry(guild_id).or_default();
+        states.retain(|s| s.user_id != voice_state.user_id);
+        if voice_state.channel_id.is_some() {
+            states.push(voice_state);
+        }
+    }
+
+    pub fn voice_channels_for_selected_guild(&self) -> Vec<&Channel> {
+        let Some(guild_id) = &self.selected_guild else { return Vec::new() };
+        let Some(channels) = self.guild_channels.get(guild_id) else { return Vec::new() };
+        let mut voice: Vec<&Channel> = channels
+            .iter()
+            .filter(|c| matches!(c.kind, ChannelType::GuildVoice | ChannelType::GuildStageVoice))
+            .collect();
+        voice.sort_by_key(|c| c.position.unwrap_or(i32::MAX));
+        voice
+    }
+
+    pub fn members_in_voice_channel(&self, guild_id: &str, channel_id: &str) -> Vec<&rustcord_client::models::VoiceState> {
+        let Some(states) = self.voice_channel_states.get(guild_id) else { return Vec::new() };
+        states.iter().filter(|s| s.channel_id.as_deref() == Some(channel_id)).collect()
     }
 
     pub fn grouped_channels_for_selected_guild(&self) -> Vec<ChannelGroup<'_>> {

@@ -856,6 +856,42 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                     }
                 }
+
+                let guild_id = state.selected_guild.clone().unwrap_or_default();
+                let voice_channels: Vec<(String, String)> = state
+                    .voice_channels_for_selected_guild()
+                    .into_iter()
+                    .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone())))
+                    .collect();
+                if !voice_channels.is_empty() {
+                    ui.spacing();
+                    let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+                    ui.text("VOICE CHANNELS");
+                    token.pop();
+                    for (channel_id, name) in &voice_channels {
+                        let is_connected = state.connected_voice_channel.as_ref() == Some(&(guild_id.clone(), channel_id.clone()));
+                        let label = if is_connected { format!("\u{1F50A} {name} (connected)") } else { format!("\u{1F50A} {name}") };
+                        if ui.selectable(label) && !is_connected {
+                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: guild_id.clone(), channel_id: channel_id.clone() });
+                            state.pending_voice_channel = Some((guild_id.clone(), channel_id.clone()));
+                        }
+                        for member in state.members_in_voice_channel(&guild_id, channel_id) {
+                            ui.indent();
+                            ui.text_disabled(&member.user_id);
+                            ui.unindent();
+                        }
+                        if is_connected {
+                            ui.indent();
+                            if ui.button("Disconnect") {
+                                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: guild_id.clone() });
+                            }
+                            ui.unindent();
+                        }
+                    }
+                    if state.voice_connecting {
+                        ui.text_disabled("Connecting to voice...");
+                    }
+                }
             } else {
                 draw_dm_sidebar(ui, state, cmd_tx, textures);
             }

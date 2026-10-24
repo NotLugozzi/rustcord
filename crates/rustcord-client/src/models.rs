@@ -44,6 +44,22 @@ pub enum ChannelType {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceState {
+    pub guild_id: Option<Snowflake>,
+    pub channel_id: Option<Snowflake>,
+    pub user_id: Snowflake,
+    pub session_id: String,
+    #[serde(default)]
+    pub self_mute: bool,
+    #[serde(default)]
+    pub self_deaf: bool,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub deaf: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Channel {
     pub id: Snowflake,
     #[serde(rename = "type")]
