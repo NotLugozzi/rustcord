@@ -1,22 +1,69 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const MAX_CONCURRENT_ANIMATIONS: usize = 3;
+const TEXTURE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+const IN_USE_WINDOW: Duration = Duration::from_secs(2);
+const MAX_ANIMATED_DIM: u32 = 640;
+const MAX_ANIMATED_BYTES: usize = 48 * 1024 * 1024;
+
+pub enum Decoded {
+    Still(image::RgbaImage),
+    Animated(Vec<(Duration, image::RgbaImage)>),
+    Failed,
+}
+
+pub fn decode(bytes: &[u8]) -> Decoded {
+    if matches!(image::guess_format(bytes), Ok(image::ImageFormat::Gif)) {
+        return match decode_gif_frames(bytes) {
+            Ok(frames) if frames.len() > 1 => Decoded::Animated(shrink_frames(frames)),
+            Ok(mut frames) if !frames.is_empty() => Decoded::Still(frames.remove(0).1),
+            _ => Decoded::Failed,
+        };
+    }
+    match image::load_from_memory(bytes) {
+        Ok(img) => Decoded::Still(img.to_rgba8()),
+        Err(e) => {
+            tracing::warn!("failed to decode image: {e}");
+            Decoded::Failed
+        }
+    }
+}
+
+fn shrink_frames(mut frames: Vec<(Duration, image::RgbaImage)>) -> Vec<(Duration, image::RgbaImage)> {
+    let (w, h) = frames[0].1.dimensions();
+    let longest = w.max(h);
+    if longest > MAX_ANIMATED_DIM {
+        let scale = MAX_ANIMATED_DIM as f32 / longest as f32;
+        let (nw, nh) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+        for (_, f) in &mut frames {
+            *f = image::imageops::resize(f, nw, nh, image::imageops::FilterType::Triangle);
+        }
+    }
+    let (w, h) = frames[0].1.dimensions();
+    if frames.len() * w as usize * h as usize * 4 > MAX_ANIMATED_BYTES {
+        frames.truncate(1);
+    }
+    frames
+}
 
 struct DecodedFrame {
     texture_id: imgui::TextureId,
     delay: Duration,
 }
 
-enum Entry {
-    Static { texture_id: imgui::TextureId, size: [f32; 2] },
+enum Kind {
+    Static { texture_id: imgui::TextureId },
     Animated {
         frames: Vec<DecodedFrame>,
-        size: [f32; 2],
         current_frame: usize,
         frame_started_at: Instant,
-        animating: bool,
+        visible: Cell<bool>,
     },
+}
+
+enum Entry {
+    Loaded { kind: Kind, size: [f32; 2], bytes: usize, last_used: Cell<Instant> },
     Pending,
     Failed,
 }
@@ -24,7 +71,8 @@ enum Entry {
 #[derive(Default)]
 pub struct TextureCache {
     entries: HashMap<String, Entry>,
-    animating_count: usize,
+    total_bytes: usize,
+    pub animating: bool,
 }
 
 impl TextureCache {
@@ -36,66 +84,84 @@ impl TextureCache {
         let _ = cmd_tx.send(crate::backend::UiCommand::DownloadImage { url: url.to_string() });
     }
 
-    pub fn ingest(&mut self, url: String, bytes: &[u8], device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut imgui_wgpu::Renderer) {
-        let format = image::guess_format(bytes).ok();
-        let is_gif = matches!(format, Some(image::ImageFormat::Gif));
-
-        if is_gif {
-            match decode_gif_frames(bytes) {
-                Ok(frames) if !frames.is_empty() => {
-                    let size = [frames[0].1.width() as f32, frames[0].1.height() as f32];
-                    let decoded: Vec<DecodedFrame> = frames
-                        .into_iter()
-                        .map(|(delay, rgba)| DecodedFrame {
-                            texture_id: upload_texture(device, queue, renderer, &rgba),
-                            delay,
-                        })
-                        .collect();
-                    let animating = self.animating_count < MAX_CONCURRENT_ANIMATIONS;
-                    if animating {
-                        self.animating_count += 1;
-                    }
-                    self.entries.insert(
-                        url,
-                        Entry::Animated {
-                            frames: decoded,
-                            size,
-                            current_frame: 0,
-                            frame_started_at: Instant::now(),
-                            animating,
-                        },
-                    );
-                }
-                _ => {
-                    self.entries.insert(url, Entry::Failed);
+    pub fn ingest(&mut self, url: String, decoded: Decoded, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut imgui_wgpu::Renderer) {
+        let now = Instant::now();
+        let entry = match decoded {
+            Decoded::Failed => Entry::Failed,
+            Decoded::Still(rgba) => Entry::Loaded {
+                size: [rgba.width() as f32, rgba.height() as f32],
+                bytes: rgba.as_raw().len(),
+                kind: Kind::Static { texture_id: upload_texture(device, queue, renderer, &rgba) },
+                last_used: Cell::new(now),
+            },
+            Decoded::Animated(frames) => {
+                let size = [frames[0].1.width() as f32, frames[0].1.height() as f32];
+                let bytes = frames.iter().map(|(_, f)| f.as_raw().len()).sum();
+                let frames = frames
+                    .into_iter()
+                    .map(|(delay, rgba)| DecodedFrame { texture_id: upload_texture(device, queue, renderer, &rgba), delay })
+                    .collect();
+                Entry::Loaded {
+                    size,
+                    bytes,
+                    kind: Kind::Animated { frames, current_frame: 0, frame_started_at: now, visible: Cell::new(false) },
+                    last_used: Cell::new(now),
                 }
             }
+        };
+        if let Entry::Loaded { bytes, .. } = &entry {
+            self.total_bytes += bytes;
+        }
+        self.entries.insert(url, entry);
+    }
+
+    pub fn evict(&mut self, renderer: &mut imgui_wgpu::Renderer) {
+        if self.total_bytes <= TEXTURE_BUDGET_BYTES {
             return;
         }
-
-        match image::load_from_memory(bytes) {
-            Ok(img) => {
-                let rgba = img.to_rgba8();
-                let size = [rgba.width() as f32, rgba.height() as f32];
-                let texture_id = upload_texture(device, queue, renderer, &rgba);
-                self.entries.insert(url, Entry::Static { texture_id, size });
+        let now = Instant::now();
+        let mut candidates: Vec<(Instant, String)> = self
+            .entries
+            .iter()
+            .filter_map(|(url, e)| match e {
+                Entry::Loaded { last_used, .. } if now.duration_since(last_used.get()) > IN_USE_WINDOW => {
+                    Some((last_used.get(), url.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        candidates.sort();
+        for (_, url) in candidates {
+            if self.total_bytes <= TEXTURE_BUDGET_BYTES {
+                break;
             }
-            Err(e) => {
-                tracing::warn!("failed to decode image {url}: {e}");
-                self.entries.insert(url, Entry::Failed);
+            if let Some(Entry::Loaded { kind, bytes, .. }) = self.entries.remove(&url) {
+                self.total_bytes -= bytes;
+                match kind {
+                    Kind::Static { texture_id } => {
+                        renderer.textures.remove(texture_id);
+                    }
+                    Kind::Animated { frames, .. } => {
+                        for f in frames {
+                            renderer.textures.remove(f.texture_id);
+                        }
+                    }
+                }
             }
         }
     }
 
     pub fn tick(&mut self) {
         let now = Instant::now();
+        self.animating = false;
         for entry in self.entries.values_mut() {
-            if let Entry::Animated { frames, current_frame, frame_started_at, animating, .. } = entry {
-                if !*animating || frames.is_empty() {
+            if let Entry::Loaded { kind: Kind::Animated { frames, current_frame, frame_started_at, visible }, .. } = entry {
+                if !visible.replace(false) {
+                    *frame_started_at = now;
                     continue;
                 }
-                let delay = frames[*current_frame].delay;
-                if now.duration_since(*frame_started_at) >= delay {
+                self.animating = true;
+                if now.duration_since(*frame_started_at) >= frames[*current_frame].delay {
                     *current_frame = (*current_frame + 1) % frames.len();
                     *frame_started_at = now;
                 }
@@ -104,12 +170,27 @@ impl TextureCache {
     }
 
     pub fn get(&self, url: &str) -> Option<(imgui::TextureId, [f32; 2])> {
-        match self.entries.get(url)? {
-            Entry::Static { texture_id, size } => Some((*texture_id, *size)),
-            Entry::Animated { frames, current_frame, size, .. } => {
-                frames.get(*current_frame).map(|f| (f.texture_id, *size))
+        self.lookup(url, true)
+    }
+
+    pub fn get_still(&self, url: &str) -> Option<(imgui::TextureId, [f32; 2])> {
+        self.lookup(url, false)
+    }
+
+    fn lookup(&self, url: &str, animate: bool) -> Option<(imgui::TextureId, [f32; 2])> {
+        let Entry::Loaded { kind, size, last_used, .. } = self.entries.get(url)? else { return None };
+        last_used.set(Instant::now());
+        match kind {
+            Kind::Static { texture_id } => Some((*texture_id, *size)),
+            Kind::Animated { frames, current_frame, visible, .. } => {
+                if animate {
+                    visible.set(true);
+                    frames.get(*current_frame)
+                } else {
+                    frames.first()
+                }
+                .map(|f| (f.texture_id, *size))
             }
-            Entry::Pending | Entry::Failed => None,
         }
     }
 

@@ -2,7 +2,9 @@ mod app_state;
 mod backend;
 mod clipboard;
 mod images;
+mod ipc;
 mod markdown;
+mod presence;
 mod renderer;
 mod session_store;
 mod theme;
@@ -21,7 +23,7 @@ fn main() {
     let (event_tx, event_rx) = mpsc::unbounded_channel::<BackendEvent>();
     backend::spawn(&rt, cmd_rx, event_tx);
 
-    let mut state = AppState::default();
+    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, groups: app_state::load_groups(), notes: app_state::load_notes(), ..Default::default() };
     if let Some(dir) = theme::Theme::themes_dir() {
         let default_path = dir.join("discord-dark.toml");
         if let Ok(t) = theme::Theme::load_from_file(&default_path) {
@@ -40,7 +42,7 @@ fn main() {
 pub fn drain_backend_events(
     state: &mut AppState,
     event_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
-) -> Vec<(String, Vec<u8>)> {
+) -> Vec<(String, images::Decoded)> {
     let mut image_downloads = Vec::new();
     while let Ok(event) = event_rx.try_recv() {
         match event {
@@ -59,6 +61,12 @@ pub fn drain_backend_events(
             }
             BackendEvent::CaptchaInProgress => {
                 state.login_status = Some("Solve the captcha in the popup window...".into());
+            }
+            BackendEvent::ProfileLoaded { user_id, profile } => {
+                state.profiles.insert(user_id, profile);
+            }
+            BackendEvent::RpcApps(apps) => {
+                state.rpc_apps = apps;
             }
             BackendEvent::Error(err) => {
                 state.status_message = Some(err);
@@ -106,10 +114,10 @@ pub fn drain_backend_events(
                 }
                 state.selected_guild = None;
                 state.selected_channel = Some(channel_id);
-                state.show_friends_list = false;
+                state.sidebar_tab = 0;
             }
-            BackendEvent::ImageDownloaded { url, bytes } => {
-                image_downloads.push((url, bytes));
+            BackendEvent::ImageDownloaded { url, image } => {
+                image_downloads.push((url, image));
             }
         }
     }

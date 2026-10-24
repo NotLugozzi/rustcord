@@ -40,6 +40,11 @@ struct IdentifyProperties {
     device: &'static str,
 }
 
+/// Gateway op 3 frame. `status` is online/idle/dnd/invisible; a custom status is an activity of type 4.
+pub fn presence_frame(status: &str, activities: &[Value]) -> String {
+    json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
+}
+
 pub struct Gateway {
     token: String,
 }
@@ -49,7 +54,11 @@ impl Gateway {
         Self { token: token.into() }
     }
 
-    pub async fn run(&self, tx: mpsc::UnboundedSender<GatewayEvent>) -> Result<(), ClientError> {
+    pub async fn run(
+        &self,
+        tx: mpsc::UnboundedSender<GatewayEvent>,
+        mut outgoing: mpsc::UnboundedReceiver<String>,
+    ) -> Result<(), ClientError> {
         let (ws_stream, _) = tokio_tungstenite::connect_async(GATEWAY_URL).await?;
         let (mut write, mut read) = ws_stream.split();
 
@@ -96,6 +105,9 @@ impl Gateway {
                     if let WsMessage::Text(text) = frame {
                         self.handle_frame(&text, &tx)?;
                     }
+                }
+                Some(frame) = outgoing.recv() => {
+                    write.send(WsMessage::Text(frame)).await?;
                 }
                 _ = heartbeat_rx.recv() => {
                     write.send(WsMessage::Text(json!({ "op": 1, "d": null }).to_string())).await?;

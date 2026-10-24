@@ -82,6 +82,60 @@ pub struct Relationship {
     #[serde(rename = "type")]
     pub kind: RelationshipType,
     pub user: User,
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Badge {
+    pub description: String,
+    pub icon_url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UserProfile {
+    pub bio: Option<String>,
+    pub banner_url: Option<String>,
+    pub badges: Vec<Badge>,
+    pub mutual_guild_ids: Vec<String>,
+    pub mutual_friends: Vec<User>,
+}
+
+impl UserProfile {
+    pub fn from_value(v: &serde_json::Value) -> Self {
+        let str_of = |x: &serde_json::Value| x.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+        let user = &v["user"];
+        let banner_url = str_of(&user["banner"]).map(|hash| {
+            let ext = if hash.starts_with("a_") { "gif" } else { "png" };
+            format!("https://cdn.discordapp.com/banners/{}/{hash}.{ext}?size=480", user["id"].as_str().unwrap_or_default())
+        });
+        let badges = v["badges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| {
+                Some(Badge {
+                    description: b["description"].as_str().unwrap_or_default().to_string(),
+                    icon_url: format!("https://cdn.discordapp.com/badge-icons/{}.png", b["icon"].as_str()?),
+                })
+            })
+            .collect();
+        let mutual_guild_ids =
+            v["mutual_guilds"].as_array().into_iter().flatten().filter_map(|g| str_of(&g["id"])).collect();
+        let mutual_friends = v["mutual_friends"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|u| serde_json::from_value(u.clone()).ok())
+            .collect();
+        Self {
+            bio: str_of(&v["user_profile"]["bio"]).or_else(|| str_of(&user["bio"])),
+            banner_url,
+            badges,
+            mutual_guild_ids,
+            mutual_friends,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -114,6 +168,38 @@ pub struct Presence {
     pub status: PresenceStatus,
     #[serde(default)]
     pub client_status: ClientStatus,
+    #[serde(default)]
+    pub activities: Vec<Activity>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Activity {
+    pub name: String,
+    #[serde(rename = "type", default)]
+    pub kind: u8,
+    pub details: Option<String>,
+    pub state: Option<String>,
+}
+
+impl Activity {
+    pub fn summary(&self) -> String {
+        if self.kind == 4 {
+            return self.state.clone().unwrap_or_default();
+        }
+        let verb = match self.kind {
+            1 => "Streaming",
+            2 => "Listening to",
+            3 => "Watching",
+            5 => "Competing in",
+            _ => "Playing",
+        };
+        let mut out = format!("{verb} {}", self.name);
+        for extra in [&self.details, &self.state].into_iter().flatten() {
+            out.push_str(" - ");
+            out.push_str(extra);
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -8,7 +8,7 @@ use imgui_wgpu::{Renderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use pollster::block_on;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -158,9 +158,10 @@ impl AppWindow {
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
         let image_downloads = drain_backend_events(state, event_rx);
-        for (url, bytes) in image_downloads {
-            self.textures.ingest(url, &bytes, &self.device, &self.queue, &mut self.imgui.renderer);
+        for (url, image) in image_downloads {
+            self.textures.ingest(url, image, &self.device, &self.queue, &mut self.imgui.renderer);
         }
+        self.textures.evict(&mut self.imgui.renderer);
         self.textures.tick();
 
         let imgui = &mut self.imgui;
@@ -235,6 +236,7 @@ struct App {
     event_rx: UnboundedReceiver<BackendEvent>,
     window: Option<AppWindow>,
     theme_applied: bool,
+    last_input: Instant,
 }
 
 impl ApplicationHandler for App {
@@ -257,6 +259,10 @@ impl ApplicationHandler for App {
                 window.resize(size.width, size.height);
             }
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => {}
+            _ => self.last_input = Instant::now(),
+        }
+        match &event {
             WindowEvent::RedrawRequested => {
                 window.redraw(&mut self.state, &self.cmd_tx, &mut self.event_rx);
             }
@@ -279,8 +285,15 @@ impl ApplicationHandler for App {
         );
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(window) = self.window.as_mut() else { return };
+        // Full speed while interacting or animating; otherwise ~10 fps, enough to pick up backend events.
+        let busy = self.last_input.elapsed() < Duration::from_millis(400) || window.textures.animating;
+        if busy {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        } else {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
+        }
         window.window.request_redraw();
         window.imgui.platform.handle_event::<()>(
             window.imgui.context.io_mut(),
@@ -300,6 +313,7 @@ pub fn run(state: AppState, cmd_tx: UnboundedSender<UiCommand>, event_rx: Unboun
         event_rx,
         window: None,
         theme_applied: false,
+        last_input: Instant::now(),
     };
 
     event_loop.run_app(&mut app).expect("event loop failed");

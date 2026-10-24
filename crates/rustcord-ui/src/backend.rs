@@ -1,3 +1,4 @@
+use crate::presence;
 use crate::session_store;
 use rustcord_client::captcha;
 use rustcord_client::error::ClientError;
@@ -14,6 +15,43 @@ fn mime_guess_from_path(path: &std::path::Path) -> &'static str {
         _ => "application/octet-stream",
     }
 }
+
+pub(crate) static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn cache_file(url: &str) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.cache_dir().join("images").join(format!("{:016x}", h.finish())))
+}
+
+/// Small images (avatars, badges, icons) are cached on disk; big attachments aren't.
+const MAX_DISK_CACHED_BYTES: usize = 1024 * 1024;
+
+async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
+    let path = cache_file(url);
+    if let Some(bytes) = path.as_ref().and_then(|p| std::fs::read(p).ok()) {
+        return Some(bytes);
+    }
+    let client = HTTP.get_or_init(reqwest::Client::new);
+    let resp = client.get(url).send().await.and_then(|r| r.error_for_status());
+    let bytes = match resp {
+        Ok(r) => r.bytes().await.map_err(|e| tracing::warn!("failed to read image bytes for {url}: {e}")).ok()?.to_vec(),
+        Err(e) => {
+            tracing::warn!("failed to download image {url}: {e}");
+            return None;
+        }
+    };
+    if let Some(p) = path.filter(|_| bytes.len() <= MAX_DISK_CACHED_BYTES) {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, &bytes);
+    }
+    Some(bytes)
+}
+
+pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
 
 pub enum UiCommand {
     LoginWithPassword { email: String, password: String },
@@ -35,6 +73,10 @@ pub enum UiCommand {
     DownloadImage { url: String },
     OpenDmWithUser { user_id: String },
     StartTyping { channel_id: String },
+    LoadProfile { user_id: String },
+    SetPresence { status: String, custom_status: Option<String> },
+    SetManualActivity { name: String, details: String, state: String },
+    SetRpcEnabled { conn_id: u64, enabled: bool },
     Logout,
 }
 
@@ -44,6 +86,8 @@ pub enum BackendEvent {
     LoginFailed(String),
     LoggedIn,
     Error(String),
+    RpcApps(Vec<crate::presence::RpcAppInfo>),
+    ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile },
     Gateway(GatewayEvent),
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
@@ -51,7 +95,7 @@ pub enum BackendEvent {
     OlderMessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
     RelationshipsLoaded(Vec<rustcord_client::models::Relationship>),
     DmOpened(rustcord_client::models::Channel),
-    ImageDownloaded { url: String, bytes: Vec<u8> },
+    ImageDownloaded { url: String, image: crate::images::Decoded },
 }
 
 pub fn spawn(
@@ -59,6 +103,7 @@ pub fn spawn(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
 ) {
+    rt.spawn(crate::ipc::serve(event_tx.clone()));
     rt.spawn(async move {
         let mut rest: Option<RestClient> = None;
         let mut login_session: Option<LoginSession> = None;
@@ -187,15 +232,13 @@ pub fn spawn(
                 UiCommand::DownloadImage { url } => {
                     let event_tx = event_tx.clone();
                     tokio::spawn(async move {
-                        match reqwest::get(&url).await.and_then(|r| r.error_for_status()) {
-                            Ok(resp) => match resp.bytes().await {
-                                Ok(bytes) => {
-                                    let _ = event_tx.send(BackendEvent::ImageDownloaded { url, bytes: bytes.to_vec() });
-                                }
-                                Err(e) => tracing::warn!("failed to read image bytes for {url}: {e}"),
-                            },
-                            Err(e) => tracing::warn!("failed to download image {url}: {e}"),
-                        }
+                        let image = match fetch_image_bytes(&url).await {
+                            Some(bytes) => tokio::task::spawn_blocking(move || crate::images::decode(&bytes))
+                                .await
+                                .unwrap_or(crate::images::Decoded::Failed),
+                            None => crate::images::Decoded::Failed,
+                        };
+                        let _ = event_tx.send(BackendEvent::ImageDownloaded { url, image });
                     });
                 }
                 UiCommand::StartTyping { channel_id } => {
@@ -220,6 +263,38 @@ pub fn spawn(
                             }
                         }
                     }
+                }
+                UiCommand::LoadProfile { user_id } => {
+                    if let Some(client) = &rest {
+                        match client.profile(&user_id).await {
+                            Ok(v) => {
+                                let profile = rustcord_client::models::UserProfile::from_value(&v);
+                                let _ = event_tx.send(BackendEvent::ProfileLoaded { user_id, profile });
+                            }
+                            Err(e) => tracing::warn!("failed to load profile {user_id}: {e}"),
+                        }
+                    }
+                }
+                UiCommand::SetPresence { status, custom_status } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.set_status(&status, custom_status.as_deref()).await {
+                            tracing::warn!("failed to persist status: {e}");
+                        }
+                    }
+                    presence::set_status(&status, custom_status.as_deref());
+                    presence::publish(&event_tx);
+                }
+                UiCommand::SetManualActivity { name, details, state } => {
+                    let field = |s: String| (!s.is_empty()).then_some(s);
+                    let activity = field(name.trim().to_string()).map(|name| {
+                        serde_json::json!({ "name": name, "type": 0, "details": field(details), "state": field(state) })
+                    });
+                    presence::set_manual(activity);
+                    presence::publish(&event_tx);
+                }
+                UiCommand::SetRpcEnabled { conn_id, enabled } => {
+                    presence::set_enabled(conn_id, enabled);
+                    presence::publish(&event_tx);
                 }
                 UiCommand::Logout => {
                     session_store::clear_token();
@@ -289,9 +364,12 @@ async fn start_session(
         }
     };
 
-    if let Err(e) = client.current_user().await {
-        let _ = event_tx.send(BackendEvent::LoginFailed(e.to_string()));
-        return;
+    match client.current_user().await {
+        Ok(me) => presence::set_me(serde_json::to_value(me).unwrap_or_default()),
+        Err(e) => {
+            let _ = event_tx.send(BackendEvent::LoginFailed(e.to_string()));
+            return;
+        }
     }
 
     session_store::save_token(&token);
@@ -300,6 +378,8 @@ async fn start_session(
 
     let (gw_tx, mut gw_rx) = mpsc::unbounded_channel();
     let gateway = Gateway::new(token.clone());
+    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    *GATEWAY_TX.lock().unwrap() = Some(out_tx);
     let forward_tx = event_tx.clone();
     tokio::spawn(async move {
         while let Some(ev) = gw_rx.recv().await {
@@ -307,7 +387,7 @@ async fn start_session(
         }
     });
     tokio::spawn(async move {
-        if let Err(e) = gateway.run(gw_tx).await {
+        if let Err(e) = gateway.run(gw_tx, out_rx).await {
             tracing::warn!("gateway closed: {e}");
         }
     });

@@ -299,6 +299,16 @@ impl RestClient {
         Ok(resp.json::<Message>().await?)
     }
 
+    pub async fn profile(&self, user_id: &str) -> Result<serde_json::Value, ClientError> {
+        self.get(&format!("/users/{user_id}/profile?with_mutual_guilds=true&with_mutual_friends=true")).await
+    }
+
+    pub async fn set_status(&self, status: &str, custom_status: Option<&str>) -> Result<serde_json::Value, ClientError> {
+        let custom = custom_status.filter(|t| !t.is_empty()).map(|t| serde_json::json!({ "text": t }));
+        let body = serde_json::json!({ "status": status, "custom_status": custom });
+        self.request(Method::PATCH, "/users/@me/settings", Some(&body)).await
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
         self.request(Method::GET, path, None::<&()>).await
     }

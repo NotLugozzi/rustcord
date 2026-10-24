@@ -196,7 +196,9 @@ const MESSAGE_GAP: f32 = 12.0;
 const RAIL_WIDTH: f32 = 72.0;
 const RAIL_ICON_SIZE: [f32; 2] = [48.0, 48.0];
 const RAIL_PADDING_TOP: f32 = 12.0;
-const CHANNEL_LIST_WIDTH: f32 = 220.0;
+const SIDEBAR_MIN_WIDTH: f32 = 160.0;
+const SIDEBAR_MAX_WIDTH: f32 = 480.0;
+const SPLITTER_WIDTH: f32 = 6.0;
 
 fn draw_rail_circle(ui: &Ui, color: [f32; 4]) {
     let p_min = ui.cursor_screen_pos();
@@ -242,6 +244,7 @@ const USER_ROW_AVATAR_SIZE: [f32; 2] = [28.0, 28.0];
 struct UserRowResult {
     row_clicked: bool,
     avatar_clicked: bool,
+    right_clicked: bool,
 }
 
 fn status_color(status: rustcord_client::models::PresenceStatus) -> [f32; 4] {
@@ -269,21 +272,23 @@ fn draw_user_row(
     selected: bool,
     status: rustcord_client::models::PresenceStatus,
     platform: Option<&str>,
+    activity: Option<&str>,
     row_bg_color: [f32; 4],
 ) -> UserRowResult {
     let row_start = ui.cursor_pos();
-    let row_height = USER_ROW_AVATAR_SIZE[1] + 4.0;
+    let row_height = USER_ROW_AVATAR_SIZE[1] + 8.0;
 
     let row_clicked = ui
         .selectable_config(format!("##row_{}", user.id))
         .selected(selected)
         .size([0.0, row_height])
         .build();
+    let right_clicked = ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right);
 
-    ui.set_cursor_pos([row_start[0] + 4.0, row_start[1] + 2.0]);
+    ui.set_cursor_pos([row_start[0] + 4.0, row_start[1] + 4.0]);
     let avatar_screen_pos = ui.cursor_screen_pos();
     let avatar_url = rustcord_client::cdn::avatar_url(user, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
-    let avatar_clicked = if let Some((texture_id, _)) = textures.get(&avatar_url) {
+    let avatar_clicked = if let Some((texture_id, _)) = textures.get_still(&avatar_url) {
         draw_circular_image_button(ui, &format!("avatar_row_{}", user.id), texture_id, USER_ROW_AVATAR_SIZE)
     } else {
         textures.request(&avatar_url, cmd_tx);
@@ -300,7 +305,11 @@ fn draw_user_row(
 
     ui.same_line();
     let text_x = ui.cursor_pos()[0];
-    let text_y = row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0;
+    let text_y = if activity.is_some() {
+        row_start[1] + 3.0
+    } else {
+        row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0
+    };
     ui.set_cursor_pos([text_x, text_y]);
     let name_clicked = clickable_text(ui, &format!("name_row_{}", user.id), name, ui.style_color(imgui::StyleColor::Text));
     if let Some(platform) = platform {
@@ -312,8 +321,17 @@ fn draw_user_row(
         token.pop();
     }
 
-    ui.set_cursor_pos([row_start[0], row_start[1] + row_height]);
-    UserRowResult { row_clicked, avatar_clicked: avatar_clicked || name_clicked }
+    if let Some(activity) = activity {
+        ui.set_cursor_pos([text_x, text_y + ui.text_line_height()]);
+        let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
+        ui.set_window_font_scale(0.8);
+        ui.text(activity);
+        ui.set_window_font_scale(1.0);
+        token.pop();
+    }
+
+    ui.set_cursor_pos([row_start[0], row_start[1] + row_height + ui.clone_style().item_spacing[1]]);
+    UserRowResult { row_clicked, avatar_clicked: avatar_clicked || name_clicked, right_clicked }
 }
 
 fn draw_circular_image(ui: &Ui, texture_id: imgui::TextureId, size: [f32; 2]) {
@@ -385,6 +403,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     }
 
     let [display_w, display_h] = ui.io().display_size;
+    state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
+    let sidebar_width = state.sidebar_width;
 
     ui.window("servers")
         .position([0.0, 0.0], imgui::Condition::Always)
@@ -410,7 +430,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             for guild in &state.guilds {
                 let icon_url = rustcord_client::cdn::guild_icon_url(guild, 64);
                 let clicked = if let Some(url) = &icon_url {
-                    if let Some((texture_id, _)) = textures.get(url) {
+                    if let Some((texture_id, _)) = textures.get_still(url) {
                         draw_circular_image_button(ui, &format!("guild_icon_{}", guild.id), texture_id, RAIL_ICON_SIZE)
                     } else {
                         textures.request(url, cmd_tx);
@@ -438,7 +458,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
     ui.window("channels")
         .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
-        .size([CHANNEL_LIST_WIDTH, display_h], imgui::Condition::Always)
+        .size([sidebar_width, display_h], imgui::Condition::Always)
         .no_decoration()
         .draw_background(true)
         .build(|| {
@@ -474,82 +494,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                 }
             } else {
-                ui.input_text("##search", &mut state.dm_search)
-                    .hint("Search friends or DMs")
-                    .build();
-
-                let friends_label = if state.show_friends_list { "< Back to DMs" } else { "Friends" };
-                if ui.selectable(friends_label) {
-                    state.show_friends_list = !state.show_friends_list;
-                }
-                ui.separator();
-
-                if state.show_friends_list {
-                    let friends: Vec<rustcord_client::models::User> =
-                        state.friends().into_iter().map(|r| r.user.clone()).collect();
-                    if friends.is_empty() {
-                        ui.text_disabled("No friends found.");
-                    }
-                    for user in &friends {
-                        let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
-                        let status = state.presence_for(&user.id);
-                        let platform = state.platform_for(&user.id).map(str::to_string);
-                        let result = draw_user_row(
-                            ui,
-                            cmd_tx,
-                            textures,
-                            user,
-                            &name,
-                            false,
-                            status,
-                            platform.as_deref(),
-                            state.theme.panel,
-                        );
-                        if result.avatar_clicked {
-                            state.profile_popout = Some(user.clone());
-                        } else if result.row_clicked {
-                            let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
-                        }
-                    }
-                } else {
-                    let dms: Vec<(String, String, Option<rustcord_client::models::User>)> = state
-                        .filtered_dm_channels()
-                        .into_iter()
-                        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned()))
-                        .collect();
-                    if dms.is_empty() {
-                        ui.text_disabled("No direct messages.");
-                    }
-                    for (channel_id, name, recipient) in &dms {
-                        let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
-                        let (row_clicked, avatar_clicked) = if let Some(user) = recipient {
-                            let status = state.presence_for(&user.id);
-                            let platform = state.platform_for(&user.id).map(str::to_string);
-                            let result = draw_user_row(
-                                ui,
-                                cmd_tx,
-                                textures,
-                                user,
-                                name,
-                                is_selected,
-                                status,
-                                platform.as_deref(),
-                                state.theme.panel,
-                            );
-                            (result.row_clicked, result.avatar_clicked)
-                        } else {
-                            (ui.selectable_config(name).selected(is_selected).build(), false)
-                        };
-                        if avatar_clicked {
-                            if let Some(user) = recipient {
-                                state.profile_popout = Some(user.clone());
-                            }
-                        } else if row_clicked {
-                            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
-                            state.selected_channel = Some(channel_id.clone());
-                        }
-                    }
-                }
+                draw_dm_sidebar(ui, state, cmd_tx, textures);
             }
             });
 
@@ -557,12 +502,27 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             draw_user_bar(ui, state, cmd_tx, textures);
         });
 
+    ui.window("##sidebar_splitter")
+        .position([RAIL_WIDTH + sidebar_width - SPLITTER_WIDTH / 2.0, 0.0], imgui::Condition::Always)
+        .size([SPLITTER_WIDTH, display_h], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(false)
+        .build(|| {
+            ui.invisible_button("##splitter", [SPLITTER_WIDTH, display_h]);
+            if ui.is_item_hovered() || ui.is_item_active() {
+                ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
+            }
+            if ui.is_item_active() {
+                state.sidebar_width += ui.io().mouse_delta[0];
+            }
+        });
+
     draw_settings_dialog(ui, state, cmd_tx);
     draw_profile_popout(ui, state, cmd_tx, textures);
 
     ui.window("chat")
-        .position([RAIL_WIDTH + CHANNEL_LIST_WIDTH, 0.0], imgui::Condition::Always)
-        .size([display_w - RAIL_WIDTH - CHANNEL_LIST_WIDTH, display_h], imgui::Condition::Always)
+        .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
+        .size([display_w - RAIL_WIDTH - sidebar_width, display_h], imgui::Condition::Always)
         .no_decoration()
         .draw_background(true)
         .build(|| {
@@ -833,12 +793,13 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     let avatar_url =
         rustcord_client::cdn::avatar_url(&user, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
     let avatar_screen_pos = ui.cursor_screen_pos();
-    if let Some((texture_id, _)) = textures.get(&avatar_url) {
-        draw_circular_image(ui, texture_id, [28.0, 28.0]);
+    let avatar_clicked = if let Some((texture_id, _)) = textures.get(&avatar_url) {
+        draw_circular_image_button(ui, "my_avatar", texture_id, [28.0, 28.0])
     } else {
         textures.request(&avatar_url, cmd_tx);
         ui.dummy([28.0, 28.0]);
-    }
+        false
+    };
     draw_status_dot(
         ui,
         [avatar_screen_pos[0] + 25.0, avatar_screen_pos[1] + 25.0],
@@ -846,6 +807,41 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
         state.presence_for(&user.id),
         state.theme.background,
     );
+    if avatar_clicked {
+        ui.open_popup("status_popup");
+    }
+    ui.popup("status_popup", || {
+        use rustcord_client::models::PresenceStatus::*;
+        for (status, label, key) in [
+            (Online, "Online", "online"),
+            (Idle, "Idle", "idle"),
+            (Dnd, "Do Not Disturb", "dnd"),
+            (Invisible, "Invisible", "invisible"),
+        ] {
+            if ui.selectable_config(label).selected(state.my_status == status).build() {
+                state.my_status = status;
+                let custom = Some(state.custom_status_input.clone());
+                let _ = cmd_tx.send(UiCommand::SetPresence { status: key.into(), custom_status: custom });
+            }
+        }
+        ui.separator();
+        ui.input_text("##custom_status", &mut state.custom_status_input).hint("Custom status").build();
+        if ui.button("Set") {
+            let key = match state.my_status {
+                Idle => "idle",
+                Dnd => "dnd",
+                Invisible | Offline => "invisible",
+                Online => "online",
+            };
+            let custom = Some(state.custom_status_input.clone());
+            let _ = cmd_tx.send(UiCommand::SetPresence { status: key.into(), custom_status: custom });
+            ui.close_current_popup();
+        }
+        ui.same_line();
+        if ui.button("Clear") {
+            state.custom_status_input.clear();
+        }
+    });
     ui.same_line();
 
     let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
@@ -894,19 +890,173 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
     }
 }
 
+fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
+    let plus_width = 28.0;
+    ui.set_next_item_width(ui.content_region_avail()[0] - plus_width - ui.clone_style().item_spacing[0]);
+    ui.input_text("##search", &mut state.dm_search)
+        .hint("Search friends or DMs")
+        .build();
+    ui.same_line();
+    if ui.button("+##new_group") {
+        ui.open_popup("new_group");
+    }
+    ui.popup("new_group", || {
+        ui.text("New DM group");
+        ui.input_text("##group_name", &mut state.new_group_name).build();
+        let name = state.new_group_name.trim().to_string();
+        if ui.button("Create") && !name.is_empty() {
+            state.groups.push(crate::app_state::DmGroup { name, channels: Vec::new() });
+            state.sidebar_tab = state.groups.len() + 1;
+            state.new_group_name.clear();
+            state.save_groups();
+            ui.close_current_popup();
+        }
+    });
+
+    if let Some(_bar) = ui.tab_bar("sidebar_tabs") {
+        let labels: Vec<String> =
+            ["DMs".to_string(), "Friends".to_string()].into_iter().chain(state.groups.iter().map(|g| g.name.clone())).collect();
+        for (i, label) in labels.iter().enumerate() {
+            if ui.tab_item(format!("{label}###tab{i}")).is_some() {
+                state.sidebar_tab = i;
+            }
+        }
+    }
+    if state.sidebar_tab >= state.groups.len() + 2 {
+        state.sidebar_tab = 0;
+    }
+
+    if state.sidebar_tab == 1 {
+        let friends: Vec<rustcord_client::models::User> = state.friends().into_iter().map(|r| r.user.clone()).collect();
+        if friends.is_empty() {
+            ui.text_disabled("No friends found.");
+        }
+        for user in &friends {
+            let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+            let status = state.presence_for(&user.id);
+            let platform = state.platform_for(&user.id).map(str::to_string);
+            let activity = state.activity_for(&user.id);
+            let result = draw_user_row(ui, cmd_tx, textures, user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel);
+            if result.avatar_clicked {
+                state.profile_popout = Some(user.clone());
+            } else if result.row_clicked {
+                let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
+            }
+        }
+        return;
+    }
+
+    let group = state.sidebar_tab.checked_sub(2);
+    if let Some(g) = group {
+        if ui.small_button("Delete group") {
+            state.groups.remove(g);
+            state.sidebar_tab = 0;
+            state.save_groups();
+            return;
+        }
+    }
+    let dms: Vec<(String, String, Option<rustcord_client::models::User>)> = state
+        .filtered_dm_channels()
+        .into_iter()
+        .filter(|dm| group.is_none_or(|g| state.groups[g].channels.contains(&dm.id)))
+        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned()))
+        .collect();
+    if dms.is_empty() {
+        ui.text_disabled(if group.is_some() { "Empty group. Right-click a DM to add it." } else { "No direct messages." });
+    }
+    for (channel_id, name, recipient) in &dms {
+        let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
+        let (row_clicked, avatar_clicked, right_clicked) = if let Some(user) = recipient {
+            let status = state.presence_for(&user.id);
+            let platform = state.platform_for(&user.id).map(str::to_string);
+            let activity = state.activity_for(&user.id);
+            let r = draw_user_row(ui, cmd_tx, textures, user, name, is_selected, status, platform.as_deref(), activity.as_deref(), state.theme.panel);
+            (r.row_clicked, r.avatar_clicked, r.right_clicked)
+        } else {
+            let clicked = ui.selectable_config(name).selected(is_selected).build();
+            (clicked, false, ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right))
+        };
+        if right_clicked {
+            state.context_dm = Some(channel_id.clone());
+            ui.open_popup("dm_context");
+        }
+        if avatar_clicked {
+            if let Some(user) = recipient {
+                state.profile_popout = Some(user.clone());
+            }
+        } else if row_clicked {
+            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+            state.selected_channel = Some(channel_id.clone());
+        }
+    }
+
+    ui.popup("dm_context", || {
+        let Some(channel_id) = state.context_dm.clone() else { return };
+        if state.groups.is_empty() {
+            ui.text_disabled("Create a group with + first");
+        }
+        let mut changed = false;
+        for g in &mut state.groups {
+            let mut member = g.channels.contains(&channel_id);
+            if ui.checkbox(format!("{}##ctx", g.name), &mut member) {
+                if member {
+                    g.channels.push(channel_id.clone());
+                } else {
+                    g.channels.retain(|c| c != &channel_id);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            state.save_groups();
+        }
+    });
+}
+
+fn snowflake_date(id: &str) -> String {
+    let ms = (id.parse::<u64>().unwrap_or(0) >> 22) as i64 + 1_420_070_400_000;
+    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%b %d, %Y").to_string()).unwrap_or_default()
+}
+
 fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let Some(user) = state.profile_popout.clone() else { return };
+    if state.profiles_requested.insert(user.id.clone()) {
+        let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user.id.clone() });
+    }
+    let profile = state.profiles.get(&user.id).cloned().unwrap_or_default();
     let [display_w, display_h] = ui.io().display_size;
     let mut open = true;
     let mut message_clicked = false;
     ui.window(format!("Profile##{}", user.id))
         .opened(&mut open)
-        .position([display_w / 2.0 - 160.0, display_h / 2.0 - 140.0], imgui::Condition::Appearing)
-        .size([320.0, 280.0], imgui::Condition::Appearing)
+        .position([display_w / 2.0 - 260.0, display_h / 2.0 - 260.0], imgui::Condition::Appearing)
+        .size([520.0, 520.0], imgui::Condition::Appearing)
         .build(|| {
+            let width = ui.content_region_avail()[0];
+            let banner_size = [width, width * 0.3];
+            let banner_pos = ui.cursor_pos();
+            match profile.banner_url.as_deref().and_then(|u| textures.get(u).map(|t| (u, t))) {
+                Some((_, (texture_id, _))) => imgui::Image::new(texture_id, banner_size).build(ui),
+                None => {
+                    if let Some(url) = &profile.banner_url {
+                        textures.request(url, cmd_tx);
+                    }
+                    let p = ui.cursor_screen_pos();
+                    ui.get_window_draw_list()
+                        .add_rect(p, [p[0] + banner_size[0], p[1] + banner_size[1]], state.theme.accent)
+                        .filled(true)
+                        .build();
+                    ui.dummy(banner_size);
+                }
+            }
+            ui.set_cursor_pos([banner_pos[0] + 12.0, banner_pos[1] + banner_size[1] - 36.0]);
             let avatar_url =
                 rustcord_client::cdn::avatar_url(&user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
             let avatar_screen_pos = ui.cursor_screen_pos();
+            ui.get_window_draw_list()
+                .add_circle([avatar_screen_pos[0] + 40.0, avatar_screen_pos[1] + 40.0], 44.0, state.theme.panel)
+                .filled(true)
+                .build();
             if let Some((texture_id, _)) = textures.get(&avatar_url) {
                 draw_circular_image(ui, texture_id, [80.0, 80.0]);
             } else {
@@ -923,20 +1073,81 @@ fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
 
             let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
             ui.text(&display_name);
-            if let Some(platform) = state.platform_for(&user.id) {
-                ui.same_line();
-                ui.text_disabled(format!("({platform})"));
-            }
-            ui.text_disabled(format!("@{}", user.username));
-            ui.separator();
-            ui.text(format!("User ID: {}", user.id));
             if user.bot {
+                ui.same_line();
                 ui.text_disabled("BOT");
             }
-            ui.spacing();
+            ui.text_disabled(format!("@{}", user.username));
+            for badge in &profile.badges {
+                ui.same_line();
+                if let Some((texture_id, _)) = textures.get(&badge.icon_url) {
+                    imgui::Image::new(texture_id, [18.0, 18.0]).build(ui);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(&badge.description);
+                    }
+                } else {
+                    textures.request(&badge.icon_url, cmd_tx);
+                    ui.dummy([18.0, 18.0]);
+                }
+            }
             if ui.button("Message") {
                 let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
                 message_clicked = true;
+            }
+            if let Some(presence) = state.presences.get(&user.id) {
+                for activity in &presence.activities {
+                    ui.text_wrapped(activity.summary());
+                }
+            }
+
+            if let Some(_bar) = ui.tab_bar("profile_tabs") {
+                if ui.tab_item("About").is_some() {
+                    state.profile_tab = 0;
+                    if let Some(bio) = &profile.bio {
+                        ui.text_wrapped(bio);
+                        ui.spacing();
+                    }
+                    ui.text_disabled("Member Since");
+                    ui.text(snowflake_date(&user.id));
+                    if let Some(since) = state.relationships.iter().find(|r| r.user.id == user.id).and_then(|r| r.since.as_deref()) {
+                        ui.text_disabled("Friends Since");
+                        ui.text(since.get(..10).unwrap_or(since));
+                    }
+                    ui.spacing();
+                    ui.text_disabled("Note (only visible to you)");
+                    let mut note = state.notes.get(&user.id).cloned().unwrap_or_default();
+                    if ui.input_text_multiline("##note", &mut note, [-1.0, 60.0]).build() {
+                        if note.is_empty() {
+                            state.notes.remove(&user.id);
+                        } else {
+                            state.notes.insert(user.id.clone(), note);
+                        }
+                        crate::app_state::save_notes(&state.notes);
+                    }
+                }
+                if ui.tab_item(format!("{} Mutual Friends###mf", profile.mutual_friends.len())).is_some() {
+                    state.profile_tab = 1;
+                    for friend in &profile.mutual_friends {
+                        let name = friend.global_name.clone().unwrap_or_else(|| friend.username.clone());
+                        let avatar =
+                            rustcord_client::cdn::avatar_url(friend, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(friend));
+                        if let Some((texture_id, _)) = textures.get(&avatar) {
+                            draw_circular_image(ui, texture_id, [24.0, 24.0]);
+                        } else {
+                            textures.request(&avatar, cmd_tx);
+                            ui.dummy([24.0, 24.0]);
+                        }
+                        ui.same_line();
+                        ui.text(name);
+                    }
+                }
+                if ui.tab_item(format!("{} Mutual Servers###ms", profile.mutual_guild_ids.len())).is_some() {
+                    state.profile_tab = 2;
+                    for id in &profile.mutual_guild_ids {
+                        let name = state.guilds.iter().find(|g| &g.id == id).map(|g| g.name.as_str()).unwrap_or("Unknown server");
+                        ui.text(name);
+                    }
+                }
             }
         });
     if !open || message_clicked {

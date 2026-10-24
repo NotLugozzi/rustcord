@@ -10,6 +10,45 @@ pub struct ChannelGroup<'a> {
     pub channels: Vec<&'a Channel>,
 }
 
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub struct DmGroup {
+    pub name: String,
+    pub channels: Vec<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct GroupsFile {
+    groups: Vec<DmGroup>,
+}
+
+fn groups_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("dm_groups.toml"))
+}
+
+fn notes_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("notes.toml"))
+}
+
+pub fn load_notes() -> HashMap<String, String> {
+    let text = notes_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    toml::from_str(&text).unwrap_or_default()
+}
+
+pub fn save_notes(notes: &HashMap<String, String>) {
+    let Some(path) = notes_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = toml::to_string(notes) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+pub fn load_groups() -> Vec<DmGroup> {
+    let text = groups_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    toml::from_str::<GroupsFile>(&text).map(|f| f.groups).unwrap_or_default()
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub current_user: Option<User>,
@@ -17,7 +56,19 @@ pub struct AppState {
     pub dm_channels: Vec<Channel>,
     pub relationships: Vec<Relationship>,
     pub dm_search: String,
-    pub show_friends_list: bool,
+    pub sidebar_tab: usize,
+    pub sidebar_width: f32,
+    pub groups: Vec<DmGroup>,
+    pub new_group_name: String,
+    pub context_dm: Option<String>,
+    pub profiles: HashMap<String, rustcord_client::models::UserProfile>,
+    pub profiles_requested: std::collections::HashSet<String>,
+    pub notes: HashMap<String, String>,
+    pub profile_tab: usize,
+    pub rpc_apps: Vec<crate::presence::RpcAppInfo>,
+    pub manual_activity: [String; 3],
+    pub my_status: rustcord_client::models::PresenceStatus,
+    pub custom_status_input: String,
     pub guild_channels: HashMap<String, Vec<Channel>>,
     pub messages: HashMap<String, Vec<Message>>,
     pub selected_guild: Option<String>,
@@ -50,9 +101,25 @@ const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
 impl AppState {
     pub fn presence_for(&self, user_id: &str) -> rustcord_client::models::PresenceStatus {
         if self.current_user.as_ref().is_some_and(|u| u.id == user_id) {
-            return rustcord_client::models::PresenceStatus::Online;
+            return self.my_status;
         }
         self.presences.get(user_id).map(|p| p.status).unwrap_or(rustcord_client::models::PresenceStatus::Offline)
+    }
+
+    pub fn save_groups(&self) {
+        let Some(path) = groups_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = GroupsFile { groups: self.groups.iter().map(|g| DmGroup { name: g.name.clone(), channels: g.channels.clone() }).collect() };
+        if let Ok(text) = toml::to_string(&file) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    pub fn activity_for(&self, user_id: &str) -> Option<String> {
+        let acts = &self.presences.get(user_id)?.activities;
+        acts.iter().find(|a| a.kind != 4).or_else(|| acts.first()).map(|a| a.summary()).filter(|s| !s.is_empty())
     }
 
     pub fn platform_for(&self, user_id: &str) -> Option<&'static str> {
