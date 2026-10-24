@@ -145,8 +145,8 @@ impl Gateway {
                     token: &self.token,
                     properties: IdentifyProperties {
                         os: "Windows",
-                        browser: "Chrome",
-                        device: "",
+                        browser: "Discord Client",
+                        device: "Discord Client",
                     },
                     intents: None,
                 };

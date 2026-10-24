@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-const VOICE_VERSION: &str = "v=4";
+const VOICE_VERSION: &str = "v=8";
 
 #[derive(Debug, Clone)]
 pub enum VoiceGatewayEvent {
@@ -26,14 +26,15 @@ struct Payload {
 pub struct VoiceGateway {
     endpoint: String,
     guild_id: String,
+    channel_id: String,
     user_id: String,
     session_id: String,
     token: String,
 }
 
 impl VoiceGateway {
-    pub fn new(endpoint: String, guild_id: String, user_id: String, session_id: String, token: String) -> Self {
-        Self { endpoint, guild_id, user_id, session_id, token }
+    pub fn new(endpoint: String, guild_id: String, channel_id: String, user_id: String, session_id: String, token: String) -> Self {
+        Self { endpoint, guild_id, channel_id, user_id, session_id, token }
     }
 
     pub async fn run(
@@ -43,8 +44,7 @@ impl VoiceGateway {
     ) -> Result<(), ClientError> {
         let _ = tx.send(VoiceGatewayEvent::Connecting);
 
-        let host = self.endpoint.split(':').next().unwrap_or(&self.endpoint);
-        let url = format!("wss://{host}/?{VOICE_VERSION}");
+        let url = format!("wss://{}/?{VOICE_VERSION}", self.endpoint);
         let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
         let (mut write, mut read) = ws_stream.split();
 
@@ -52,9 +52,7 @@ impl VoiceGateway {
             .next()
             .await
             .ok_or_else(|| ClientError::GatewayClosed("no voice hello frame".into()))??;
-        let hello_text = hello.into_text()?;
-        tracing::info!("voice hello raw: {hello_text}");
-        let hello_payload: Payload = serde_json::from_str(&hello_text)?;
+        let hello_payload: Payload = serde_json::from_str(&hello.into_text()?)?;
         let heartbeat_interval = hello_payload
             .d
             .and_then(|d| d.get("heartbeat_interval").and_then(Value::as_f64))
@@ -64,18 +62,15 @@ impl VoiceGateway {
             "op": 0,
             "d": {
                 "server_id": self.guild_id,
+                "channel_id": self.channel_id,
                 "user_id": self.user_id,
                 "session_id": self.session_id,
                 "token": self.token,
+                "video": false,
+                "streams": [],
+                "max_dave_protocol_version": 0,
             }
         });
-        tracing::info!(
-            "voice identify: server_id={} user_id={} session_id={} token_len={}",
-            self.guild_id,
-            self.user_id,
-            self.session_id,
-            self.token.len()
-        );
         write.send(WsMessage::Text(identify.to_string())).await?;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel::<()>();
