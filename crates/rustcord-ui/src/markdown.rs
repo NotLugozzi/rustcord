@@ -20,6 +20,8 @@ pub enum Block {
 pub enum Span {
     Text { text: String, style: Style },
     Link { label: String, url: String },
+    CustomEmoji { name: String, id: String, animated: bool },
+    UnicodeEmoji { ch: char },
 }
 
 pub fn parse(input: &str) -> Vec<Block> {
@@ -92,6 +94,18 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
     }
 
     while i < chars.len() {
+        if let Some((name, id, animated, consumed)) = try_parse_custom_emoji(&chars[i..]) {
+            flush!();
+            spans.push(Span::CustomEmoji { name, id, animated });
+            i += consumed;
+            continue;
+        }
+        if crate::emoji_sprites::lookup(chars[i]).is_some() {
+            flush!();
+            spans.push(Span::UnicodeEmoji { ch: chars[i] });
+            i += 1;
+            continue;
+        }
         if let Some((label, url, consumed)) = try_parse_link(&chars[i..]) {
             flush!();
             spans.push(Span::Link { label, url });
@@ -209,6 +223,40 @@ fn find_matching_pair(chars: &[char], start: usize, marker: char) -> Option<usiz
         j += 1;
     }
     None
+}
+
+fn try_parse_custom_emoji(chars: &[char]) -> Option<(String, String, bool, usize)> {
+    let mut j = 0;
+    if chars.first() != Some(&'<') {
+        return None;
+    }
+    j += 1;
+    let animated = chars.get(j) == Some(&'a');
+    if animated {
+        j += 1;
+    }
+    if chars.get(j) != Some(&':') {
+        return None;
+    }
+    j += 1;
+    let name_start = j;
+    while chars.get(j).is_some_and(|c| *c != ':') {
+        j += 1;
+    }
+    if j == name_start || chars.get(j) != Some(&':') {
+        return None;
+    }
+    let name: String = chars[name_start..j].iter().collect();
+    j += 1;
+    let id_start = j;
+    while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+        j += 1;
+    }
+    if j == id_start || chars.get(j) != Some(&'>') {
+        return None;
+    }
+    let id: String = chars[id_start..j].iter().collect();
+    Some((name, id, animated, j + 1))
 }
 
 fn try_parse_link(chars: &[char]) -> Option<(String, String, usize)> {

@@ -38,11 +38,20 @@ fn same_group_window(a: &str, b: &str) -> bool {
     (b - a).num_minutes().abs() < 5
 }
 
-fn draw_markdown(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, content: &str, revealed_spoilers: &mut std::collections::HashSet<usize>, id_seed: &str) {
+fn draw_markdown(
+    ui: &Ui,
+    fonts: &Fonts,
+    theme: &crate::theme::Theme,
+    content: &str,
+    revealed_spoilers: &mut std::collections::HashSet<usize>,
+    id_seed: &str,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+) {
     let blocks = markdown::parse(content);
     for (block_idx, block) in blocks.iter().enumerate() {
         match block {
-            Block::Paragraph(spans) => draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx),
+            Block::Paragraph(spans) => draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx),
             Block::Heading { level, spans } => {
                 let font = match level {
                     1 => fonts.bold,
@@ -56,7 +65,7 @@ fn draw_markdown(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, content: &
                 };
                 let token = ui.push_font(font);
                 ui.set_window_font_scale(scale);
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx);
                 ui.set_window_font_scale(1.0);
                 token.pop();
             }
@@ -64,7 +73,7 @@ fn draw_markdown(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, content: &
                 let token = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
                 ui.text("| ");
                 ui.same_line();
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx);
                 token.pop();
             }
             Block::CodeBlock { code, language } => {
@@ -96,6 +105,8 @@ fn draw_spans(
     revealed_spoilers: &mut std::collections::HashSet<usize>,
     id_seed: &str,
     block_idx: usize,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
 ) {
     for (span_idx, span) in spans.iter().enumerate() {
         if span_idx > 0 {
@@ -128,8 +139,38 @@ fn draw_spans(
                     ui.tooltip_text(url);
                 }
             }
+            Span::CustomEmoji { name, id, animated } => {
+                let ext = if *animated { "gif" } else { "png" };
+                let url = format!("https://cdn.discordapp.com/emojis/{id}.{ext}?size=32");
+                if let Some((texture_id, size)) = textures.get(&url) {
+                    let scale = (EMOJI_SIZE / size[0].max(1.0)).min(1.0);
+                    imgui::Image::new(texture_id, [size[0] * scale, size[1] * scale]).build(ui);
+                } else {
+                    textures.request(&url, cmd_tx);
+                    ui.dummy([EMOJI_SIZE, EMOJI_SIZE]);
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(format!(":{name}:"));
+                }
+            }
+            Span::UnicodeEmoji { ch } => {
+                if !draw_unicode_emoji(ui, textures, *ch, [EMOJI_SIZE, EMOJI_SIZE]) {
+                    ui.dummy([EMOJI_SIZE, EMOJI_SIZE]);
+                }
+            }
         }
     }
+}
+
+const EMOJI_SIZE: f32 = 22.0;
+
+fn draw_unicode_emoji(ui: &Ui, textures: &TextureCache, ch: char, display_size: [f32; 2]) -> bool {
+    let Some(rect) = crate::emoji_sprites::lookup(ch) else { return false };
+    let Some((texture_id, sheet_size)) = textures.get_still(crate::emoji_sprites::SHEET_URL) else { return false };
+    let uv0 = [rect.x / sheet_size[0], rect.y / sheet_size[1]];
+    let uv1 = [(rect.x + rect.w) / sheet_size[0], (rect.y + rect.h) / sheet_size[1]];
+    imgui::Image::new(texture_id, display_size).uv0(uv0).uv1(uv1).build(ui);
+    true
 }
 
 fn draw_styled_text(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, text: &str, style: Style) {
@@ -363,6 +404,316 @@ fn draw_circular_image_button(ui: &Ui, id: &str, texture_id: imgui::TextureId, s
     clicked
 }
 
+fn has_sprite(s: &str) -> bool {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => crate::emoji_sprites::lookup(ch).is_some(),
+        _ => false,
+    }
+}
+
+static UNICODE_EMOJI: std::sync::LazyLock<Vec<&'static emojis::Emoji>> =
+    std::sync::LazyLock::new(|| emojis::iter().filter(|e| has_sprite(e.as_str())).collect());
+
+const EMOJI_CATEGORIES: &[(&str, emojis::Group)] = &[
+    ("Smileys", emojis::Group::SmileysAndEmotion),
+    ("People", emojis::Group::PeopleAndBody),
+    ("Animals", emojis::Group::AnimalsAndNature),
+    ("Food", emojis::Group::FoodAndDrink),
+    ("Travel", emojis::Group::TravelAndPlaces),
+    ("Activities", emojis::Group::Activities),
+    ("Objects", emojis::Group::Objects),
+    ("Symbols", emojis::Group::Symbols),
+    ("Flags", emojis::Group::Flags),
+];
+
+const EMOJI_GRID_COLUMNS: usize = 8;
+const AUTOCOMPLETE_MAX_RESULTS: usize = 8;
+
+enum EmojiMatch<'a> {
+    Unicode(&'static emojis::Emoji),
+    Custom(&'a rustcord_client::models::Emoji),
+}
+
+impl EmojiMatch<'_> {
+    fn shortcode(&self) -> &str {
+        match self {
+            EmojiMatch::Unicode(e) => e.shortcode().unwrap_or_else(|| e.name()),
+            EmojiMatch::Custom(e) => &e.name,
+        }
+    }
+
+    fn insert_text(&self) -> String {
+        match self {
+            EmojiMatch::Unicode(e) => e.as_str().to_string(),
+            EmojiMatch::Custom(e) => {
+                let tag = if e.animated { "a" } else { "" };
+                format!("<{tag}:{}:{}>", e.name, e.id)
+            }
+        }
+    }
+}
+
+fn trailing_emoji_token(text: &str) -> Option<(usize, &str)> {
+    let colon_pos = text.rfind(':')?;
+    let partial = &text[colon_pos + 1..];
+    if partial.is_empty() || partial.len() > 32 || partial.contains(char::is_whitespace) {
+        return None;
+    }
+    if text[..colon_pos].ends_with(':') {
+        return None;
+    }
+    Some((colon_pos, partial))
+}
+
+fn emoji_autocomplete_matches<'a>(state: &'a AppState, partial: &str) -> Vec<EmojiMatch<'a>> {
+    let partial = partial.to_lowercase();
+    let mut matches: Vec<EmojiMatch> = Vec::new();
+    for (_guild, emoji) in state.available_emojis() {
+        if emoji.name.to_lowercase().starts_with(&partial) {
+            matches.push(EmojiMatch::Custom(emoji));
+        }
+    }
+    for emoji in UNICODE_EMOJI.iter() {
+        if let Some(shortcode) = emoji.shortcode() {
+            if shortcode.starts_with(&partial) {
+                matches.push(EmojiMatch::Unicode(emoji));
+            }
+        }
+    }
+    matches.truncate(AUTOCOMPLETE_MAX_RESULTS);
+    matches
+}
+
+fn draw_emoji_autocomplete(
+    ui: &Ui,
+    state: &mut AppState,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    bar_start: [f32; 2],
+) -> Option<(usize, String)> {
+    let (token_start, partial) = trailing_emoji_token(&state.compose_buf)?;
+    let partial = partial.to_string();
+    let match_count = emoji_autocomplete_matches(state, &partial).len();
+    if match_count == 0 {
+        return None;
+    }
+    if state.emoji_autocomplete_selected >= match_count {
+        state.emoji_autocomplete_selected = 0;
+    }
+    if ui.is_key_pressed(imgui::Key::DownArrow) {
+        state.emoji_autocomplete_selected = (state.emoji_autocomplete_selected + 1) % match_count;
+    }
+    if ui.is_key_pressed(imgui::Key::UpArrow) {
+        state.emoji_autocomplete_selected = (state.emoji_autocomplete_selected + match_count - 1) % match_count;
+    }
+    let confirmed_by_key = ui.is_key_pressed(imgui::Key::Tab) || ui.is_key_pressed(imgui::Key::Enter);
+    let matches = emoji_autocomplete_matches(state, &partial);
+
+    let mut picked = None;
+    let popup_pos = [bar_start[0], bar_start[1] - matches.len().min(AUTOCOMPLETE_MAX_RESULTS) as f32 * 28.0 - 8.0];
+    ui.window("##emoji_autocomplete")
+        .position(popup_pos, imgui::Condition::Always)
+        .size([260.0, matches.len() as f32 * 28.0 + 12.0], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(true)
+        .no_inputs()
+        .focus_on_appearing(false)
+        .build(|| {
+            for (idx, m) in matches.iter().enumerate() {
+                let selected = idx == state.emoji_autocomplete_selected;
+                let row_height = 20.0;
+                let row_start = ui.cursor_pos();
+                let clicked = ui.selectable_config(format!("##autocomplete_{idx}")).selected(selected).size([0.0, row_height]).build();
+                ui.set_cursor_pos(row_start);
+                match m {
+                    EmojiMatch::Unicode(e) => {
+                        let ch = e.as_str().chars().next().unwrap_or(' ');
+                        if !draw_unicode_emoji(ui, textures, ch, [18.0, 18.0]) {
+                            ui.dummy([18.0, 18.0]);
+                        }
+                        ui.same_line();
+                        ui.text(format!(":{}:", m.shortcode()));
+                    }
+                    EmojiMatch::Custom(e) => {
+                        let url = rustcord_client::cdn::custom_emoji_url(e, 32);
+                        if let Some((texture_id, size)) = textures.get(&url) {
+                            let scale = (18.0 / size[0].max(1.0)).min(1.0);
+                            imgui::Image::new(texture_id, [size[0] * scale, size[1] * scale]).build(ui);
+                        } else {
+                            textures.request(&url, cmd_tx);
+                            ui.dummy([18.0, 18.0]);
+                        }
+                        ui.same_line();
+                        ui.text(format!(":{}:", e.name));
+                    }
+                }
+                if (selected && confirmed_by_key) || clicked {
+                    picked = Some(m.insert_text());
+                }
+            }
+        });
+    picked.map(|text| (token_start, text))
+}
+
+const EMOJI_PICKER_WIDTH: f32 = 360.0;
+const EMOJI_PICKER_HEIGHT: f32 = 340.0;
+const EMOJI_SIDEBAR_WIDTH: f32 = 72.0;
+const CUSTOM_TAB: usize = 0;
+
+fn draw_custom_emoji_grid(
+    ui: &Ui,
+    custom: &[(&rustcord_client::models::Guild, &rustcord_client::models::Emoji)],
+    filter: &str,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+) -> Option<String> {
+    let mut insert = None;
+    let mut col = 0;
+    for (_guild, emoji) in custom {
+        if !filter.is_empty() && !emoji.name.to_lowercase().contains(filter) {
+            continue;
+        }
+        let url = rustcord_client::cdn::custom_emoji_url(emoji, 32);
+        if col > 0 {
+            ui.same_line();
+        }
+        if let Some((texture_id, size)) = textures.get(&url) {
+            let scale = (24.0 / size[0].max(1.0)).min(1.0);
+            if ui.invisible_button(format!("##custom_emoji_{}", emoji.id), [size[0] * scale, size[1] * scale]) {
+                let tag = if emoji.animated { "a" } else { "" };
+                insert = Some(format!("<{tag}:{}:{}>", emoji.name, emoji.id));
+            }
+            let p_min = ui.item_rect_min();
+            let p_max = ui.item_rect_max();
+            ui.get_window_draw_list().add_image(texture_id, p_min, p_max).build();
+        } else {
+            textures.request(&url, cmd_tx);
+            ui.dummy([24.0, 24.0]);
+        }
+        if ui.is_item_hovered() {
+            ui.tooltip_text(format!(":{}:", emoji.name));
+        }
+        col = (col + 1) % EMOJI_GRID_COLUMNS;
+    }
+    insert
+}
+
+fn draw_unicode_emoji_grid(ui: &Ui, textures: &TextureCache, group: Option<emojis::Group>, filter: &str) -> Option<String> {
+    let mut insert = None;
+    let mut col = 0;
+    for emoji in UNICODE_EMOJI.iter() {
+        if !filter.is_empty() {
+            let shortcode = emoji.shortcode().unwrap_or_default();
+            if !shortcode.contains(filter) && !emoji.name().to_lowercase().contains(filter) {
+                continue;
+            }
+        } else if Some(emoji.group()) != group {
+            continue;
+        }
+        if col > 0 {
+            ui.same_line();
+        }
+        let shortcode = emoji.shortcode().unwrap_or_else(|| emoji.name());
+        let ch = emoji.as_str().chars().next().unwrap_or(' ');
+        let picked = if let Some(rect) = crate::emoji_sprites::lookup(ch) {
+            if let Some((texture_id, sheet_size)) = textures.get_still(crate::emoji_sprites::SHEET_URL) {
+                let uv0 = [rect.x / sheet_size[0], rect.y / sheet_size[1]];
+                let uv1 = [(rect.x + rect.w) / sheet_size[0], (rect.y + rect.h) / sheet_size[1]];
+                ui.image_button_config(format!("##emoji_{shortcode}"), texture_id, [24.0, 24.0])
+                    .uv0(uv0)
+                    .uv1(uv1)
+                    .build()
+            } else {
+                ui.dummy([24.0, 24.0]);
+                false
+            }
+        } else {
+            ui.button(format!("{}##emoji_{shortcode}", emoji.as_str()))
+        };
+        if picked {
+            insert = Some(emoji.as_str().to_string());
+        }
+        if ui.is_item_hovered() {
+            ui.tooltip_text(format!(":{shortcode}:"));
+        }
+        col = (col + 1) % EMOJI_GRID_COLUMNS;
+    }
+    insert
+}
+
+fn draw_emoji_picker(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
+    let mut insert: Option<String> = None;
+    ui.popup("emoji_picker", || {
+        ui.set_next_item_width(EMOJI_PICKER_WIDTH);
+        ui.input_text("##emoji_search", &mut state.emoji_picker_filter).hint("Search emoji...").build();
+        let filter = state.emoji_picker_filter.to_lowercase();
+        ui.separator();
+
+        let has_custom = !state.guild_emojis.is_empty();
+        if filter.is_empty() {
+            if state.emoji_picker_category == CUSTOM_TAB && !has_custom {
+                state.emoji_picker_category = 1;
+            }
+            ui.child_window("emoji_sidebar").size([EMOJI_SIDEBAR_WIDTH, EMOJI_PICKER_HEIGHT]).build(|| {
+                if has_custom {
+                    let selected = state.emoji_picker_category == CUSTOM_TAB;
+                    let token = selected.then(|| ui.push_style_color(imgui::StyleColor::Button, state.theme.accent));
+                    if ui.button_with_size("Custom", [EMOJI_SIDEBAR_WIDTH - 16.0, 0.0]) {
+                        state.emoji_picker_category = CUSTOM_TAB;
+                    }
+                    drop(token);
+                    ui.separator();
+                }
+                for (idx, (label, _)) in EMOJI_CATEGORIES.iter().enumerate() {
+                    let tab = idx + 1;
+                    let selected = state.emoji_picker_category == tab;
+                    let token = selected.then(|| ui.push_style_color(imgui::StyleColor::Button, state.theme.accent));
+                    if ui.button_with_size(*label, [EMOJI_SIDEBAR_WIDTH - 16.0, 0.0]) {
+                        state.emoji_picker_category = tab;
+                    }
+                    drop(token);
+                }
+            });
+            ui.same_line();
+        }
+
+        ui.child_window("emoji_grid")
+            .size([EMOJI_PICKER_WIDTH - if filter.is_empty() { EMOJI_SIDEBAR_WIDTH + 8.0 } else { 0.0 }, EMOJI_PICKER_HEIGHT])
+            .build(|| {
+                let custom = state.available_emojis();
+                let showing_custom_tab = filter.is_empty() && state.emoji_picker_category == CUSTOM_TAB;
+
+                if showing_custom_tab {
+                    insert = draw_custom_emoji_grid(ui, &custom, &filter, textures, cmd_tx);
+                    return;
+                }
+
+                if !filter.is_empty() && !custom.is_empty() {
+                    if let Some(picked) = draw_custom_emoji_grid(ui, &custom, &filter, textures, cmd_tx) {
+                        insert = Some(picked);
+                    }
+                    if custom.iter().any(|(_, e)| e.name.to_lowercase().contains(&filter)) {
+                        ui.separator();
+                    }
+                }
+
+                let group = if filter.is_empty() {
+                    Some(EMOJI_CATEGORIES[state.emoji_picker_category.saturating_sub(1).min(EMOJI_CATEGORIES.len() - 1)].1)
+                } else {
+                    None
+                };
+                if let Some(picked) = draw_unicode_emoji_grid(ui, textures, group, &filter) {
+                    insert = Some(picked);
+                }
+            });
+    });
+    if let Some(glyph) = insert {
+        state.compose_buf.push_str(&glyph);
+        state.focus_compose = true;
+    }
+}
+
 fn draw_attachment(
     ui: &Ui,
     cmd_tx: &UnboundedSender<UiCommand>,
@@ -397,6 +748,17 @@ fn draw_attachment(
 }
 
 pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, fonts: &Fonts) {
+    if let Some([left, right]) = state.theme.gradient {
+        let [display_w, display_h] = ui.io().display_size;
+        ui.get_background_draw_list().add_rect_filled_multicolor(
+            [0.0, 0.0],
+            [display_w, display_h],
+            left,
+            right,
+            right,
+            left,
+        );
+    }
     if !state.logged_in {
         draw_login(ui, state, cmd_tx);
         let _ = textures;
@@ -609,7 +971,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 token.pop();
 
                                 if !msg.content.is_empty() {
-                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx);
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
@@ -625,7 +987,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
                                 if !msg.content.is_empty() {
-                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id);
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx);
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
@@ -687,11 +1049,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
                     let scroll_y = ui.scroll_y();
                     let near_bottom = scroll_y >= ui.scroll_max_y() - 40.0;
-                    if has_new_messages && (near_bottom || seen_count == 0) {
+                    let snapping_to_bottom = has_new_messages && (near_bottom || seen_count == 0);
+                    if snapping_to_bottom {
                         ui.set_scroll_here_y_with_ratio(1.0);
                     }
 
-                    if scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages {
+                    if !snapping_to_bottom && scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages {
                         if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), messages.first()) {
                             state.loading_older_messages = true;
                             let _ = cmd_tx.send(UiCommand::LoadOlderMessages {
@@ -793,21 +1156,39 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             }
             let before_edit = state.compose_buf.clone();
             ui.set_next_item_width((bar_width - plus_width - right_width - spacing).max(40.0));
-            let enter_pressed = ui
+            let enter_pressed_raw = ui
                 .input_text("##compose", &mut state.compose_buf)
                 .enter_returns_true(true)
                 .build();
             let input_focused = ui.is_item_focused();
+            let autocomplete_active = trailing_emoji_token(&state.compose_buf).is_some();
+
+            let mut enter_pressed = enter_pressed_raw;
+            if input_focused && autocomplete_active {
+                enter_pressed = false;
+                if let Some((token_start, insert_text)) = draw_emoji_autocomplete(ui, state, textures, cmd_tx, bar_start) {
+                    state.compose_buf.truncate(token_start);
+                    state.compose_buf.push_str(&insert_text);
+                    state.compose_buf.push(' ');
+                    state.focus_compose = true;
+                    state.emoji_autocomplete_selected = 0;
+                }
+            }
 
             for label in right_labels {
                 ui.same_line();
                 if ui.button(label) {
-                    ui.open_popup("picker_soon");
+                    if label == "Emoji" {
+                        ui.open_popup("emoji_picker");
+                    } else {
+                        ui.open_popup("picker_soon");
+                    }
                 }
             }
             ui.popup("picker_soon", || {
-                ui.text_disabled("GIFs, stickers and emoji pickers are coming soon.");
+                ui.text_disabled("GIFs and stickers are coming soon.");
             });
+            draw_emoji_picker(ui, state, textures, cmd_tx);
 
             let compose_focused = input_focused;
             if compose_focused && ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::V) {
@@ -1384,7 +1765,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
 
             let theme_paths = crate::theme::Theme::list_available();
             if theme_paths.is_empty() {
-                ui.text_disabled("No themes found in config directory.");
+                ui.text_disabled("No themes are available.");
             }
             for path in &theme_paths {
                 let label = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();

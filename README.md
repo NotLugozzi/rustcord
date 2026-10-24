@@ -71,7 +71,10 @@ in the server rail to log out and clear the saved token.
 
 Themes are plain TOML files under `~/.config/rustcord/themes/` (platform
 equivalent paths apply on Windows/macOS), each defining a small color
-palette:
+palette. The built-in themes are installed there on first launch, including
+in packaged builds. Alongside Discord Dark, Nord, and Solarized Light, the
+picker includes Aurora, Sunset, and Cosmic gradients. Custom themes may add
+an optional two-color horizontal gradient:
 
 ```toml
 name = "my-theme"
@@ -82,8 +85,9 @@ text_muted    = [0.60, 0.62, 0.66, 1.0]
 accent        = [0.35, 0.40, 0.95, 1.0]
 accent_hover  = [0.45, 0.50, 1.0,  1.0]
 border        = [0.08, 0.09, 0.10, 1.0]
+gradient      = [[0.10, 0.75, 0.67, 1.0], [0.31, 0.27, 0.78, 1.0]]
 ```
 
-Copy any file from `themes/` into that directory to try it, then rename it
-`discord-dark.toml` (the default loaded at startup) or wire up a theme
-switcher in the UI.
+Add your own TOML theme to that directory to make it appear in the theme
+switcher. The selected theme applies immediately; `discord-dark.toml` is the
+default loaded at startup.

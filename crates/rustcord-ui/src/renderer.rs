@@ -91,7 +91,6 @@ impl AppWindow {
                 ..Default::default()
             })
         };
-
         let regular = context.fonts().add_font(&[FontSource::TtfData {
             data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
             size_pixels: font_size,
@@ -126,7 +125,7 @@ impl AppWindow {
         };
         let renderer = Renderer::new(&mut context, &device, &queue, renderer_config);
 
-        let imgui = ImguiState {
+        let mut imgui = ImguiState {
             context,
             platform,
             renderer,
@@ -134,6 +133,10 @@ impl AppWindow {
             last_cursor: None,
             fonts,
         };
+
+        let mut textures = TextureCache::default();
+        let emoji_sheet = crate::images::decode(crate::emoji_sprites::SHEET_BYTES);
+        textures.ingest(crate::emoji_sprites::SHEET_URL.to_string(), emoji_sheet, &device, &queue, &mut imgui.renderer);
 
         Self {
             device,
@@ -143,7 +146,7 @@ impl AppWindow {
             surface,
             hidpi_factor: hidpi_factor,
             imgui,
-            textures: TextureCache::default(),
+            textures,
         }
     }
 
@@ -157,7 +160,7 @@ impl AppWindow {
     }
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
-        let image_downloads = drain_backend_events(state, event_rx);
+        let image_downloads = drain_backend_events(state, event_rx, cmd_tx);
         for (url, image) in image_downloads {
             self.textures.ingest(url, image, &self.device, &self.queue, &mut self.imgui.renderer);
         }

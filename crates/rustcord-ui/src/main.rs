@@ -1,6 +1,7 @@
 mod app_state;
 mod backend;
 mod clipboard;
+mod emoji_sprites;
 mod images;
 mod ipc;
 mod markdown;
@@ -24,6 +25,7 @@ fn main() {
     backend::spawn(&rt, cmd_rx, event_tx);
 
     let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), ..Default::default() };
+    theme::Theme::install_bundled();
     if let Some(dir) = theme::Theme::themes_dir() {
         let default_path = dir.join("discord-dark.toml");
         if let Ok(t) = theme::Theme::load_from_file(&default_path) {
@@ -61,6 +63,7 @@ fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Messa
 pub fn drain_backend_events(
     state: &mut AppState,
     event_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
+    cmd_tx: &mpsc::UnboundedSender<UiCommand>,
 ) -> Vec<(String, images::Decoded)> {
     let mut image_downloads = Vec::new();
     while let Ok(event) = event_rx.try_recv() {
@@ -92,8 +95,15 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::Ready { user, guilds, friend_presences }) => {
                 state.current_user = Some(user);
+                let guild_ids = guilds.iter().map(|g| g.id.clone()).collect();
                 state.guilds = guilds;
                 for presence in friend_presences {
+                    state.presences.insert(presence.user.id.clone(), presence);
+                }
+                let _ = cmd_tx.send(UiCommand::LoadAllGuildEmojis { guild_ids });
+            }
+            BackendEvent::Gateway(GatewayEvent::Presences(presences)) => {
+                for presence in presences {
                     state.presences.insert(presence.user.id.clone(), presence);
                 }
             }
@@ -102,6 +112,9 @@ pub fn drain_backend_events(
                     typing.remove(&message.author.id);
                 }
                 notify_if_relevant(state, &message);
+                if message.guild_id.is_none() && !state.dm_channels.iter().any(|c| c.id == message.channel_id) {
+                    let _ = cmd_tx.send(UiCommand::RefreshDmChannels);
+                }
                 state.push_message(message);
             }
             BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
@@ -128,6 +141,9 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::Unknown { .. }) => {}
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
                 state.guild_channels.insert(guild_id, channels);
+            }
+            BackendEvent::GuildEmojisLoaded { guild_id, emojis } => {
+                state.guild_emojis.insert(guild_id, emojis);
             }
             BackendEvent::DmChannelsLoaded(channels) => {
                 state.dm_channels = channels;

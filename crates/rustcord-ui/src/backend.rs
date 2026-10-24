@@ -57,6 +57,7 @@ pub enum UiCommand {
     LoginWithToken { token: String },
     SubmitMfa { ticket: String, code: String },
     SelectGuild { guild_id: String },
+    LoadAllGuildEmojis { guild_ids: Vec<String> },
     SelectChannel { channel_id: String },
     LoadOlderMessages { channel_id: String, before: String },
     SendMessage { channel_id: String, content: String, reply_to: Option<String> },
@@ -71,6 +72,7 @@ pub enum UiCommand {
     },
     DownloadImage { url: String },
     OpenDmWithUser { user_id: String },
+    RefreshDmChannels,
     StartTyping { channel_id: String },
     LoadProfile { user_id: String },
     EditMessage { channel_id: String, message_id: String, content: String },
@@ -91,6 +93,7 @@ pub enum BackendEvent {
     ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile },
     Gateway(GatewayEvent),
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
+    GuildEmojisLoaded { guild_id: String, emojis: Vec<rustcord_client::models::Emoji> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
     MessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
     OlderMessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
@@ -139,13 +142,19 @@ pub fn spawn(
                     if let Some(client) = &rest {
                         match client.guild_channels(&guild_id).await {
                             Ok(channels) => {
-                                let _ = event_tx.send(BackendEvent::GuildChannelsLoaded { guild_id, channels });
+                                let _ = event_tx.send(BackendEvent::GuildChannelsLoaded { guild_id: guild_id.clone(), channels });
                             }
                             Err(e) => {
                                 tracing::error!("failed to load channels for guild {guild_id}: {e}");
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to load channels: {e}")));
                             }
                         }
+                        spawn_guild_emoji_loads(client, vec![guild_id], &event_tx);
+                    }
+                }
+                UiCommand::LoadAllGuildEmojis { guild_ids } => {
+                    if let Some(client) = &rest {
+                        spawn_guild_emoji_loads(client, guild_ids, &event_tx);
                     }
                 }
                 UiCommand::SelectChannel { channel_id } => {
@@ -265,6 +274,13 @@ pub fn spawn(
                         }
                     }
                 }
+                UiCommand::RefreshDmChannels => {
+                    if let Some(client) = &rest {
+                        if let Ok(dms) = client.dm_channels().await {
+                            let _ = event_tx.send(BackendEvent::DmChannelsLoaded(dms));
+                        }
+                    }
+                }
                 UiCommand::EditMessage { channel_id, message_id, content } => {
                     if let Some(client) = &rest {
                         if let Err(e) = client.edit_message(&channel_id, &message_id, &content).await {
@@ -319,6 +335,39 @@ pub fn spawn(
             }
         }
     });
+}
+
+async fn load_guild_emojis(client: &RestClient, guild_id: String, event_tx: &mpsc::UnboundedSender<BackendEvent>) {
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client.guild_emojis(&guild_id).await {
+            Ok(emojis) => {
+                let _ = event_tx.send(BackendEvent::GuildEmojisLoaded { guild_id, emojis });
+                return;
+            }
+            Err(ClientError::Api { status: 429, .. }) if attempt < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+            }
+            Err(e) => {
+                tracing::warn!("failed to load emojis for guild {guild_id}: {e}");
+                return;
+            }
+        }
+    }
+}
+
+fn spawn_guild_emoji_loads(client: &RestClient, guild_ids: Vec<String>, event_tx: &mpsc::UnboundedSender<BackendEvent>) {
+    const MAX_CONCURRENT: usize = 3;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
+    for guild_id in guild_ids {
+        let client = client.clone();
+        let event_tx = event_tx.clone();
+        let semaphore = semaphore.clone();
+        tokio::spawn(async move {
+            let _permit = semaphore.acquire().await;
+            load_guild_emojis(&client, guild_id, &event_tx).await;
+        });
+    }
 }
 
 fn attempt_login<'a>(

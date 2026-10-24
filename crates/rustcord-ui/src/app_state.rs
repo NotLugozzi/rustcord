@@ -1,4 +1,4 @@
-use rustcord_client::models::{Channel, ChannelType, Guild, Message, Presence, Relationship, RelationshipType, User};
+use rustcord_client::models::{Channel, ChannelType, Emoji, Guild, Message, Presence, Relationship, RelationshipType, User};
 use std::collections::HashMap;
 
 fn snowflake_value(id: &str) -> u64 {
@@ -98,6 +98,10 @@ pub struct AppState {
     pub image_lightbox: Option<String>,
     pub reply_target: Option<Message>,
     pub presences: HashMap<String, Presence>,
+    pub guild_emojis: HashMap<String, Vec<Emoji>>,
+    pub emoji_picker_filter: String,
+    pub emoji_picker_category: usize,
+    pub emoji_autocomplete_selected: usize,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -107,7 +111,28 @@ impl AppState {
         if self.current_user.as_ref().is_some_and(|u| u.id == user_id) {
             return self.my_status;
         }
-        self.presences.get(user_id).map(|p| p.status).unwrap_or(rustcord_client::models::PresenceStatus::Offline)
+        self.presences
+            .get(user_id)
+            .map(|p| {
+                use rustcord_client::models::PresenceStatus::*;
+                if p.status != Offline {
+                    return p.status;
+                }
+                [p.client_status.desktop, p.client_status.mobile, p.client_status.web]
+                    .into_iter()
+                    .flatten()
+                    .find(|status| *status != Offline && *status != Invisible)
+                    .unwrap_or(p.status)
+            })
+            .unwrap_or(rustcord_client::models::PresenceStatus::Offline)
+    }
+
+    pub fn available_emojis(&self) -> Vec<(&Guild, &Emoji)> {
+        self.guilds
+            .iter()
+            .filter_map(|g| self.guild_emojis.get(&g.id).map(|emojis| (g, emojis)))
+            .flat_map(|(g, emojis)| emojis.iter().map(move |e| (g, e)))
+            .collect()
     }
 
     pub fn save_groups(&self) {
