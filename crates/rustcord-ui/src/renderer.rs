@@ -16,6 +16,22 @@ use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+struct ArboardClipboard {
+    clipboard: Option<arboard::Clipboard>,
+}
+
+impl imgui::ClipboardBackend for ArboardClipboard {
+    fn get(&mut self) -> Option<String> {
+        self.clipboard.as_mut()?.get_text().ok()
+    }
+
+    fn set(&mut self, value: &str) {
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            let _ = clipboard.set_text(value);
+        }
+    }
+}
+
 struct ImguiState {
     context: imgui::Context,
     platform: WinitPlatform,
@@ -74,6 +90,7 @@ impl AppWindow {
         surface.configure(&device, &surface_desc);
 
         let mut context = imgui::Context::create();
+        context.set_clipboard_backend(ArboardClipboard { clipboard: arboard::Clipboard::new().ok() });
         let mut platform = WinitPlatform::new(&mut context);
         platform.attach_window(context.io_mut(), &window, HiDpiMode::Default);
         context.set_ini_filename(None);

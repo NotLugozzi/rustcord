@@ -52,7 +52,13 @@ fn solve_blocking(challenge: &CaptchaChallenge) -> Result<String, ClientError> {
     }
 
     let (tx, rx) = mpsc::channel::<String>();
+    let prior_backend = std::env::var_os("WINIT_UNIX_BACKEND");
+    std::env::set_var("WINIT_UNIX_BACKEND", "x11");
     let mut event_loop = EventLoop::new();
+    match prior_backend {
+        Some(val) => std::env::set_var("WINIT_UNIX_BACKEND", val),
+        None => std::env::remove_var("WINIT_UNIX_BACKEND"),
+    }
     let window = WindowBuilder::new()
         .with_title("Verify you are human")
         .with_inner_size(tao::dpi::LogicalSize::new(420.0, 520.0))
