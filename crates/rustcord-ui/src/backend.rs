@@ -391,7 +391,7 @@ fn attempt_login<'a>(
                 let _ = event_tx.send(BackendEvent::CaptchaInProgress);
                 let solve_result = tokio::task::spawn_blocking({
                     let challenge = challenge.clone();
-                    move || captcha::solve_blocking(&challenge)
+                    move || captcha::request_solve(challenge)
                 })
                 .await;
 

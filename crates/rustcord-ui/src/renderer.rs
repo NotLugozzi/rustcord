@@ -290,6 +290,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        rustcord_client::captcha::pump_main_thread();
         let Some(window) = self.window.as_mut() else { return };
         let busy = self.last_input.elapsed() < Duration::from_millis(400) || window.textures.animating;
         if busy {

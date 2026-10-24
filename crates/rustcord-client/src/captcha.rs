@@ -1,13 +1,49 @@
 use crate::error::ClientError;
 use crate::rest::CaptchaChallenge;
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::WindowBuilder;
 use wry::WebViewBuilder;
 
-pub fn solve_blocking(challenge: &CaptchaChallenge) -> Result<String, ClientError> {
+struct SolveRequest {
+    challenge: CaptchaChallenge,
+    reply: mpsc::Sender<Result<String, ClientError>>,
+}
+
+static REQUESTS: OnceLock<mpsc::Sender<SolveRequest>> = OnceLock::new();
+static REQUESTS_RX: std::sync::Mutex<Option<mpsc::Receiver<SolveRequest>>> = std::sync::Mutex::new(None);
+
+fn requests_channel() -> &'static mpsc::Sender<SolveRequest> {
+    REQUESTS.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        *REQUESTS_RX.lock().unwrap() = Some(rx);
+        tx
+    })
+}
+
+pub fn request_solve(challenge: CaptchaChallenge) -> Result<String, ClientError> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let _ = requests_channel().send(SolveRequest { challenge, reply: reply_tx });
+    reply_rx
+        .recv()
+        .unwrap_or_else(|_| Err(ClientError::CaptchaFailed("captcha handler shut down".into())))
+}
+
+pub fn pump_main_thread() {
+    let request = {
+        let mut guard = REQUESTS_RX.lock().unwrap();
+        let Some(rx) = guard.as_mut() else { return };
+        rx.try_recv().ok()
+    };
+    let Some(request) = request else { return };
+    let result = solve_blocking(&request.challenge);
+    let _ = request.reply.send(result);
+}
+
+fn solve_blocking(challenge: &CaptchaChallenge) -> Result<String, ClientError> {
     if challenge.captcha_service != "hcaptcha" {
         return Err(ClientError::CaptchaFailed(format!(
             "unsupported captcha service: {}",
