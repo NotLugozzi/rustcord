@@ -260,6 +260,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {}
+            WindowEvent::Focused(focused) => self.state.window_focused = *focused,
             _ => self.last_input = Instant::now(),
         }
         match &event {
@@ -287,7 +288,6 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let Some(window) = self.window.as_mut() else { return };
-        // Full speed while interacting or animating; otherwise ~10 fps, enough to pick up backend events.
         let busy = self.last_input.elapsed() < Duration::from_millis(400) || window.textures.animating;
         if busy {
             event_loop.set_control_flow(ControlFlow::Poll);

@@ -25,7 +25,6 @@ fn cache_file(url: &str) -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.cache_dir().join("images").join(format!("{:016x}", h.finish())))
 }
 
-/// Small images (avatars, badges, icons) are cached on disk; big attachments aren't.
 const MAX_DISK_CACHED_BYTES: usize = 1024 * 1024;
 
 async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
@@ -74,6 +73,8 @@ pub enum UiCommand {
     OpenDmWithUser { user_id: String },
     StartTyping { channel_id: String },
     LoadProfile { user_id: String },
+    EditMessage { channel_id: String, message_id: String, content: String },
+    DeleteMessage { channel_id: String, message_id: String },
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
@@ -261,6 +262,20 @@ pub fn spawn(
                                 tracing::error!("failed to open dm with {user_id}: {e}");
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to open DM: {e}")));
                             }
+                        }
+                    }
+                }
+                UiCommand::EditMessage { channel_id, message_id, content } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.edit_message(&channel_id, &message_id, &content).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to edit message: {e}")));
+                        }
+                    }
+                }
+                UiCommand::DeleteMessage { channel_id, message_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.delete_message(&channel_id, &message_id).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to delete message: {e}")));
                         }
                     }
                 }

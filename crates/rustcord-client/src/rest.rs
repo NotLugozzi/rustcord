@@ -219,6 +219,21 @@ impl RestClient {
         self.post(&format!("/channels/{channel_id}/messages"), &body).await
     }
 
+    pub async fn edit_message(&self, channel_id: &str, message_id: &str, content: &str) -> Result<Message, ClientError> {
+        let body = serde_json::json!({ "content": content });
+        self.request(Method::PATCH, &format!("/channels/{channel_id}/messages/{message_id}"), Some(&body)).await
+    }
+
+    pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
+        let resp = self.http.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}")).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ClientError> {
         let resp = self
             .http

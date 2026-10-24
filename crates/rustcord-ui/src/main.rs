@@ -23,7 +23,7 @@ fn main() {
     let (event_tx, event_rx) = mpsc::unbounded_channel::<BackendEvent>();
     backend::spawn(&rt, cmd_rx, event_tx);
 
-    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, groups: app_state::load_groups(), notes: app_state::load_notes(), ..Default::default() };
+    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), ..Default::default() };
     if let Some(dir) = theme::Theme::themes_dir() {
         let default_path = dir.join("discord-dark.toml");
         if let Ok(t) = theme::Theme::load_from_file(&default_path) {
@@ -37,6 +37,25 @@ fn main() {
     }
 
     renderer::run(state, cmd_tx, event_rx);
+}
+
+fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message) {
+    let Some(me) = &state.current_user else { return };
+    if !state.notifications_enabled || message.author.id == me.id {
+        return;
+    }
+    let relevant = message.guild_id.is_none() || message.mentions.iter().any(|u| u.id == me.id);
+    let watching = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
+    if !relevant || watching {
+        return;
+    }
+    let title = message.author.global_name.clone().unwrap_or_else(|| message.author.username.clone());
+    let body = if message.content.is_empty() { "[attachment]".to_string() } else { message.content.chars().take(160).collect() };
+    std::thread::spawn(move || {
+        if let Err(e) = notify_rust::Notification::new().summary(&title).body(&body).show() {
+            tracing::warn!("notification failed: {e}");
+        }
+    });
 }
 
 pub fn drain_backend_events(
@@ -82,6 +101,7 @@ pub fn drain_backend_events(
                 if let Some(typing) = state.typing_users.get_mut(&message.channel_id) {
                     typing.remove(&message.author.id);
                 }
+                notify_if_relevant(state, &message);
                 state.push_message(message);
             }
             BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
@@ -89,6 +109,21 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::PresenceUpdate(presence)) => {
                 state.presences.insert(presence.user.id.clone(), presence);
+            }
+            BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp }) => {
+                if let Some(msg) = state.messages.get_mut(&channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) {
+                    if let Some(content) = content {
+                        msg.content = content;
+                    }
+                    if edited_timestamp.is_some() {
+                        msg.edited_timestamp = edited_timestamp;
+                    }
+                }
+            }
+            BackendEvent::Gateway(GatewayEvent::MessageDelete { channel_id, id }) => {
+                if let Some(list) = state.messages.get_mut(&channel_id) {
+                    list.retain(|m| m.id != id);
+                }
             }
             BackendEvent::Gateway(GatewayEvent::Unknown { .. }) => {}
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {

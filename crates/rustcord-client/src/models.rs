@@ -179,9 +179,43 @@ pub struct Activity {
     pub kind: u8,
     pub details: Option<String>,
     pub state: Option<String>,
+    pub application_id: Option<String>,
+    #[serde(default)]
+    pub assets: Option<ActivityAssets>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ActivityAssets {
+    pub large_image: Option<String>,
+    pub large_text: Option<String>,
+    pub small_image: Option<String>,
+    pub small_text: Option<String>,
+}
+
+pub fn activity_image_url(application_id: Option<&str>, key: &str) -> Option<String> {
+    if let Some(rest) = key.strip_prefix("mp:") {
+        return Some(format!("https://media.discordapp.net/{rest}"));
+    }
+    if let Some(id) = key.strip_prefix("spotify:") {
+        return Some(format!("https://i.scdn.co/image/{id}"));
+    }
+    if key.starts_with("http") {
+        return Some(key.to_string());
+    }
+    key.chars().all(|c| c.is_ascii_digit()).then_some(())?;
+    Some(format!("https://cdn.discordapp.com/app-assets/{}/{key}.png", application_id?))
 }
 
 impl Activity {
+    pub fn summary_title(&self) -> String {
+        self.summary().split(" - ").next().unwrap_or_default().to_string()
+    }
+
+    pub fn large_image_url(&self) -> Option<String> {
+        let key = self.assets.as_ref()?.large_image.as_deref()?;
+        activity_image_url(self.application_id.as_deref(), key)
+    }
+
     pub fn summary(&self) -> String {
         if self.kind == 4 {
             return self.state.clone().unwrap_or_default();

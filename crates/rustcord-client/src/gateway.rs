@@ -15,6 +15,8 @@ pub enum GatewayEvent {
     MessageCreate(Message),
     TypingStart { channel_id: String, user_id: String },
     PresenceUpdate(Presence),
+    MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String> },
+    MessageDelete { channel_id: String, id: String },
     Unknown { op_name: String, raw: Value },
 }
 
@@ -40,7 +42,6 @@ struct IdentifyProperties {
     device: &'static str,
 }
 
-/// Gateway op 3 frame. `status` is online/idle/dnd/invisible; a custom status is an activity of type 4.
 pub fn presence_frame(status: &str, activities: &[Value]) -> String {
     json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
 }
@@ -156,6 +157,19 @@ impl Gateway {
                 let user_id = data["user_id"].as_str().unwrap_or_default().to_string();
                 GatewayEvent::TypingStart { channel_id, user_id }
             }
+            Some("MESSAGE_UPDATE") => {
+                let text = |k: &str| data[k].as_str().map(str::to_string);
+                GatewayEvent::MessageUpdate {
+                    channel_id: text("channel_id").unwrap_or_default(),
+                    id: text("id").unwrap_or_default(),
+                    content: text("content"),
+                    edited_timestamp: text("edited_timestamp"),
+                }
+            }
+            Some("MESSAGE_DELETE") => GatewayEvent::MessageDelete {
+                channel_id: data["channel_id"].as_str().unwrap_or_default().to_string(),
+                id: data["id"].as_str().unwrap_or_default().to_string(),
+            },
             Some("PRESENCE_UPDATE") => {
                 let presence: Presence = serde_json::from_value(data)?;
                 GatewayEvent::PresenceUpdate(presence)
