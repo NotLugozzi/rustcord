@@ -452,7 +452,7 @@ async fn start_session(
     });
     tokio::spawn(async move {
         if let Err(e) = gateway.run(gw_tx, out_rx).await {
-            tracing::warn!("gateway closed: {e}");
+            tracing::warn!("gateway task exited: {e}");
         }
     });
 

@@ -889,7 +889,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .no_decoration()
         .draw_background(true)
         .build(|| {
-            let status_height = if state.status_message.is_some() { 24.0 } else { 0.0 };
+            let show_reconnecting = state.logged_in && !state.gateway_connected;
+            let status_height = if state.status_message.is_some() || show_reconnecting { 24.0 } else { 0.0 };
             let messages = state.active_messages().to_vec();
             let channel_key = state.selected_channel.clone().unwrap_or_default();
             let seen_count = state.last_seen_message_count.get(&channel_key).copied().unwrap_or(0);
@@ -1083,6 +1084,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     ui.text(text);
                     token.pop();
                 }
+            }
+
+            if show_reconnecting {
+                let token = ui.push_style_color(imgui::StyleColor::Text, [1.0, 0.6, 0.3, 1.0]);
+                ui.text("Reconnecting to Discord...");
+                token.pop();
             }
 
             if let Some(status) = state.status_message.clone() {

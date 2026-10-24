@@ -102,6 +102,7 @@ pub struct AppState {
     pub emoji_picker_filter: String,
     pub emoji_picker_category: usize,
     pub emoji_autocomplete_selected: usize,
+    pub gateway_connected: bool,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);

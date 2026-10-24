@@ -8,9 +8,14 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub enum GatewayEvent {
+    Connecting,
+    Connected,
+    Resumed,
+    Disconnected { reason: String },
     Ready { user: User, guilds: Vec<Guild>, friend_presences: Vec<Presence> },
     Presences(Vec<Presence>),
     MessageCreate(Message),
@@ -43,8 +48,22 @@ struct IdentifyProperties {
     device: &'static str,
 }
 
+#[derive(Serialize)]
+struct Resume<'a> {
+    token: &'a str,
+    session_id: &'a str,
+    seq: u64,
+}
+
 pub fn presence_frame(status: &str, activities: &[Value]) -> String {
     json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
+}
+
+#[derive(Default)]
+struct Session {
+    session_id: Option<String>,
+    seq: Option<u64>,
+    resume_gateway_url: Option<String>,
 }
 
 pub struct Gateway {
@@ -61,7 +80,33 @@ impl Gateway {
         tx: mpsc::UnboundedSender<GatewayEvent>,
         mut outgoing: mpsc::UnboundedReceiver<String>,
     ) -> Result<(), ClientError> {
-        let (ws_stream, _) = tokio_tungstenite::connect_async(GATEWAY_URL).await?;
+        let mut session = Session::default();
+        let mut backoff = Duration::from_secs(1);
+
+        loop {
+            let _ = tx.send(GatewayEvent::Connecting);
+            match self.connect_and_run(&tx, &mut outgoing, &mut session).await {
+                Ok(()) => {
+                    backoff = Duration::from_secs(1);
+                }
+                Err(e) => {
+                    tracing::warn!("gateway connection ended: {e}");
+                    let _ = tx.send(GatewayEvent::Disconnected { reason: e.to_string() });
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
+    async fn connect_and_run(
+        &self,
+        tx: &mpsc::UnboundedSender<GatewayEvent>,
+        outgoing: &mut mpsc::UnboundedReceiver<String>,
+        session: &mut Session,
+    ) -> Result<(), ClientError> {
+        let url = session.resume_gateway_url.as_deref().unwrap_or(GATEWAY_URL);
+        let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
         let (mut write, mut read) = ws_stream.split();
 
         let hello = read
@@ -74,20 +119,31 @@ impl Gateway {
             .and_then(|d| d.get("heartbeat_interval").and_then(Value::as_u64))
             .unwrap_or(41250);
 
-        let identify = Identify {
-            token: &self.token,
-            properties: IdentifyProperties {
-                os: "Windows",
-                browser: "Chrome",
-                device: "",
-            },
-            intents: None,
-        };
-        let identify_payload = json!({ "op": 2, "d": identify });
-        write.send(WsMessage::Text(identify_payload.to_string())).await?;
+        match (&session.session_id, session.seq) {
+            (Some(session_id), Some(seq)) => {
+                let resume = Resume { token: &self.token, session_id, seq };
+                let resume_payload = json!({ "op": 6, "d": resume });
+                write.send(WsMessage::Text(resume_payload.to_string())).await?;
+            }
+            _ => {
+                let identify = Identify {
+                    token: &self.token,
+                    properties: IdentifyProperties {
+                        os: "Windows",
+                        browser: "Chrome",
+                        device: "",
+                    },
+                    intents: None,
+                };
+                let identify_payload = json!({ "op": 2, "d": identify });
+                write.send(WsMessage::Text(identify_payload.to_string())).await?;
+            }
+        }
+
+        let _ = tx.send(GatewayEvent::Connected);
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel::<()>();
-        tokio::spawn(async move {
+        let heartbeat_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval));
             loop {
                 interval.tick().await;
@@ -97,41 +153,96 @@ impl Gateway {
             }
         });
 
-        loop {
+        let result = loop {
             tokio::select! {
                 frame = read.next() => {
                     let Some(frame) = frame else {
-                        return Err(ClientError::GatewayClosed("stream ended".into()));
+                        break Err(ClientError::GatewayClosed("stream ended".into()));
                     };
-                    let frame = frame?;
+                    let frame = match frame {
+                        Ok(f) => f,
+                        Err(e) => break Err(e.into()),
+                    };
                     match frame {
-                        WsMessage::Ping(payload) => write.send(WsMessage::Pong(payload)).await?,
-                        WsMessage::Text(text) => {
-                            let payload: Payload = serde_json::from_str(&text)?;
-                            if payload.op == 1 {
-                                write.send(WsMessage::Text(json!({ "op": 1, "d": null }).to_string())).await?;
-                                continue;
+                        WsMessage::Ping(payload) => {
+                            if let Err(e) = write.send(WsMessage::Pong(payload)).await {
+                                break Err(e.into());
                             }
-                            self.handle_frame(&text, &tx)?;
+                        }
+                        WsMessage::Close(frame) => {
+                            let reason = frame.map(|f| format!("{}: {}", f.code, f.reason)).unwrap_or_else(|| "closed".into());
+                            let resumable = frame_is_resumable(&reason);
+                            if !resumable {
+                                session.session_id = None;
+                                session.seq = None;
+                                session.resume_gateway_url = None;
+                            }
+                            break Err(ClientError::GatewayClosed(reason));
+                        }
+                        WsMessage::Text(text) => {
+                            let payload: Payload = match serde_json::from_str(&text) {
+                                Ok(p) => p,
+                                Err(e) => break Err(e.into()),
+                            };
+                            if let Some(seq) = payload.s {
+                                session.seq = Some(seq);
+                            }
+                            match payload.op {
+                                1 => {
+                                    if let Err(e) = write.send(WsMessage::Text(json!({ "op": 1, "d": null }).to_string())).await {
+                                        break Err(e.into());
+                                    }
+                                }
+                                7 => {
+                                    break Err(ClientError::GatewayClosed("reconnect requested".into()));
+                                }
+                                9 => {
+                                    let resumable = payload.d.and_then(|d| d.as_bool()).unwrap_or(false);
+                                    if !resumable {
+                                        session.session_id = None;
+                                        session.seq = None;
+                                        session.resume_gateway_url = None;
+                                    }
+                                    break Err(ClientError::GatewayClosed("invalid session".into()));
+                                }
+                                0 => {
+                                    if payload.t.as_deref() == Some("READY") {
+                                        if let Some(data) = &payload.d {
+                                            session.session_id = data.get("session_id").and_then(Value::as_str).map(str::to_string);
+                                            session.resume_gateway_url = data
+                                                .get("resume_gateway_url")
+                                                .and_then(Value::as_str)
+                                                .map(|u| format!("{u}/?v=10&encoding=json"));
+                                        }
+                                    }
+                                    if let Err(e) = self.handle_frame(payload, tx) {
+                                        break Err(e);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                         _ => {}
                     }
                 }
                 Some(frame) = outgoing.recv() => {
-                    write.send(WsMessage::Text(frame)).await?;
+                    if let Err(e) = write.send(WsMessage::Text(frame)).await {
+                        break Err(e.into());
+                    }
                 }
                 _ = heartbeat_rx.recv() => {
-                    write.send(WsMessage::Text(json!({ "op": 1, "d": null }).to_string())).await?;
+                    if let Err(e) = write.send(WsMessage::Text(json!({ "op": 1, "d": null }).to_string())).await {
+                        break Err(e.into());
+                    }
                 }
             }
-        }
+        };
+
+        heartbeat_task.abort();
+        result
     }
 
-    fn handle_frame(&self, text: &str, tx: &mpsc::UnboundedSender<GatewayEvent>) -> Result<(), ClientError> {
-        let payload: Payload = serde_json::from_str(text)?;
-        if payload.op != 0 {
-            return Ok(());
-        }
+    fn handle_frame(&self, payload: Payload, tx: &mpsc::UnboundedSender<GatewayEvent>) -> Result<(), ClientError> {
         let Some(data) = payload.d else { return Ok(()) };
         let event = match payload.t.as_deref() {
             Some("READY") => {
@@ -150,6 +261,7 @@ impl Gateway {
                 tracing::info!("READY supplied {} friend presences", friend_presences.len());
                 GatewayEvent::Ready { user, guilds, friend_presences }
             }
+            Some("RESUMED") => GatewayEvent::Resumed,
             Some("READY_SUPPLEMENTAL") => {
                 let mut presences = parse_presence_list(data.get("presences"));
                 if let Some(merged) = data.get("merged_presences") {
@@ -190,6 +302,10 @@ impl Gateway {
         let _ = tx.send(event);
         Ok(())
     }
+}
+
+fn frame_is_resumable(reason: &str) -> bool {
+    !reason.starts_with("1000") && !reason.starts_with("1001") && !reason.starts_with("4004")
 }
 
 fn parse_presence_list(value: Option<&Value>) -> Vec<Presence> {

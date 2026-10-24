@@ -93,7 +93,18 @@ pub fn drain_backend_events(
             BackendEvent::Error(err) => {
                 state.status_message = Some(err);
             }
+            BackendEvent::Gateway(GatewayEvent::Connecting) => {
+                state.gateway_connected = false;
+            }
+            BackendEvent::Gateway(GatewayEvent::Connected) => {}
+            BackendEvent::Gateway(GatewayEvent::Resumed) => {
+                state.gateway_connected = true;
+            }
+            BackendEvent::Gateway(GatewayEvent::Disconnected { .. }) => {
+                state.gateway_connected = false;
+            }
             BackendEvent::Gateway(GatewayEvent::Ready { user, guilds, friend_presences }) => {
+                state.gateway_connected = true;
                 state.current_user = Some(user);
                 let guild_ids = guilds.iter().map(|g| g.id.clone()).collect();
                 state.guilds = guilds;
