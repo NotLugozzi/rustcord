@@ -1,3 +1,4 @@
+use crate::dave::{self, DaveSession};
 use crate::error::ClientError;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -14,6 +15,7 @@ pub enum VoiceGatewayEvent {
     Ready { ssrc: u32, ip: String, port: u16, modes: Vec<String> },
     SessionDescription { mode: String, secret_key: [u8; 32] },
     Speaking { ssrc: u32, user_id: Option<String> },
+    DaveReady,
     Disconnected { reason: String },
 }
 
@@ -68,10 +70,14 @@ impl VoiceGateway {
                 "token": self.token,
                 "video": false,
                 "streams": [],
-                "max_dave_protocol_version": 0,
+                "max_dave_protocol_version": dave::DAVE_PROTOCOL_VERSION,
             }
         });
+        tracing::info!("voice: sending identify");
         write.send(WsMessage::Text(identify.to_string())).await?;
+        tracing::info!("voice: identify sent");
+
+        let mut dave_session = DaveSession::new(&self.user_id)?;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel::<()>();
         let heartbeat_task = tokio::spawn(async move {
@@ -102,15 +108,48 @@ impl VoiceGateway {
                         }
                         WsMessage::Close(frame) => {
                             let reason = frame.map(|f| format!("{}: {}", f.code, f.reason)).unwrap_or_else(|| "closed".into());
+                            tracing::info!("voice: received close frame: {reason}");
                             break Err(ClientError::GatewayClosed(reason));
                         }
                         WsMessage::Text(text) => {
+                            tracing::info!("voice: received text frame: {text}");
                             let payload: Payload = match serde_json::from_str(&text) {
                                 Ok(p) => p,
                                 Err(e) => break Err(e.into()),
                             };
+                            if payload.op == 2 {
+                                let ready = match parse_ready(&payload) {
+                                    Some(r) => r,
+                                    None => break Err(ClientError::GatewayClosed("voice: malformed ready payload".into())),
+                                };
+                                match negotiate_udp(&ready).await {
+                                    Ok((udp_socket, select_protocol)) => {
+                                        socket = Some(udp_socket);
+                                        if let Err(e) = write.send(WsMessage::Text(select_protocol)).await {
+                                            break Err(e.into());
+                                        }
+                                    }
+                                    Err(e) => break Err(e),
+                                }
+                            }
                             if let Err(e) = handle_payload(payload, &tx) {
                                 break Err(e);
+                            }
+                        }
+                        WsMessage::Binary(bytes) => {
+                            tracing::info!("voice: received binary frame, {} bytes, opcode={:?}", bytes.len(), bytes.get(2));
+                            match handle_dave_frame(&bytes, &mut dave_session, &tx) {
+                                Ok(Some(reply)) => {
+                                    tracing::info!("voice: sending dave reply, {} bytes, opcode={:?}", reply.len(), reply.first());
+                                    if let Err(e) = write.send(WsMessage::Binary(reply)).await {
+                                        break Err(e.into());
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!("voice: dave frame handling failed: {e}");
+                                    break Err(e);
+                                }
                             }
                         }
                         _ => {}
@@ -167,6 +206,36 @@ fn handle_payload(payload: Payload, tx: &mpsc::UnboundedSender<VoiceGatewayEvent
     };
     let _ = tx.send(event);
     Ok(())
+}
+
+fn handle_dave_frame(
+    bytes: &[u8],
+    dave_session: &mut DaveSession,
+    tx: &mpsc::UnboundedSender<VoiceGatewayEvent>,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    let frame = dave::decode_server_frame(bytes)?;
+    match frame.opcode {
+        dave::OP_MLS_EXTERNAL_SENDER => Ok(None),
+        dave::OP_PREPARE_EPOCH => {
+            dave_session.create_new_group()?;
+            let key_package = dave_session.generate_key_package()?;
+            Ok(Some(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &key_package)))
+        }
+        dave::OP_MLS_PROPOSALS => Ok(None),
+        dave::OP_MLS_ANNOUNCE_COMMIT_TRANSITION => {
+            dave_session.process_commit(&frame.payload)?;
+            Ok(Some(dave::encode_client_frame(dave::OP_TRANSITION_READY, &[])))
+        }
+        dave::OP_MLS_WELCOME => {
+            dave_session.process_welcome(&frame.payload)?;
+            Ok(Some(dave::encode_client_frame(dave::OP_TRANSITION_READY, &[])))
+        }
+        dave::OP_EXECUTE_TRANSITION => {
+            let _ = tx.send(VoiceGatewayEvent::DaveReady);
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
 }
 
 pub fn select_protocol_frame(address: &str, port: u16, mode: &str) -> String {
