@@ -333,6 +333,7 @@ pub fn spawn(
                     presence::publish(&event_tx);
                 }
                 UiCommand::JoinVoiceChannel { guild_id, channel_id } => {
+                    tracing::info!("sending voice state update op4 for channel {channel_id}");
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                         let frame = rustcord_client::gateway::voice_state_update_frame(&guild_id, Some(&channel_id), false, false);
                         let _ = tx.send(frame);

@@ -871,7 +871,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     for (channel_id, name) in &voice_channels {
                         let is_connected = state.connected_voice_channel.as_ref() == Some(&(guild_id.clone(), channel_id.clone()));
                         let label = if is_connected { format!("\u{1F50A} {name} (connected)") } else { format!("\u{1F50A} {name}") };
-                        if ui.selectable(label) && !is_connected {
+                        if ui.selectable(label) && !is_connected && !state.voice_connecting {
                             let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: guild_id.clone(), channel_id: channel_id.clone() });
                             state.pending_voice_channel = Some((guild_id.clone(), channel_id.clone()));
                         }
