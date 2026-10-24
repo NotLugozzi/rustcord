@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Channel, Guild, Message, User};
+use crate::models::{Channel, Emoji, Guild, Message, User};
 use reqwest::{header, Client, Method};
 use serde::{Deserialize, Serialize};
 
@@ -96,12 +96,10 @@ impl LoginSession {
             }
             return Err(ClientError::Api { status: status.as_u16(), message: text });
         }
-        tracing::info!("login response: {text}");
         Ok(serde_json::from_str(&text)?)
     }
 
     pub async fn submit_mfa(&self, ticket: &str, code: &str) -> Result<String, ClientError> {
-        tracing::info!("submitting mfa: ticket={ticket:?} code={code:?}");
         #[derive(Serialize)]
         struct Body<'a> {
             code: &'a str,
@@ -177,6 +175,10 @@ impl RestClient {
 
     pub async fn guild_channels(&self, guild_id: &str) -> Result<Vec<Channel>, ClientError> {
         self.get(&format!("/guilds/{guild_id}/channels")).await
+    }
+
+    pub async fn guild_emojis(&self, guild_id: &str) -> Result<Vec<Emoji>, ClientError> {
+        self.get(&format!("/guilds/{guild_id}/emojis")).await
     }
 
     pub async fn messages(&self, channel_id: &str, limit: u32) -> Result<Vec<Message>, ClientError> {
