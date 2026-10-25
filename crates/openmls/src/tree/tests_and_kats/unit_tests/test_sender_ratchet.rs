@@ -1,0 +1,567 @@
+#[cfg(feature = "virtual-clients-draft")]
+use crate::tree::dual_use_ratchet::DualUseRatchet;
+use crate::{
+    ciphersuite::Secret, test_utils::*, tree::secret_tree::SecretTreeError, tree::sender_ratchet::*,
+};
+
+// Test the maximum forward ratcheting
+#[openmls_test::openmls_test]
+fn test_max_forward_distance() {
+    let provider = &Provider::default();
+
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet1 = DecryptionRatchet::new(secret.clone());
+    let mut ratchet2 = DecryptionRatchet::new(secret);
+
+    // We expect this to still work
+    let _secret = ratchet1
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            configuration.maximum_forward_distance(),
+            configuration,
+        )
+        .expect("Expected decryption secret.");
+
+    // We expect this to return an error
+    let err = ratchet2
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            configuration.maximum_forward_distance() + 1,
+            configuration,
+        )
+        .expect_err("Expected error.");
+
+    assert_eq!(err, SecretTreeError::TooDistantInTheFuture);
+
+    // Test if there's an overflow in the maximum forward distance check.
+    ratchet1.ratchet_secret_mut().set_generation(u32::MAX - 5);
+    ratchet1
+        .secret_for_decryption(ciphersuite, provider.crypto(), u32::MAX - 1, configuration)
+        .expect("Error ratcheting to very high generation");
+}
+
+// Test out-of-order generations
+#[openmls_test::openmls_test]
+fn test_out_of_order_generations() {
+    let provider = &Provider::default();
+
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet1 = DecryptionRatchet::new(secret);
+
+    // Ratchet forward twice the size of the window
+    for i in 0..configuration.out_of_order_tolerance() * 2 {
+        let _secret = ratchet1
+            .secret_for_decryption(ciphersuite, provider.crypto(), i, configuration)
+            .expect("Expected decryption secret.");
+    }
+
+    // Check that secrets from before the window are not accessible anymore
+    let err = ratchet1
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            configuration.out_of_order_tolerance() - 1,
+            configuration,
+        )
+        .expect_err("Expected error.");
+
+    assert_eq!(err, SecretTreeError::TooDistantInThePast);
+
+    // All secrets within the window should have been deleted because of FS.
+    for i in configuration.out_of_order_tolerance()..configuration.out_of_order_tolerance() * 2 {
+        assert_eq!(
+            ratchet1
+                .secret_for_decryption(ciphersuite, provider.crypto(), i, configuration)
+                .expect_err("Expected decryption secret."),
+            SecretTreeError::SecretReuseError
+        );
+    }
+}
+
+// Test forward secrecy
+#[openmls_test::openmls_test]
+fn test_forward_secrecy() {
+    let provider = &Provider::default();
+
+    // Encryption Ratchets are forward-secret by default, since they don't store
+    // any keys. Thus, we can only test FS on Decryption Ratchets.
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DecryptionRatchet::new(secret);
+
+    // Let's ratchet once and see if the ratchet keeps any keys around.
+    let _ratchet_secrets = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 0, configuration)
+        .expect("Error ratcheting forward.");
+
+    // The generation should have increased.
+    assert_eq!(ratchet.generation(), 1);
+
+    // And we should get an error for generation 0.
+    let err = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 0, configuration)
+        .expect_err("No error when trying to retrieve key outside of tolerance window.");
+    assert_eq!(err, SecretTreeError::SecretReuseError);
+
+    // Let's ratchet forward a few times, making the ratchet keep the secrets round for out-of-order decryption.
+    let _ratchet_secrets = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 10, configuration)
+        .expect("Error ratcheting forward.");
+
+    // First, let's make sure that the window works.
+    let err = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 5, configuration)
+        .expect_err("No error when trying to retrieve key outside of tolerance window.");
+    assert_eq!(err, SecretTreeError::TooDistantInThePast);
+
+    // Now let's get a few keys. The first time we're trying to get the key of a given generation, it should work. The second time, we should get a SecretReuseError.
+    for generation in 10 - configuration.out_of_order_tolerance() + 1..10 {
+        let keys = ratchet.secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            generation,
+            configuration,
+        );
+        assert!(keys.is_ok());
+
+        let err = ratchet
+            .secret_for_decryption(ciphersuite, provider.crypto(), generation, configuration)
+            .expect_err("No error when trying to retrieve deleted key.");
+        assert_eq!(err, SecretTreeError::SecretReuseError);
+    }
+}
+
+// Test if a sender ratchet overflow is caught
+#[test]
+fn sender_ratchet_generation_overflow() {
+    let provider = OpenMlsRustCrypto::default();
+    let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = RatchetSecret::initial_ratchet_secret(secret);
+    ratchet.set_generation(u32::MAX - 1);
+    let _ = ratchet
+        .ratchet_forward(provider.crypto(), ciphersuite)
+        .expect("error ratcheting forward");
+    let err = ratchet
+        .ratchet_forward(provider.crypto(), ciphersuite)
+        .expect_err("no error exceeding generation u32::MAX");
+    assert_eq!(err, SecretTreeError::RatchetTooLong)
+}
+
+#[openmls_test::openmls_test]
+fn decryption_follows_the_ratchet_chain() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut chain = RatchetSecret::initial_ratchet_secret(secret.clone());
+    let chain_keys: Vec<_> = (0..=10)
+        .map(|_| {
+            chain
+                .ratchet_forward(provider.crypto(), ciphersuite)
+                .unwrap()
+                .1
+        })
+        .collect();
+    let mut ratchet = DecryptionRatchet::new(secret);
+
+    let cases = [
+        (0, None),
+        (3, None),
+        (4, None),
+        (1, None),
+        (1, Some(SecretTreeError::SecretReuseError)),
+        (2, None),
+        (10, None),
+        (2, Some(SecretTreeError::TooDistantInThePast)),
+        (2_000, Some(SecretTreeError::TooDistantInTheFuture)),
+    ];
+    for (generation, expected_error) in cases {
+        let result = ratchet.secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            generation,
+            configuration,
+        );
+        match expected_error {
+            Some(error) => assert_eq!(result, Err(error), "generation {generation}"),
+            None => assert_eq!(
+                result,
+                Ok(chain_keys[generation as usize].clone()),
+                "generation {generation}"
+            ),
+        }
+    }
+}
+
+#[openmls_test::openmls_test]
+fn peek_leaves_decryption_ratchet_unchanged() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DecryptionRatchet::new(secret);
+    ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), 3, configuration)
+        .unwrap();
+    let unchanged = ratchet.clone();
+
+    for generation in [1, 7] {
+        let (first_secret, _) = ratchet
+            .peek(ciphersuite, provider.crypto(), generation, configuration)
+            .unwrap();
+        let (second_secret, _) = ratchet
+            .peek(ciphersuite, provider.crypto(), generation, configuration)
+            .unwrap();
+        assert_eq!(first_secret, second_secret);
+        assert_eq!(ratchet, unchanged);
+    }
+}
+
+#[openmls_test::openmls_test]
+fn stale_peeked_generation_is_rejected() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DecryptionRatchet::new(secret);
+
+    let (_, forward) = ratchet
+        .peek(ciphersuite, provider.crypto(), 5, configuration)
+        .unwrap();
+    let (_, other_forward) = ratchet
+        .peek(ciphersuite, provider.crypto(), 6, configuration)
+        .unwrap();
+    ratchet.consume(forward, configuration).unwrap();
+    assert_eq!(
+        ratchet.consume(other_forward, configuration),
+        Err(SecretTreeError::LibraryError)
+    );
+
+    let (_, past) = ratchet
+        .peek(ciphersuite, provider.crypto(), 2, configuration)
+        .unwrap();
+    let (_, same_past) = ratchet
+        .peek(ciphersuite, provider.crypto(), 2, configuration)
+        .unwrap();
+    ratchet.consume(past, configuration).unwrap();
+    assert_eq!(
+        ratchet.consume(same_past, configuration),
+        Err(SecretTreeError::SecretReuseError)
+    );
+}
+
+// === DualUseRatchet ===
+//
+// The tests below cover the dual-use-only methods
+// (`secret_for_encryption`, `delete_secret_for_generation`) and the
+// encrypt-then-decrypt-own state machine that's unique to `DualUseRatchet`.
+
+// Encrypting caches the secret in the past-secrets window, then `confirm`
+// (i.e. `delete_secret_for_generation`) drops it, and a later attempt to
+// decrypt that generation fails as `SecretReuseError`.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_encrypt_confirm_drops_secret() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    let (generation, _) = ratchet
+        .secret_for_encryption(ciphersuite, provider.crypto())
+        .expect("Expected encryption secret.");
+    assert_eq!(generation, 0);
+    assert_eq!(ratchet.generation(), 1);
+
+    // Confirm the message, dropping the cached encryption secret.
+    ratchet.delete_secret_for_generation(generation);
+
+    // Decrypting at the same generation now fails since the entry was removed.
+    let err = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), generation, configuration)
+        .expect_err("Confirmed secret should be unavailable.");
+    assert_eq!(err, SecretTreeError::SecretReuseError);
+}
+
+// Without confirming, the local sender can decrypt their own message (the
+// cached secret in the past-secrets window is removed when used). A second
+// decryption attempt at the same generation then fails.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_encrypt_then_decrypt_own() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    let (generation, _) = ratchet
+        .secret_for_encryption(ciphersuite, provider.crypto())
+        .expect("Expected encryption secret.");
+
+    // First decryption succeeds — the secret was cached when we encrypted.
+    let _decrypted = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), generation, configuration)
+        .expect("Expected to decrypt own message.");
+
+    // Second decryption at the same generation fails.
+    let err = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), generation, configuration)
+        .expect_err("Reusing the same generation should fail.");
+    assert_eq!(err, SecretTreeError::SecretReuseError);
+}
+
+// `delete_secret_for_generation` is a no-op when the requested generation
+// hasn't been emitted yet (>= the ratchet head) and is idempotent for past
+// generations whose cached secret was already removed.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_delete_secret_edge_cases() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    // Deleting at the current head (generation == head, window_index == -1) is
+    // a no-op.
+    ratchet.delete_secret_for_generation(ratchet.generation());
+    assert_eq!(ratchet.generation(), 0);
+
+    // Deleting a future generation is also a no-op.
+    ratchet.delete_secret_for_generation(42);
+    assert_eq!(ratchet.generation(), 0);
+
+    // Now emit a couple of secrets so we have entries in the past-secrets
+    // window.
+    let (gen0, _) = ratchet
+        .secret_for_encryption(ciphersuite, provider.crypto())
+        .expect("Expected encryption secret.");
+    let (_gen1, _) = ratchet
+        .secret_for_encryption(ciphersuite, provider.crypto())
+        .expect("Expected encryption secret.");
+
+    // Deleting an already-cached past generation drops it; a second delete at
+    // the same generation is harmless.
+    ratchet.delete_secret_for_generation(gen0);
+    ratchet.delete_secret_for_generation(gen0);
+
+    // Decrypting that generation now fails.
+    let err = ratchet
+        .secret_for_decryption(ciphersuite, provider.crypto(), gen0, configuration)
+        .expect_err("Deleted secret should be unavailable.");
+    assert_eq!(err, SecretTreeError::SecretReuseError);
+}
+
+// Encrypting more than `out_of_order_tolerance` messages without confirming or
+// decrypting must not lock the local sender out of decrypting their oldest
+// in-flight message: the past-bound check that's correct for a pure
+// `DecryptionRatchet` (where anything that old has been pruned away) does not
+// apply to a `DualUseRatchet`, because encryption keeps the secret.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_decrypts_past_out_of_order_tolerance() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    // Send more messages than `out_of_order_tolerance` so that the cache is
+    // larger than the tolerance window.
+    let send_count = configuration.out_of_order_tolerance() + 2;
+    let mut first_generation = None;
+    for _ in 0..send_count {
+        let (generation, _) = ratchet
+            .secret_for_encryption(ciphersuite, provider.crypto())
+            .expect("Expected encryption secret.");
+        first_generation.get_or_insert(generation);
+    }
+    let first_generation = first_generation.unwrap();
+    assert!(ratchet.generation() - first_generation > configuration.out_of_order_tolerance());
+
+    // The oldest cached secret is `out_of_order_tolerance + 1` generations
+    // behind the head, but its secret is still cached, so decryption must
+    // succeed.
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            first_generation,
+            configuration,
+        )
+        .expect("Old encryption secret should still be retrievable for own decryption.");
+}
+
+// Confirming later messages must not advance the receive-side retention
+// window or evict an older unconfirmed encryption secret. The older secret may
+// still be needed to decrypt an own message from another virtual client.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_confirming_later_messages_keeps_old_unconfirmed_secret() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    let (first_generation, _) = ratchet
+        .secret_for_encryption(ciphersuite, provider.crypto())
+        .expect("Expected encryption secret.");
+
+    for _ in 0..configuration.out_of_order_tolerance() + 2 {
+        let (generation, _) = ratchet
+            .secret_for_encryption(ciphersuite, provider.crypto())
+            .expect("Expected encryption secret.");
+        ratchet.delete_secret_for_generation(generation);
+    }
+
+    assert!(ratchet.generation() - first_generation > configuration.out_of_order_tolerance());
+
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            first_generation,
+            configuration,
+        )
+        .expect("Old unconfirmed secret should still be retrievable for own decryption.");
+}
+
+// Successful decryption is what advances the receive-side window. Secrets
+// derived only to cover skipped receive generations are pruned once they fall
+// outside that window.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_decryption_moves_receive_window() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    let target_generation = configuration.out_of_order_tolerance() * 2;
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            target_generation,
+            configuration,
+        )
+        .expect("Expected decryption secret.");
+
+    let too_old_generation = target_generation - configuration.out_of_order_tolerance();
+    let err = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            too_old_generation,
+            configuration,
+        )
+        .expect_err("Expected the receive window to reject old generations.");
+    assert_eq!(err, SecretTreeError::TooDistantInThePast);
+
+    let retained_generation = target_generation - configuration.out_of_order_tolerance() + 1;
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            retained_generation,
+            configuration,
+        )
+        .expect("Expected retained out-of-order secret.");
+}
+
+// Local sends must not occupy slots in the receive-side retention window. Only
+// decrypting a message advances that window. In this scenario the first
+// decryption leaves a full receive window, then we send and confirm enough
+// messages to span the whole tolerance. A later decryption should prune only as
+// far as that one received message requires, not by the locally sent
+// generations.
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_local_sends_do_not_advance_receive_window() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    let first_received_generation = configuration.out_of_order_tolerance();
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            first_received_generation,
+            configuration,
+        )
+        .expect("Expected first decryption secret.");
+
+    for _ in 0..configuration.out_of_order_tolerance() {
+        let (generation, _) = ratchet
+            .secret_for_encryption(ciphersuite, provider.crypto())
+            .expect("Expected encryption secret.");
+        ratchet.delete_secret_for_generation(generation);
+    }
+
+    let later_received_generation = ratchet.generation();
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            later_received_generation,
+            configuration,
+        )
+        .expect("Expected later decryption secret.");
+
+    let pruned_by_later_decryption =
+        first_received_generation.saturating_sub(configuration.out_of_order_tolerance()) + 1;
+    let err = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            pruned_by_later_decryption,
+            configuration,
+        )
+        .expect_err("One old generation should be pruned by the later decryption.");
+    assert_eq!(err, SecretTreeError::TooDistantInThePast);
+
+    let retained_across_local_sends = pruned_by_later_decryption + 1;
+    let _decrypted = ratchet
+        .secret_for_decryption(
+            ciphersuite,
+            provider.crypto(),
+            retained_across_local_sends,
+            configuration,
+        )
+        .expect("Local sends should not prune the receive window.");
+}
+
+#[cfg(feature = "virtual-clients-draft")]
+#[openmls_test::openmls_test]
+fn dual_use_stale_peeked_generation_is_rejected() {
+    let provider = &Provider::default();
+    let configuration = &SenderRatchetConfiguration::default();
+    let secret = Secret::random(ciphersuite, provider.rand()).expect("Not enough randomness.");
+    let mut ratchet = DualUseRatchet::new(secret);
+
+    let (_, forward) = ratchet
+        .peek(ciphersuite, provider.crypto(), 5, configuration)
+        .unwrap();
+    let (_, other_forward) = ratchet
+        .peek(ciphersuite, provider.crypto(), 6, configuration)
+        .unwrap();
+    ratchet.consume(forward, configuration).unwrap();
+    assert_eq!(
+        ratchet.consume(other_forward, configuration),
+        Err(SecretTreeError::LibraryError)
+    );
+
+    let (_, past) = ratchet
+        .peek(ciphersuite, provider.crypto(), 2, configuration)
+        .unwrap();
+    let (_, same_past) = ratchet
+        .peek(ciphersuite, provider.crypto(), 2, configuration)
+        .unwrap();
+    ratchet.consume(past, configuration).unwrap();
+    assert_eq!(
+        ratchet.consume(same_past, configuration),
+        Err(SecretTreeError::SecretReuseError)
+    );
+}

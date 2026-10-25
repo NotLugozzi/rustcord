@@ -76,8 +76,10 @@ impl DaveSession {
     }
 
     pub fn generate_key_package(&self) -> Result<Vec<u8>, ClientError> {
+        let capabilities = dave_capabilities();
         let bundle = KeyPackage::builder()
             .key_package_lifetime(Lifetime::init(0, u64::MAX))
+            .leaf_node_capabilities(capabilities)
             .build(CIPHERSUITE, &self.provider, &self.signature_keys, self.credential_with_key.clone())
             .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to build key package: {e:?}")))?;
         bundle
@@ -97,35 +99,50 @@ impl DaveSession {
         self.external_sender.is_some()
     }
 
-    pub fn create_new_group(&mut self, group_id: u64) -> Result<(), ClientError> {
+    pub fn create_new_group(&mut self, group_id: u64) -> Result<Vec<u8>, ClientError> {
         let external_sender = self.external_sender.clone()
             .ok_or_else(|| ClientError::GatewayClosed("dave: external sender is not available".into()))?;
         let extensions = Extensions::<GroupContext>::single(Extension::ExternalSenders(vec![external_sender]))
             .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to build external sender extension: {e:?}")))?;
+        let capabilities = dave_capabilities();
+        let key_package_bundle = KeyPackage::builder()
+            .key_package_lifetime(Lifetime::init(0, u64::MAX))
+            .leaf_node_capabilities(capabilities.clone())
+            .build(CIPHERSUITE, &self.provider, &self.signature_keys, self.credential_with_key.clone())
+            .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to build initial key package: {e:?}")))?;
+        let key_package = key_package_bundle.key_package().tls_serialize_detached()
+            .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to serialize initial key package: {e:?}")))?;
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(CIPHERSUITE)
+            .capabilities(capabilities)
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .with_group_context_extensions(extensions)
             .build();
-        let group = MlsGroup::new_with_group_id(
+        let group = MlsGroup::new_with_group_id_and_key_package(
             &self.provider,
             &self.signature_keys,
             &config,
             GroupId::from_slice(&group_id.to_be_bytes()),
             self.credential_with_key.clone(),
+            key_package_bundle,
         )
             .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to create group: {e:?}")))?;
         self.group = Some(group);
-        Ok(())
+        Ok(key_package)
     }
 
     pub fn process_welcome(&mut self, bytes: &[u8]) -> Result<(), ClientError> {
-        let message = MlsMessageIn::tls_deserialize_exact(bytes)
+        let welcome = Welcome::tls_deserialize_exact(bytes)
             .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to parse welcome: {e:?}")))?;
-        let MlsMessageBodyIn::Welcome(welcome) = message.extract() else {
-            return Err(ClientError::GatewayClosed("dave: expected welcome message".into()));
-        };
-        let join_config = MlsGroupJoinConfig::builder().use_ratchet_tree_extension(true).build();
+        if let Some(mut pending_group) = self.group.take() {
+            pending_group.delete(self.provider.storage())
+                .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to discard pending group before welcome: {e:?}")))?;
+        }
+        let join_config = MlsGroupJoinConfig::builder()
+            .wire_format_policy(MIXED_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .build();
         let staged = StagedWelcome::new_from_welcome(&self.provider, &join_config, welcome, None)
             .map_err(|e| ClientError::GatewayClosed(format!("dave: failed to stage welcome: {e:?}")))?;
         let group = staged
@@ -279,4 +296,14 @@ impl DaveSession {
         secret.copy_from_slice(&exported);
         Ok(secret)
     }
+}
+
+fn dave_capabilities() -> Capabilities {
+    Capabilities::new(
+        Some(&[ProtocolVersion::Mls10]),
+        Some(&[CIPHERSUITE]),
+        None,
+        None,
+        Some(&[CredentialType::Basic]),
+    )
 }

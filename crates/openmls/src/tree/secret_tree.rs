@@ -1,0 +1,640 @@
+use openmls_traits::crypto::OpenMlsCrypto;
+use openmls_traits::types::{Ciphersuite, CryptoError};
+use thiserror::Error;
+use tls_codec::{Error as TlsCodecError, TlsSerialize, TlsSize};
+
+use super::*;
+#[cfg(feature = "virtual-clients-draft")]
+use crate::tree::dual_use_ratchet::{DualUseRatchet, PeekedDualUseGeneration};
+use crate::{
+    binary_tree::{
+        array_representation::{
+            direct_path, left, right, root, ParentNodeIndex, TreeNodeIndex, TreeSize,
+        },
+        LeafNodeIndex,
+    },
+    framing::*,
+    schedule::*,
+    tree::sender_ratchet::*,
+};
+
+/// Secret tree error
+#[derive(Error, Debug, Eq, PartialEq, Clone)]
+pub enum SecretTreeError {
+    /// Generation is too old to be processed.
+    #[error("Generation is too old to be processed.")]
+    TooDistantInThePast,
+    /// Generation is too far in the future to be processed.
+    #[error("Generation is too far in the future to be processed.")]
+    TooDistantInTheFuture,
+    /// Index out of bounds
+    #[error("Index out of bounds")]
+    IndexOutOfBounds,
+    /// The requested secret was deleted to preserve forward secrecy.
+    #[error("The requested secret was deleted to preserve forward secrecy.")]
+    SecretReuseError,
+    /// Cannot create decryption secrets from own sender ratchet or encryption secrets from the sender ratchets of other members.
+    #[error("Cannot create decryption secrets from own sender ratchet or encryption secrets from the sender ratchets of other members.")]
+    RatchetTypeError,
+    /// Ratchet generation has reached `u32::MAX`.
+    #[error("Ratchet generation has reached `u32::MAX`.")]
+    RatchetTooLong,
+    /// An unrecoverable error has occurred due to a bug in the implementation.
+    #[error("An unrecoverable error has occurred due to a bug in the implementation.")]
+    LibraryError,
+    /// See [`TlsCodecError`] for more details.
+    #[error(transparent)]
+    CodecError(#[from] TlsCodecError),
+    /// See [`CryptoError`] for more details.
+    #[error(transparent)]
+    CryptoError(#[from] CryptoError),
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) enum SecretType {
+    HandshakeSecret,
+    ApplicationSecret,
+}
+
+impl From<&ContentType> for SecretType {
+    fn from(content_type: &ContentType) -> SecretType {
+        match content_type {
+            ContentType::Application => SecretType::ApplicationSecret,
+            ContentType::Commit => SecretType::HandshakeSecret,
+            ContentType::Proposal => SecretType::HandshakeSecret,
+        }
+    }
+}
+
+impl From<&PublicMessage> for SecretType {
+    fn from(public_message: &PublicMessage) -> SecretType {
+        SecretType::from(&public_message.content_type())
+    }
+}
+
+/// A sender ratchet change computed by [`SecretTree::prepare_decryption`],
+/// not yet applied to the tree.
+pub(crate) struct PendingRatchetUpdate {
+    index: LeafNodeIndex,
+    secret_type: SecretType,
+    peeked: Box<PeekedRatchetGeneration>,
+}
+
+enum PeekedRatchetGeneration {
+    Decryption(PeekedGeneration),
+    #[cfg(feature = "virtual-clients-draft")]
+    DualUse(PeekedDualUseGeneration),
+}
+
+impl std::fmt::Debug for PendingRatchetUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRatchetUpdate")
+            .field("index", &self.index)
+            .field("secret_type", &self.secret_type)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) fn derive_child_secrets(
+    parent_secret: &Secret,
+    crypto: &impl OpenMlsCrypto,
+    ciphersuite: Ciphersuite,
+) -> Result<(Secret, Secret), CryptoError> {
+    let left_child = parent_secret.kdf_expand_label(
+        crypto,
+        ciphersuite,
+        "tree",
+        b"left",
+        ciphersuite.hash_length(),
+    )?;
+    let right_child = parent_secret.kdf_expand_label(
+        crypto,
+        ciphersuite,
+        "tree",
+        b"right",
+        ciphersuite.hash_length(),
+    )?;
+    Ok((left_child, right_child))
+}
+
+/// Derives secrets for inner nodes of a SecretTree. This function corresponds
+/// to the `DeriveTreeSecret` defined in Section 10.1 of the MLS specification.
+#[inline]
+pub(crate) fn derive_tree_secret(
+    ciphersuite: Ciphersuite,
+    secret: &Secret,
+    label: &str,
+    generation: u32,
+    length: usize,
+    crypto: &impl OpenMlsCrypto,
+) -> Result<Secret, SecretTreeError> {
+    log::debug!(
+        "Derive tree secret with label \"{label}\" in generation {generation} of length {length}"
+    );
+    log_crypto!(trace, "Input secret {:x?}", secret.as_slice());
+
+    let secret = secret.kdf_expand_label(
+        crypto,
+        ciphersuite,
+        label,
+        &generation.to_be_bytes(),
+        length,
+    )?;
+    log_crypto!(trace, "Derived secret {:x?}", secret.as_slice());
+    Ok(secret)
+}
+
+#[derive(Debug, TlsSerialize, TlsSize)]
+pub(crate) struct TreeContext {
+    pub(crate) node: u32,
+    pub(crate) generation: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, TlsSerialize, TlsSize)]
+#[cfg_attr(any(feature = "test-utils", test), derive(PartialEq, Clone))]
+pub(crate) struct SecretTreeNode {
+    pub(crate) secret: Secret,
+}
+
+#[derive(Serialize, Deserialize)]
+#[cfg_attr(any(feature = "test-utils", test), derive(PartialEq, Clone))]
+#[cfg_attr(any(feature = "crypto-debug", test), derive(Debug))]
+pub(crate) struct SecretTree {
+    own_index: LeafNodeIndex,
+    leaf_nodes: Vec<Option<SecretTreeNode>>,
+    parent_nodes: Vec<Option<SecretTreeNode>>,
+    handshake_sender_ratchets: Vec<Option<SenderRatchet>>,
+    application_sender_ratchets: Vec<Option<SenderRatchet>>,
+    size: TreeSize,
+}
+
+impl SecretTree {
+    /// Creates a new SecretTree based on an `encryption_secret` and group size
+    /// `size`. The inner nodes of the tree and the SenderRatchets only get
+    /// initialized when secrets are requested either through `secret()`
+    /// or `next_secret()`.
+    pub(crate) fn new(
+        encryption_secret: EncryptionSecret,
+        size: TreeSize,
+        own_index: LeafNodeIndex,
+    ) -> Self {
+        let leaf_count = size.leaf_count() as usize;
+        let leaf_nodes = std::iter::repeat_with(|| None).take(leaf_count).collect();
+        let parent_nodes = std::iter::repeat_with(|| None).take(leaf_count).collect();
+        let handshake_sender_ratchets = std::iter::repeat_with(|| None).take(leaf_count).collect();
+        let application_sender_ratchets =
+            std::iter::repeat_with(|| None).take(leaf_count).collect();
+
+        let mut secret_tree = SecretTree {
+            own_index,
+            leaf_nodes,
+            parent_nodes,
+            handshake_sender_ratchets,
+            application_sender_ratchets,
+            size,
+        };
+
+        // Set the encryption secret in the root node. We ignore the Result
+        // here, since the we rely on the tree math to be correct, i.e.
+        // root(size) < size.
+        let _ = secret_tree.set_node(
+            root(size),
+            Some(SecretTreeNode {
+                secret: encryption_secret.consume_secret(),
+            }),
+        );
+
+        secret_tree
+    }
+
+    /// Get current generation for a specific SenderRatchet
+    #[cfg(test)]
+    pub(crate) fn generation(&self, index: LeafNodeIndex, secret_type: SecretType) -> u32 {
+        match self
+            .ratchet_opt(index, secret_type)
+            .expect("Index out of bounds.")
+        {
+            Some(sender_ratchet) => sender_ratchet.generation(),
+            None => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sender_ratchet(
+        &self,
+        index: LeafNodeIndex,
+        secret_type: SecretType,
+    ) -> Option<&SenderRatchet> {
+        self.ratchet_opt(index, secret_type).ok().flatten()
+    }
+
+    /// Initializes a specific SenderRatchet pair for a given index by
+    /// calculating and deleting the appropriate values in the SecretTree
+    fn initialize_sender_ratchets(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index: LeafNodeIndex,
+    ) -> Result<(), SecretTreeError> {
+        log::trace!("Initializing sender ratchets for {index:?} with {ciphersuite}");
+        if index.u32() >= self.size.leaf_count() {
+            log::error!("Index is larger than the tree size.");
+            return Err(SecretTreeError::IndexOutOfBounds);
+        }
+        // Check if SenderRatchets are already initialized
+        if self
+            .ratchet_opt(index, SecretType::HandshakeSecret)?
+            .is_some()
+            && self
+                .ratchet_opt(index, SecretType::ApplicationSecret)?
+                .is_some()
+        {
+            log::trace!("The sender ratchets are initialized already.");
+            return Ok(());
+        }
+
+        // If we don't have a secret in the leaf node, we derive it
+        if self.get_node(index.into())?.is_none() {
+            // Collect empty nodes in the direct path until a non-empty node is
+            // found
+            let mut empty_nodes: Vec<ParentNodeIndex> = Vec::new();
+            let direct_path = direct_path(index, self.size);
+            log::trace!("Direct path for node {index:?}: {direct_path:?}");
+            for parent_node in direct_path {
+                empty_nodes.push(parent_node);
+                // Stop if we find a non-empty node
+                if self.get_node(parent_node.into())?.is_some() {
+                    break;
+                }
+            }
+
+            // Invert direct path
+            empty_nodes.reverse();
+
+            // Derive the secrets down all the way to the leaf node
+            for n in empty_nodes {
+                log::trace!("Derive down for parent node {n:?}.");
+                self.derive_down(ciphersuite, crypto, n)?;
+            }
+        }
+
+        // Calculate node secret and initialize SenderRatchets
+        let node_secret = match self.get_node(index.into())? {
+            Some(node) => &node.secret,
+            // We just derived all necessary nodes so this should not happen
+            None => {
+                return Err(SecretTreeError::LibraryError);
+            }
+        };
+
+        log::trace!("Deriving leaf node secrets for leaf {index:?}");
+
+        let handshake_ratchet_secret = node_secret.kdf_expand_label(
+            crypto,
+            ciphersuite,
+            "handshake",
+            b"",
+            ciphersuite.hash_length(),
+        )?;
+        let application_ratchet_secret = node_secret.kdf_expand_label(
+            crypto,
+            ciphersuite,
+            "application",
+            b"",
+            ciphersuite.hash_length(),
+        )?;
+
+        log_crypto!(
+            trace,
+            "handshake ratchet secret {handshake_ratchet_secret:x?}"
+        );
+        log_crypto!(
+            trace,
+            "application ratchet secret {application_ratchet_secret:x?}"
+        );
+
+        // Initialize SenderRatchets. We differentiate between the own
+        // SenderRatchets and the SenderRatchets of other members. With the
+        // `virtual-clients-draft` feature, the own SenderRatchets are
+        // [`DualUseRatchet`]s, which can produce key material for both
+        // encryption and decryption.
+        let (handshake_sender_ratchet, application_sender_ratchet) = if index == self.own_index {
+            #[cfg(not(feature = "virtual-clients-draft"))]
+            {
+                (
+                    SenderRatchet::EncryptionRatchet(RatchetSecret::initial_ratchet_secret(
+                        handshake_ratchet_secret,
+                    )),
+                    SenderRatchet::EncryptionRatchet(RatchetSecret::initial_ratchet_secret(
+                        application_ratchet_secret,
+                    )),
+                )
+            }
+            #[cfg(feature = "virtual-clients-draft")]
+            {
+                (
+                    SenderRatchet::DualUse(DualUseRatchet::new(handshake_ratchet_secret)),
+                    SenderRatchet::DualUse(DualUseRatchet::new(application_ratchet_secret)),
+                )
+            }
+        } else {
+            (
+                SenderRatchet::DecryptionRatchet(DecryptionRatchet::new(handshake_ratchet_secret)),
+                SenderRatchet::DecryptionRatchet(DecryptionRatchet::new(
+                    application_ratchet_secret,
+                )),
+            )
+        };
+
+        *self
+            .handshake_sender_ratchets
+            .get_mut(index.usize())
+            .ok_or(SecretTreeError::IndexOutOfBounds)? = Some(handshake_sender_ratchet);
+        *self
+            .application_sender_ratchets
+            .get_mut(index.usize())
+            .ok_or(SecretTreeError::IndexOutOfBounds)? = Some(application_sender_ratchet);
+
+        // Delete leaf node
+        self.set_node(index.into(), None)
+    }
+
+    /// Returns the RatchetSecrets for a given index and generation without
+    /// changing the sender's ratchet, together with the change that
+    /// [`Self::apply_decryption_update`] applies to mark the generation as
+    /// used. Until then, the generation can be requested again.
+    ///
+    /// The sender's ratchets are initialized in the tree if they weren't
+    /// before.
+    ///
+    /// Returns an error if index or generation are out of bound.
+    pub(crate) fn prepare_decryption(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index: LeafNodeIndex,
+        secret_type: SecretType,
+        generation: u32,
+        configuration: &SenderRatchetConfiguration,
+    ) -> Result<(RatchetKeyMaterial, PendingRatchetUpdate), SecretTreeError> {
+        log::debug!(
+            "Generating {secret_type:?} decryption secret for {index:?} in generation {generation} with {ciphersuite}",
+        );
+        // Check tree bounds
+        if index.u32() >= self.size.leaf_count() {
+            log::error!("Sender index is not in the tree.");
+            return Err(SecretTreeError::IndexOutOfBounds);
+        }
+        if self.ratchet_opt(index, secret_type)?.is_none() {
+            log::trace!("   initialize sender ratchets");
+            self.initialize_sender_ratchets(ciphersuite, crypto, index)?;
+        }
+        let (ratchet_key_material, peeked) = match self.ratchet_mut(index, secret_type)? {
+            SenderRatchet::EncryptionRatchet(_) => {
+                log::error!("This is the wrong ratchet type.");
+                return Err(SecretTreeError::RatchetTypeError);
+            }
+            SenderRatchet::DecryptionRatchet(dec_ratchet) => {
+                log::trace!("   getting secret for decryption");
+                let (ratchet_key_material, peeked) =
+                    dec_ratchet.peek(ciphersuite, crypto, generation, configuration)?;
+                (
+                    ratchet_key_material,
+                    PeekedRatchetGeneration::Decryption(peeked),
+                )
+            }
+            #[cfg(feature = "virtual-clients-draft")]
+            SenderRatchet::DualUse(dual_ratchet) => {
+                log::trace!("   getting secret for decryption (own dual-use ratchet)");
+                let (ratchet_key_material, peeked) =
+                    dual_ratchet.peek(ciphersuite, crypto, generation, configuration)?;
+                (
+                    ratchet_key_material,
+                    PeekedRatchetGeneration::DualUse(peeked),
+                )
+            }
+        };
+        let update = PendingRatchetUpdate {
+            index,
+            secret_type,
+            peeked: Box::new(peeked),
+        };
+        Ok((ratchet_key_material, update))
+    }
+
+    /// Marks the generation in `update` as used in the sender's ratchet.
+    pub(crate) fn apply_decryption_update(
+        &mut self,
+        update: PendingRatchetUpdate,
+        configuration: &SenderRatchetConfiguration,
+    ) -> Result<(), SecretTreeError> {
+        let ratchet = self.ratchet_mut(update.index, update.secret_type)?;
+        match (ratchet, *update.peeked) {
+            (
+                SenderRatchet::DecryptionRatchet(dec_ratchet),
+                PeekedRatchetGeneration::Decryption(peeked),
+            ) => dec_ratchet.consume(peeked, configuration),
+            #[cfg(feature = "virtual-clients-draft")]
+            (SenderRatchet::DualUse(dual_ratchet), PeekedRatchetGeneration::DualUse(peeked)) => {
+                dual_ratchet.consume(peeked, configuration)
+            }
+            _ => Err(SecretTreeError::RatchetTypeError),
+        }
+    }
+
+    /// Return RatchetSecrets for a given index and generation and mark the
+    /// generation as used.
+    /// Returns an error if index or generation are out of bound.
+    #[cfg(any(feature = "test-utils", test))]
+    pub(crate) fn secret_for_decryption(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index: LeafNodeIndex,
+        secret_type: SecretType,
+        generation: u32,
+        configuration: &SenderRatchetConfiguration,
+    ) -> Result<RatchetKeyMaterial, SecretTreeError> {
+        let (ratchet_key_material, update) = self.prepare_decryption(
+            ciphersuite,
+            crypto,
+            index,
+            secret_type,
+            generation,
+            configuration,
+        )?;
+        self.apply_decryption_update(update, configuration)?;
+        Ok(ratchet_key_material)
+    }
+
+    /// Return the next RatchetSecrets that should be used for encryption and
+    /// then increments the generation.
+    pub(crate) fn secret_for_encryption(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index: LeafNodeIndex,
+        secret_type: SecretType,
+    ) -> Result<(u32, RatchetKeyMaterial), SecretTreeError> {
+        if self.ratchet_opt(index, secret_type)?.is_none() {
+            self.initialize_sender_ratchets(ciphersuite, crypto, index)?;
+        }
+        match self.ratchet_mut(index, secret_type)? {
+            SenderRatchet::DecryptionRatchet(_) => {
+                log::error!("Invalid ratchet type. Got decryption, expected encryption.");
+                Err(SecretTreeError::RatchetTypeError)
+            }
+            SenderRatchet::EncryptionRatchet(enc_ratchet) => {
+                enc_ratchet.ratchet_forward(crypto, ciphersuite)
+            }
+            #[cfg(feature = "virtual-clients-draft")]
+            SenderRatchet::DualUse(dual_ratchet) => {
+                dual_ratchet.secret_for_encryption(ciphersuite, crypto)
+            }
+        }
+    }
+
+    #[cfg(feature = "virtual-clients-draft")]
+    pub(crate) fn delete_own_secret_for_generation(
+        &mut self,
+        secret_type: SecretType,
+        generation: Generation,
+    ) -> Result<(), SecretTreeError> {
+        match self.ratchet_mut(self.own_index, secret_type)? {
+            SenderRatchet::DualUse(dual_ratchet) => {
+                dual_ratchet.delete_secret_for_generation(generation);
+                Ok(())
+            }
+            SenderRatchet::EncryptionRatchet(_) | SenderRatchet::DecryptionRatchet(_) => {
+                Err(SecretTreeError::RatchetTypeError)
+            }
+        }
+    }
+
+    /// Returns a mutable reference to a specific SenderRatchet. The
+    /// SenderRatchet needs to be initialized.
+    fn ratchet_mut(
+        &mut self,
+        index: LeafNodeIndex,
+        secret_type: SecretType,
+    ) -> Result<&mut SenderRatchet, SecretTreeError> {
+        let sender_ratchets = match secret_type {
+            SecretType::HandshakeSecret => &mut self.handshake_sender_ratchets,
+            SecretType::ApplicationSecret => &mut self.application_sender_ratchets,
+        };
+        sender_ratchets
+            .get_mut(index.usize())
+            .and_then(|r| r.as_mut())
+            .ok_or(SecretTreeError::IndexOutOfBounds)
+    }
+
+    /// Returns an optional reference to a specific SenderRatchet
+    fn ratchet_opt(
+        &self,
+        index: LeafNodeIndex,
+        secret_type: SecretType,
+    ) -> Result<Option<&SenderRatchet>, SecretTreeError> {
+        let sender_ratchets = match secret_type {
+            SecretType::HandshakeSecret => &self.handshake_sender_ratchets,
+            SecretType::ApplicationSecret => &self.application_sender_ratchets,
+        };
+        match sender_ratchets.get(index.usize()) {
+            Some(sender_ratchet_option) => Ok(sender_ratchet_option.as_ref()),
+            None => Err(SecretTreeError::IndexOutOfBounds),
+        }
+    }
+
+    /// Derives the secrets for the child nodes in a SecretTree and blanks the
+    /// parent node.
+    fn derive_down(
+        &mut self,
+        ciphersuite: Ciphersuite,
+        crypto: &impl OpenMlsCrypto,
+        index_in_tree: ParentNodeIndex,
+    ) -> Result<(), SecretTreeError> {
+        log::debug!(
+            "Deriving tree secret for parent node {} with {}",
+            index_in_tree.u32(),
+            ciphersuite
+        );
+        let node_secret = match &self.get_node(index_in_tree.into())? {
+            Some(node) => &node.secret,
+            // This function only gets called top to bottom, so this should not happen
+            None => {
+                return Err(SecretTreeError::LibraryError);
+            }
+        };
+        log_crypto!(trace, "Node secret: {:x?}", node_secret.as_slice());
+        let left_index = left(index_in_tree);
+        let right_index = right(index_in_tree);
+        let (left_secret, right_secret) = derive_child_secrets(node_secret, crypto, ciphersuite)?;
+        log_crypto!(
+            trace,
+            "Left node ({}) secret: {:x?}",
+            left_index.test_u32(),
+            left_secret.as_slice()
+        );
+        log_crypto!(
+            trace,
+            "Right node ({}) secret: {:x?}",
+            right_index.test_u32(),
+            right_secret.as_slice()
+        );
+
+        // Populate left child
+        self.set_node(
+            left_index,
+            Some(SecretTreeNode {
+                secret: left_secret,
+            }),
+        )?;
+
+        // Populate right child
+        self.set_node(
+            right_index,
+            Some(SecretTreeNode {
+                secret: right_secret,
+            }),
+        )?;
+
+        // Delete parent node
+        self.set_node(index_in_tree.into(), None)
+    }
+
+    fn get_node(&self, index: TreeNodeIndex) -> Result<Option<&SecretTreeNode>, SecretTreeError> {
+        match index {
+            TreeNodeIndex::Leaf(leaf_index) => Ok(self
+                .leaf_nodes
+                .get(leaf_index.usize())
+                .ok_or(SecretTreeError::IndexOutOfBounds)?
+                .as_ref()),
+            TreeNodeIndex::Parent(parent_index) => Ok(self
+                .parent_nodes
+                .get(parent_index.usize())
+                .ok_or(SecretTreeError::IndexOutOfBounds)?
+                .as_ref()),
+        }
+    }
+
+    fn set_node(
+        &mut self,
+        index: TreeNodeIndex,
+        node: Option<SecretTreeNode>,
+    ) -> Result<(), SecretTreeError> {
+        match index {
+            TreeNodeIndex::Leaf(leaf_index) => {
+                *self
+                    .leaf_nodes
+                    .get_mut(leaf_index.usize())
+                    .ok_or(SecretTreeError::IndexOutOfBounds)? = node;
+            }
+            TreeNodeIndex::Parent(parent_index) => {
+                *self
+                    .parent_nodes
+                    .get_mut(parent_index.usize())
+                    .ok_or(SecretTreeError::IndexOutOfBounds)? = node;
+            }
+        }
+        Ok(())
+    }
+}

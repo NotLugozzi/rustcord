@@ -2,7 +2,7 @@ use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use ghash::universal_hash::UniversalHash;
 use ghash::{GHash, Key as GHashKey};
-use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -13,15 +13,24 @@ const TAG_LEN: usize = 8;
 const MAX_CACHED_GENERATIONS: usize = 8;
 
 fn expand_label(secret: &[u8], label: &str, len: usize) -> Option<Vec<u8>> {
+    if len > 255 * 32 { return None; }
     let label = format!("MLS 1.0 {label}");
     let mut info = Vec::with_capacity(4 + label.len());
     info.extend_from_slice(&(len as u16).to_be_bytes());
     info.push(u8::try_from(label.len()).ok()?);
     info.extend_from_slice(label.as_bytes());
     info.push(0);
-    let hk = Hkdf::<Sha256>::from_prk(secret).ok()?;
-    let mut output = vec![0; len];
-    hk.expand(&info, &mut output).ok()?;
+    let mut output = Vec::with_capacity(len);
+    let mut previous = Vec::new();
+    for counter in 1..=((len + 31) / 32) {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret).ok()?;
+        mac.update(&previous);
+        mac.update(&info);
+        mac.update(&[u8::try_from(counter).ok()?]);
+        previous = mac.finalize().into_bytes().to_vec();
+        let remaining = len - output.len();
+        output.extend_from_slice(&previous[..remaining.min(previous.len())]);
+    }
     Some(output)
 }
 

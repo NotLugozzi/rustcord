@@ -185,10 +185,7 @@ impl VoiceGateway {
                                             .or_else(|| self.channel_id.parse::<u64>().ok());
                                         if dave_session.has_external_sender() {
                                             if let Some(group_id) = pending_dave_group_id.take() {
-                                                if let Err(e) = dave_session.create_new_group(group_id) {
-                                                    break Err(e);
-                                                }
-                                                match dave_session.generate_key_package() {
+                                                match dave_session.create_new_group(group_id) {
                                                     Ok(package) => {
                                                         tracing::info!("voice: sending initial DAVE MLS key package");
                                                         if let Err(e) = write.send(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &package))).await {
@@ -270,17 +267,13 @@ impl VoiceGateway {
                                         };
                                         pending_dave_group_id = Some(group_id);
                                         if dave_session.has_external_sender() {
-                                            if let Err(e) = dave_session.create_new_group(group_id) {
-                                                break Err(e);
-                                            }
-                                            pending_dave_group_id = None;
-                                            match dave_session.generate_key_package() {
-                                                Ok(package) => {
-                                                    if let Err(e) = write.send(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &package))).await {
-                                                        break Err(e.into());
-                                                    }
-                                                }
+                                            let package = match dave_session.create_new_group(group_id) {
+                                                Ok(package) => package,
                                                 Err(e) => break Err(e),
+                                            };
+                                            pending_dave_group_id = None;
+                                            if let Err(e) = write.send(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &package))).await {
+                                                break Err(e.into());
                                             }
                                         }
                                     }
@@ -399,7 +392,12 @@ impl VoiceGateway {
                             if received_audio_frame_count == 1 || received_audio_frame_count % 50 == 0 {
                                 tracing::info!("voice: received {received_audio_frame_count} decoded RTP audio events; latest SSRC {ssrc}, {} bytes, DAVE enabled={dave_enabled}", payload.len());
                             }
-                            let decoded_payload = if dave_enabled {
+                            if payload.is_empty() {
+                                continue;
+                            }
+                            let decoded_payload = if dave_enabled && payload == [0xf8, 0xff, 0xfe] {
+                                payload
+                            } else if dave_enabled {
                                 let Some(user_id) = remote_speakers.get(&ssrc).and_then(|id| id.parse::<u64>().ok()) else {
                                     tracing::warn!("voice: no speaker identity for encrypted stream SSRC {ssrc}");
                                     continue;
@@ -407,7 +405,10 @@ impl VoiceGateway {
                                 match frame_crypto.decrypt(user_id, &payload) {
                                     Some(plain) => plain,
                                     None => {
-                                        tracing::warn!("voice: DAVE decryption failed for SSRC {ssrc}");
+                                        if received_audio_frame_count == 1 || received_audio_frame_count % 50 == 0 {
+                                            let marker = payload.get(payload.len().saturating_sub(2)..).unwrap_or_default();
+                                            tracing::warn!("voice: DAVE decryption failed for SSRC {ssrc}; {} byte frame, footer {:02x?}", payload.len(), marker);
+                                        }
                                         continue;
                                     }
                                 }
@@ -527,8 +528,7 @@ fn handle_dave_frame(
         dave::OP_MLS_EXTERNAL_SENDER => {
             dave_session.set_external_sender(&frame.payload)?;
             if let Some(group_id) = pending_group_id.take() {
-                dave_session.create_new_group(group_id)?;
-                let package = dave_session.generate_key_package()?;
+                let package = dave_session.create_new_group(group_id)?;
                 tracing::info!("voice: sending DAVE MLS key package for group initialization");
                 Ok(Some(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &package))))
             } else {
