@@ -879,7 +879,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         for member in state.members_in_voice_channel(&guild_id, channel_id) {
                             ui.indent();
                             let mute_icon = if member.self_deaf { " \u{1F507}" } else if member.self_mute { " \u{1F3A4}\u{0338}" } else { "" };
-                            ui.text_disabled(format!("{}{}", member.display_name(), mute_icon));
+                            let speaking_icon = if state.voice_speaking_users.contains(&member.user_id) { "\u{1F50A} " } else { "" };
+                            ui.text_disabled(format!("{speaking_icon}{}{mute_icon}", member.display_name()));
                             ui.unindent();
                         }
                         if is_connected {
@@ -1900,6 +1901,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                 if let Some(_token) = ui.begin_combo("##input_device", &current_input) {
                     if ui.selectable_config("Default").selected(state.selected_input_device.is_none()).build() {
                         state.selected_input_device = None;
+                        crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: None, output_device: state.selected_output_device.clone() });
                         let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: None });
                     }
                     let devices = state.voice_input_devices.clone();
@@ -1907,6 +1909,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                         let is_selected = state.selected_input_device.as_deref() == Some(device.as_str());
                         if ui.selectable_config(device).selected(is_selected).build() {
                             state.selected_input_device = Some(device.clone());
+                            crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: Some(device.clone()), output_device: state.selected_output_device.clone() });
                             let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: Some(device.clone()) });
                         }
                     }
@@ -1919,6 +1922,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                 if let Some(_token) = ui.begin_combo("##output_device", &current_output) {
                     if ui.selectable_config("Default").selected(state.selected_output_device.is_none()).build() {
                         state.selected_output_device = None;
+                        crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: None });
                         let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: None });
                     }
                     let devices = state.voice_output_devices.clone();
@@ -1926,6 +1930,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                         let is_selected = state.selected_output_device.as_deref() == Some(device.as_str());
                         if ui.selectable_config(device).selected(is_selected).build() {
                             state.selected_output_device = Some(device.clone());
+                            crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: Some(device.clone()) });
                             let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: Some(device.clone()) });
                         }
                     }
@@ -1947,11 +1952,22 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                 if ui.selectable_config(&label).selected(is_current).build() {
                     if let Ok(theme) = crate::theme::Theme::load_from_file(path) {
                         state.theme = theme;
+                        let theme_file = path.file_name().map(|name| name.to_string_lossy().into_owned());
+                        crate::settings::save(&crate::settings::Settings { theme_file, input_device: state.selected_input_device.clone(), output_device: state.selected_output_device.clone() });
                     }
                 }
             }
         });
     state.show_settings = open;
+}
+
+fn current_theme_file(theme: &crate::theme::Theme) -> Option<String> {
+    crate::theme::Theme::themes_dir().and_then(|dir| {
+        crate::theme::Theme::list_available().into_iter().find(|path| {
+            crate::theme::Theme::load_from_file(path).is_ok_and(|candidate| candidate.name == theme.name)
+        }).and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .or_else(|| Some(dir.join(format!("{}.toml", theme.name)).file_name()?.to_string_lossy().into_owned()))
+    })
 }
 
 fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {

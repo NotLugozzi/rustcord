@@ -8,6 +8,7 @@ mod markdown;
 mod presence;
 mod renderer;
 mod session_store;
+mod settings;
 mod theme;
 mod ui;
 
@@ -24,12 +25,16 @@ fn main() {
     let (event_tx, event_rx) = mpsc::unbounded_channel::<BackendEvent>();
     backend::spawn(&rt, cmd_rx, event_tx);
 
-    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), ..Default::default() };
+    let saved_settings = settings::load();
+    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), selected_input_device: saved_settings.input_device, selected_output_device: saved_settings.output_device, ..Default::default() };
     theme::Theme::install_bundled();
     if let Some(dir) = theme::Theme::themes_dir() {
-        let default_path = dir.join("discord-dark.toml");
-        if let Ok(t) = theme::Theme::load_from_file(&default_path) {
+        let selected_file = saved_settings.theme_file.unwrap_or_else(|| "discord-dark.toml".into());
+        let path = dir.join(&selected_file);
+        if let Ok(t) = theme::Theme::load_from_file(&path) {
             state.theme = t;
+        } else {
+            tracing::warn!("saved theme {} could not be loaded; using the default theme", path.display());
         }
     }
 
@@ -172,6 +177,10 @@ pub fn drain_backend_events(
                 state.voice_connecting = false;
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
+                state.voice_speaking_users.clear();
+            }
+            BackendEvent::VoiceSpeaking { user_id, speaking } => {
+                state.set_voice_speaking(user_id, speaking);
             }
             BackendEvent::VoiceDevicesLoaded { inputs, outputs } => {
                 state.voice_input_devices = inputs;

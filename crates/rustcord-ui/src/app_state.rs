@@ -104,6 +104,7 @@ pub struct AppState {
     pub emoji_autocomplete_selected: usize,
     pub gateway_connected: bool,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
+    pub voice_speaking_users: std::collections::HashSet<String>,
     pub connected_voice_channel: Option<(Option<String>, String)>,
     pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
@@ -301,6 +302,14 @@ impl AppState {
     pub fn members_in_voice_channel(&self, guild_id: &str, channel_id: &str) -> Vec<&rustcord_client::models::VoiceState> {
         let Some(states) = self.voice_channel_states.get(guild_id) else { return Vec::new() };
         states.iter().filter(|s| s.channel_id.as_deref() == Some(channel_id)).collect()
+    }
+
+    pub fn set_voice_speaking(&mut self, user_id: String, speaking: bool) {
+        if speaking {
+            self.voice_speaking_users.insert(user_id);
+        } else {
+            self.voice_speaking_users.remove(&user_id);
+        }
     }
 
     pub fn grouped_channels_for_selected_guild(&self) -> Vec<ChannelGroup<'_>> {

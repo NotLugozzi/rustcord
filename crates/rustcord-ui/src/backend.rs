@@ -110,6 +110,7 @@ pub enum BackendEvent {
     VoiceConnecting,
     VoiceConnected,
     VoiceDisconnected,
+    VoiceSpeaking { user_id: String, speaking: bool },
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
 }
 
@@ -419,7 +420,12 @@ fn try_spawn_voice_gateway(
     };
     *pending_session = None;
 
-    let media_state = rustcord_client::voice_gateway::VoiceMediaState::default();
+    let saved_settings = crate::settings::load();
+    let media_state = rustcord_client::voice_gateway::VoiceMediaState {
+        input_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.input_device)),
+        output_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.output_device)),
+        ..Default::default()
+    };
     *VOICE_MEDIA_STATE.lock().unwrap() = Some(media_state.clone());
 
     let voice_gateway =
@@ -438,6 +444,9 @@ fn try_spawn_voice_gateway(
                 }
                 VoiceGatewayEvent::Disconnected { .. } => {
                     let _ = forward_tx.send(BackendEvent::VoiceDisconnected);
+                }
+                VoiceGatewayEvent::Speaking { user_id: Some(user_id), speaking, .. } => {
+                    let _ = forward_tx.send(BackendEvent::VoiceSpeaking { user_id, speaking });
                 }
                 _ => {}
             }

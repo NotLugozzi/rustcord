@@ -42,7 +42,10 @@ struct Identify<'a> {
     token: &'a str,
     properties: IdentifyProperties,
     intents: Option<u64>,
+    capabilities: u64,
 }
+
+const CAPABILITY_PRIORITIZED_READY_PAYLOAD: u64 = 1 << 5;
 
 #[derive(Serialize)]
 struct IdentifyProperties {
@@ -150,6 +153,7 @@ impl Gateway {
                         device: "Discord Client",
                     },
                     intents: None,
+                    capabilities: CAPABILITY_PRIORITIZED_READY_PAYLOAD,
                 };
                 let identify_payload = json!({ "op": 2, "d": identify });
                 write.send(WsMessage::Text(identify_payload.to_string())).await?;
@@ -264,6 +268,11 @@ impl Gateway {
             Some("READY") => {
                 let user: User = serde_json::from_value(data["user"].clone())?;
                 let guilds: Vec<Guild> = serde_json::from_value(data["guilds"].clone())?;
+                let voice_states = parse_initial_voice_states(data.get("guilds"));
+                tracing::info!("READY supplied {} initial voice states", voice_states.len());
+                if !voice_states.is_empty() {
+                    let _ = tx.send(GatewayEvent::InitialVoiceStates(voice_states));
+                }
                 let mut friend_presences = parse_presence_list(data.get("presences"));
                 match data.get("merged_presences") {
                     Some(v) => {
@@ -285,25 +294,8 @@ impl Gateway {
                 }
                 deduplicate_presences(&mut presences);
 
-                let mut voice_states = Vec::new();
-                if let Some(guilds) = data.get("guilds").and_then(Value::as_array) {
-                    for guild in guilds {
-                        let guild_id = guild.get("id").and_then(Value::as_str);
-                        let Some(states) = guild.get("voice_states").and_then(Value::as_array) else { continue };
-                        for state in states {
-                            let mut state = state.clone();
-                            if state.get("guild_id").and_then(Value::as_str).is_none() {
-                                if let (Some(guild_id), Some(object)) = (guild_id, state.as_object_mut()) {
-                                    object.insert("guild_id".to_string(), Value::String(guild_id.to_string()));
-                                }
-                            }
-                            match serde_json::from_value::<VoiceState>(state) {
-                                Ok(state) => voice_states.push(state),
-                                Err(error) => tracing::debug!("skipping malformed initial voice state: {error}"),
-                            }
-                        }
-                    }
-                }
+                let voice_states = parse_initial_voice_states(data.get("guilds"));
+                tracing::info!("READY_SUPPLEMENTAL supplied {} initial voice states", voice_states.len());
                 if !voice_states.is_empty() {
                     let _ = tx.send(GatewayEvent::InitialVoiceStates(voice_states));
                 }
@@ -351,6 +343,28 @@ impl Gateway {
         let _ = tx.send(event);
         Ok(())
     }
+}
+
+fn parse_initial_voice_states(guilds: Option<&Value>) -> Vec<VoiceState> {
+    let mut voice_states = Vec::new();
+    let Some(guilds) = guilds.and_then(Value::as_array) else { return voice_states };
+    for guild in guilds {
+        let guild_id = guild.get("id").and_then(Value::as_str);
+        let Some(states) = guild.get("voice_states").and_then(Value::as_array) else { continue };
+        for state in states {
+            let mut state = state.clone();
+            if state.get("guild_id").and_then(Value::as_str).is_none() {
+                if let (Some(guild_id), Some(object)) = (guild_id, state.as_object_mut()) {
+                    object.insert("guild_id".to_string(), Value::String(guild_id.to_string()));
+                }
+            }
+            match serde_json::from_value::<VoiceState>(state) {
+                Ok(state) => voice_states.push(state),
+                Err(error) => tracing::debug!("skipping malformed initial voice state: {error}"),
+            }
+        }
+    }
+    voice_states
 }
 
 fn frame_is_resumable(reason: &str) -> bool {

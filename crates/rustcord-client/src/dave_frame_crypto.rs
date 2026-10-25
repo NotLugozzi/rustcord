@@ -12,14 +12,15 @@ const MARKER: [u8; 2] = [0xfa, 0xfa];
 const TAG_LEN: usize = 8;
 const MAX_CACHED_GENERATIONS: usize = 8;
 
-fn expand_label(secret: &[u8], label: &str, len: usize) -> Option<Vec<u8>> {
+fn expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Option<Vec<u8>> {
     if len > 255 * 32 { return None; }
     let label = format!("MLS 1.0 {label}");
-    let mut info = Vec::with_capacity(4 + label.len());
+    let mut info = Vec::with_capacity(4 + label.len() + context.len());
     info.extend_from_slice(&(len as u16).to_be_bytes());
     info.push(u8::try_from(label.len()).ok()?);
     info.extend_from_slice(label.as_bytes());
-    info.push(0);
+    info.push(u8::try_from(context.len()).ok()?);
+    info.extend_from_slice(context);
     let mut output = Vec::with_capacity(len);
     let mut previous = Vec::new();
     for counter in 1..=((len + 31) / 32) {
@@ -38,18 +39,22 @@ fn expand_label(secret: &[u8], label: &str, len: usize) -> Option<Vec<u8>> {
 struct GenerationKey {
     secret: Vec<u8>,
     key: [u8; 16],
+    generation: u64,
 }
 
 impl GenerationKey {
-    fn derive(secret: Vec<u8>) -> Option<Self> {
-        let bytes = expand_label(&secret, "key", 16)?;
+    fn derive(secret: Vec<u8>, generation: u64) -> Option<Self> {
+        let generation_context = u32::try_from(generation).ok()?.to_be_bytes();
+        let bytes = expand_label(&secret, "key", &generation_context, 16)?;
         let mut key = [0; 16];
         key.copy_from_slice(&bytes);
-        Some(Self { secret, key })
+        Some(Self { secret, key, generation })
     }
 
-    fn next(&self) -> Option<Self> {
-        Self::derive(expand_label(&self.secret, "secret", 32)?)
+    fn next(&self, generation: u64) -> Option<Self> {
+        let generation_context = u32::try_from(self.generation).ok()?.to_be_bytes();
+        let secret = expand_label(&self.secret, "secret", &generation_context, 32)?;
+        Self::derive(secret, generation)
     }
 }
 
@@ -61,7 +66,7 @@ struct SenderRatchet {
 impl SenderRatchet {
     fn new(base_secret: [u8; 16]) -> Option<Self> {
         let mut keys = HashMap::new();
-        keys.insert(0, GenerationKey::derive(base_secret.to_vec())?);
+        keys.insert(0, GenerationKey::derive(base_secret.to_vec(), 0)?);
         Some(Self { keys, highest: 0 })
     }
 
@@ -71,7 +76,7 @@ impl SenderRatchet {
         }
         let mut next = self.keys.get(&self.highest)?.clone();
         for index in self.highest.checked_add(1)?..=generation {
-            next = next.next()?;
+            next = next.next(index)?;
             self.keys.insert(index, next.clone());
             if self.keys.len() > MAX_CACHED_GENERATIONS {
                 let oldest = *self.keys.keys().min()?;
@@ -140,7 +145,8 @@ impl FrameCrypto {
 
     pub fn encrypt(&mut self, opus_frame: &[u8]) -> Option<Vec<u8>> {
         if opus_frame.is_empty() { return None; }
-        let full_nonce = self.next_nonce.checked_add(1)?;
+        let full_nonce = self.next_nonce;
+        let next_nonce = full_nonce.checked_add(1)?;
         let nonce_value = full_nonce as u32;
         let ratchet = self.ratchets.get_mut(&self.local_sender_id)?;
         let generation = full_nonce >> 24;
@@ -153,10 +159,10 @@ impl FrameCrypto {
         output.extend_from_slice(&ciphertext);
         output.extend_from_slice(&tag[..TAG_LEN]);
         put_uleb128(nonce_value, &mut output);
-        let supplemental_size = TAG_LEN + output.len() - opus_frame.len() - TAG_LEN + 3;
+        let supplemental_size = output.len().checked_sub(opus_frame.len())?.checked_add(3)?;
         output.push(u8::try_from(supplemental_size).ok()?);
         output.extend_from_slice(&MARKER);
-        self.next_nonce = full_nonce;
+        self.next_nonce = next_nonce;
         Some(output)
     }
 
