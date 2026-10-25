@@ -112,27 +112,22 @@ impl VoiceRtc {
                     }
                 }
                 Output::Transmit(transmit) => {
-                    tracing::info!(
-                        "voice rtc: udp send {} bytes to {}: {:02x?}",
-                        transmit.contents.len(),
-                        transmit.destination,
-                        &transmit.contents[..]
-                    );
                     if let Err(e) = self.socket.send_to(&transmit.contents, transmit.destination).await {
                         tracing::warn!("voice rtc: udp send failed: {e}");
                     }
                 }
                 Output::Event(event) => match event {
-                    Event::Connected => return Ok(Some(RtcEvent::Connected)),
+                    Event::Connected => {
+                        tracing::info!("voice rtc: connected (ice+dtls established)");
+                        return Ok(Some(RtcEvent::Connected));
+                    }
                     Event::IceConnectionStateChange(state) => {
-                        tracing::info!("voice rtc: ice connection state changed: {state:?}");
                         if state == IceConnectionState::Disconnected {
+                            tracing::info!("voice rtc: ice disconnected");
                             return Ok(Some(RtcEvent::Disconnected));
                         }
                     }
-                    other => {
-                        tracing::info!("voice rtc: other event: {other:?}");
-                    }
+                    _ => {}
                 },
             }
         }

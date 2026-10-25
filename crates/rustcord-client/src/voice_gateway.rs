@@ -77,9 +77,7 @@ impl VoiceGateway {
                 "max_dave_protocol_version": dave::DAVE_PROTOCOL_VERSION,
             }
         });
-        tracing::info!("voice: sending identify");
         write.send(WsMessage::Text(identify.to_string())).await?;
-        tracing::info!("voice: identify sent");
 
         let mut dave_session = DaveSession::new(&self.user_id)?;
         let mut rtc: Option<VoiceRtc> = None;
@@ -115,11 +113,10 @@ impl VoiceGateway {
                         }
                         WsMessage::Close(frame) => {
                             let reason = frame.map(|f| format!("{}: {}", f.code, f.reason)).unwrap_or_else(|| "closed".into());
-                            tracing::info!("voice: received close frame: {reason}");
+                            tracing::info!("voice: closed: {reason}");
                             break Err(ClientError::GatewayClosed(reason));
                         }
                         WsMessage::Text(text) => {
-                            tracing::info!("voice: received text frame: {text}");
                             let payload: Payload = match serde_json::from_str(&text) {
                                 Ok(p) => p,
                                 Err(e) => break Err(e.into()),
@@ -128,7 +125,6 @@ impl VoiceGateway {
                                 seq_ack = seq;
                             }
                             if payload.op == 2 {
-                                tracing::info!("voice: sending client info (op 16)");
                                 if let Err(e) = write.send(WsMessage::Text(json!({ "op": 16, "d": {} }).to_string())).await {
                                     break Err(e.into());
                                 }
@@ -140,7 +136,6 @@ impl VoiceGateway {
                                 let offer = voice_sdp::build_offer(&params);
                                 rtc = Some(new_rtc);
                                 let select_protocol = select_protocol_frame(&offer);
-                                tracing::info!("voice: sending select protocol: {select_protocol}");
                                 if let Err(e) = write.send(WsMessage::Text(select_protocol)).await {
                                     break Err(e.into());
                                 }
@@ -158,26 +153,18 @@ impl VoiceGateway {
                                 let Some(remote) = remote_sdp else {
                                     break Err(ClientError::GatewayClosed("voice: session description missing parsable sdp".into()));
                                 };
-                                tracing::info!(
-                                    "voice: parsed remote sdp: ufrag={} candidates={}",
-                                    remote.ice_ufrag,
-                                    remote.candidates.len()
-                                );
                                 if let Err(e) = active_rtc.set_remote(&remote) {
                                     tracing::warn!("voice: set_remote failed: {e}");
                                     break Err(e);
                                 }
-                                tracing::info!("voice: rtc remote set, awaiting ice/dtls");
                             }
                             if let Err(e) = handle_payload(payload, &tx) {
                                 break Err(e);
                             }
                         }
                         WsMessage::Binary(bytes) => {
-                            tracing::info!("voice: received binary frame, {} bytes, opcode={:?}", bytes.len(), bytes.get(2));
                             match handle_dave_frame(&bytes, &mut dave_session, &tx) {
                                 Ok(Some(reply)) => {
-                                    tracing::info!("voice: sending dave reply, {} bytes, opcode={:?}", reply.len(), reply.first());
                                     if let Err(e) = write.send(WsMessage::Binary(reply)).await {
                                         break Err(e.into());
                                     }
@@ -207,11 +194,9 @@ impl VoiceGateway {
                 rtc_event = drive_rtc(rtc.as_mut(), &mut rtc_buf) => {
                     match rtc_event {
                         Ok(Some(RtcEvent::Connected)) => {
-                            tracing::info!("voice: rtc connected (ice+dtls established)");
                             let _ = tx.send(VoiceGatewayEvent::MediaConnected);
                         }
                         Ok(Some(RtcEvent::Disconnected)) => {
-                            tracing::info!("voice: rtc disconnected");
                             break Err(ClientError::GatewayClosed("voice media connection disconnected".into()));
                         }
                         Ok(None) => {}
