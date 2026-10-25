@@ -118,6 +118,11 @@ pub fn drain_backend_events(
                     state.presences.insert(presence.user.id.clone(), presence);
                 }
             }
+            BackendEvent::Gateway(GatewayEvent::InitialVoiceStates(voice_states)) => {
+                for voice_state in voice_states {
+                    state.apply_voice_state(voice_state);
+                }
+            }
             BackendEvent::Gateway(GatewayEvent::MessageCreate(message)) => {
                 if let Some(typing) = state.typing_users.get_mut(&message.channel_id) {
                     typing.remove(&message.author.id);
@@ -151,7 +156,7 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::VoiceStateUpdate(voice_state)) => {
                 if state.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) {
-                    state.connected_voice_channel = voice_state.guild_id.clone().zip(voice_state.channel_id.clone());
+                    state.connected_voice_channel = voice_state.channel_id.clone().map(|cid| (voice_state.guild_id.clone(), cid));
                 }
                 state.apply_voice_state(voice_state);
             }
@@ -167,6 +172,10 @@ pub fn drain_backend_events(
                 state.voice_connecting = false;
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
+            }
+            BackendEvent::VoiceDevicesLoaded { inputs, outputs } => {
+                state.voice_input_devices = inputs;
+                state.voice_output_devices = outputs;
             }
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
                 state.guild_channels.insert(guild_id, channels);

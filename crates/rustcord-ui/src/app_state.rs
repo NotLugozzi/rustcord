@@ -104,9 +104,16 @@ pub struct AppState {
     pub emoji_autocomplete_selected: usize,
     pub gateway_connected: bool,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
-    pub connected_voice_channel: Option<(String, String)>,
-    pub pending_voice_channel: Option<(String, String)>,
+    pub connected_voice_channel: Option<(Option<String>, String)>,
+    pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
+    pub self_muted: bool,
+    pub self_deafened: bool,
+    pub voice_input_devices: Vec<String>,
+    pub voice_output_devices: Vec<String>,
+    pub selected_input_device: Option<String>,
+    pub selected_output_device: Option<String>,
+    pub show_voice_device_picker: bool,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);

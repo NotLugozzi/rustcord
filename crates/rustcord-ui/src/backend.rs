@@ -51,6 +51,7 @@ async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
 }
 
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
+pub(crate) static VOICE_MEDIA_STATE: std::sync::Mutex<Option<rustcord_client::voice_gateway::VoiceMediaState>> = std::sync::Mutex::new(None);
 
 pub enum UiCommand {
     LoginWithPassword { email: String, password: String },
@@ -80,8 +81,12 @@ pub enum UiCommand {
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
-    JoinVoiceChannel { guild_id: String, channel_id: String },
-    LeaveVoiceChannel { guild_id: String },
+    JoinVoiceChannel { guild_id: Option<String>, channel_id: String },
+    LeaveVoiceChannel { guild_id: Option<String> },
+    SetVoiceMuteDeaf { guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
+    SetVoiceInputDevice { device: Option<String> },
+    SetVoiceOutputDevice { device: Option<String> },
+    LoadVoiceDevices,
     Logout,
 }
 
@@ -105,6 +110,7 @@ pub enum BackendEvent {
     VoiceConnecting,
     VoiceConnected,
     VoiceDisconnected,
+    VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
 }
 
 pub fn spawn(
@@ -334,17 +340,47 @@ pub fn spawn(
                 }
                 UiCommand::JoinVoiceChannel { guild_id, channel_id } => {
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                        let frame = rustcord_client::gateway::voice_state_update_frame(&guild_id, Some(&channel_id), false, false);
+                        let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), false, false);
                         let _ = tx.send(frame);
                     }
                     let _ = event_tx.send(BackendEvent::VoiceConnecting);
                 }
                 UiCommand::LeaveVoiceChannel { guild_id } => {
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                        let frame = rustcord_client::gateway::voice_state_update_frame(&guild_id, None, false, false);
+                        let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), None, false, false);
                         let _ = tx.send(frame);
                     }
+                    *VOICE_MEDIA_STATE.lock().unwrap() = None;
                     let _ = event_tx.send(BackendEvent::VoiceDisconnected);
+                }
+                UiCommand::SetVoiceMuteDeaf { guild_id, channel_id, self_mute, self_deaf } => {
+                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                        let frame =
+                            rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), self_mute, self_deaf);
+                        let _ = tx.send(frame);
+                    }
+                    if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        media_state.muted.store(self_mute, std::sync::atomic::Ordering::Relaxed);
+                        media_state.deafened.store(self_deaf, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                UiCommand::SetVoiceInputDevice { device } => {
+                    if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        *media_state.input_device.lock().unwrap() = device;
+                    }
+                }
+                UiCommand::SetVoiceOutputDevice { device } => {
+                    if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        *media_state.output_device.lock().unwrap() = device;
+                    }
+                }
+                UiCommand::LoadVoiceDevices => {
+                    let event_tx = event_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let inputs = rustcord_client::voice_audio::list_input_devices();
+                        let outputs = rustcord_client::voice_audio::list_output_devices();
+                        let _ = event_tx.send(BackendEvent::VoiceDevicesLoaded { inputs, outputs });
+                    });
                 }
                 UiCommand::Logout => {
                     session_store::clear_token();
@@ -383,7 +419,11 @@ fn try_spawn_voice_gateway(
     };
     *pending_session = None;
 
-    let voice_gateway = rustcord_client::voice_gateway::VoiceGateway::new(endpoint, guild_id, channel_id, user_id, session_id, token);
+    let media_state = rustcord_client::voice_gateway::VoiceMediaState::default();
+    *VOICE_MEDIA_STATE.lock().unwrap() = Some(media_state.clone());
+
+    let voice_gateway =
+        rustcord_client::voice_gateway::VoiceGateway::new(endpoint, guild_id, channel_id, user_id, session_id, token, media_state);
     let (vg_tx, mut vg_rx) = mpsc::unbounded_channel();
     let (_vg_out_tx, vg_out_rx) = mpsc::unbounded_channel();
     let forward_tx = forward_tx.clone();

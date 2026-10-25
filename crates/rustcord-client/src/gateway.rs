@@ -25,6 +25,7 @@ pub enum GatewayEvent {
     MessageDelete { channel_id: String, id: String },
     VoiceStateUpdate(VoiceState),
     VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
+    InitialVoiceStates(Vec<VoiceState>),
     Unknown { op_name: String, raw: Value },
 }
 
@@ -61,7 +62,7 @@ pub fn presence_frame(status: &str, activities: &[Value]) -> String {
     json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
 }
 
-pub fn voice_state_update_frame(guild_id: &str, channel_id: Option<&str>, self_mute: bool, self_deaf: bool) -> String {
+pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>, self_mute: bool, self_deaf: bool) -> String {
     json!({
         "op": 4,
         "d": {
@@ -283,6 +284,24 @@ impl Gateway {
                     presences.extend(parse_merged_presences(merged));
                 }
                 deduplicate_presences(&mut presences);
+
+                let voice_states: Vec<VoiceState> = data
+                    .get("guilds")
+                    .and_then(Value::as_array)
+                    .map(|guilds| {
+                        guilds
+                            .iter()
+                            .filter_map(|g| g.get("voice_states"))
+                            .filter_map(|v| v.as_array())
+                            .flatten()
+                            .filter_map(|vs| serde_json::from_value::<VoiceState>(vs.clone()).ok())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !voice_states.is_empty() {
+                    let _ = tx.send(GatewayEvent::InitialVoiceStates(voice_states));
+                }
+
                 GatewayEvent::Presences(presences)
             }
             Some("MESSAGE_CREATE") => {

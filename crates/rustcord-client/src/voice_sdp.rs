@@ -15,7 +15,7 @@ pub fn build_offer(ice: &LocalIceParams) -> String {
          a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\n\
          a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\n\
          a=extmap:4 urn:ietf:params:rtp-hdrext:sdes:mid\n\
-         a=rtpmap:111 opus/48000/2\n\
+         a=rtpmap:120 opus/48000/2\n\
          a=extmap:14 urn:ietf:params:rtp-hdrext:toffset\n\
          a=extmap:13 urn:3gpp:video-orientation\n\
          a=extmap:5 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\n\

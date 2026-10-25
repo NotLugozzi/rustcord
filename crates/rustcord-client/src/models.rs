@@ -57,6 +57,28 @@ pub struct VoiceState {
     pub mute: bool,
     #[serde(default)]
     pub deaf: bool,
+    #[serde(default)]
+    pub member: Option<VoiceStateMember>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceStateMember {
+    pub nick: Option<String>,
+    pub user: Option<User>,
+}
+
+impl VoiceState {
+    pub fn display_name(&self) -> String {
+        if let Some(member) = &self.member {
+            if let Some(nick) = &member.nick {
+                return nick.clone();
+            }
+            if let Some(user) = &member.user {
+                return user.global_name.clone().unwrap_or_else(|| user.username.clone());
+            }
+        }
+        self.user_id.clone()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

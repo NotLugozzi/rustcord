@@ -238,6 +238,7 @@ const RAIL_WIDTH: f32 = 72.0;
 const RAIL_ICON_SIZE: [f32; 2] = [48.0, 48.0];
 const RAIL_PADDING_TOP: f32 = 12.0;
 const USER_BAR_HEIGHT: f32 = 44.0;
+const HEADER_HEIGHT: f32 = 48.0;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const SPLITTER_WIDTH: f32 = 6.0;
@@ -869,21 +870,52 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     ui.text("VOICE CHANNELS");
                     token.pop();
                     for (channel_id, name) in &voice_channels {
-                        let is_connected = state.connected_voice_channel.as_ref() == Some(&(guild_id.clone(), channel_id.clone()));
+                        let is_connected = state.connected_voice_channel.as_ref() == Some(&(Some(guild_id.clone()), channel_id.clone()));
                         let label = if is_connected { format!("\u{1F50A} {name} (connected)") } else { format!("\u{1F50A} {name}") };
                         if ui.selectable(label) && !is_connected && !state.voice_connecting {
-                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: guild_id.clone(), channel_id: channel_id.clone() });
-                            state.pending_voice_channel = Some((guild_id.clone(), channel_id.clone()));
+                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone() });
+                            state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
                         }
                         for member in state.members_in_voice_channel(&guild_id, channel_id) {
                             ui.indent();
-                            ui.text_disabled(&member.user_id);
+                            let mute_icon = if member.self_deaf { " \u{1F507}" } else if member.self_mute { " \u{1F3A4}\u{0338}" } else { "" };
+                            ui.text_disabled(format!("{}{}", member.display_name(), mute_icon));
                             ui.unindent();
                         }
                         if is_connected {
                             ui.indent();
+                            let mute_label = if state.self_muted { "Unmute" } else { "Mute" };
+                            if ui.button(mute_label) {
+                                state.self_muted = !state.self_muted;
+                                if state.self_muted {
+                                    state.self_deafened = false;
+                                }
+                                let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+                                    guild_id: Some(guild_id.clone()),
+                                    channel_id: channel_id.clone(),
+                                    self_mute: state.self_muted,
+                                    self_deaf: state.self_deafened,
+                                });
+                            }
+                            ui.same_line();
+                            let deaf_label = if state.self_deafened { "Undeafen" } else { "Deafen" };
+                            if ui.button(deaf_label) {
+                                state.self_deafened = !state.self_deafened;
+                                if state.self_deafened {
+                                    state.self_muted = true;
+                                }
+                                let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+                                    guild_id: Some(guild_id.clone()),
+                                    channel_id: channel_id.clone(),
+                                    self_mute: state.self_muted,
+                                    self_deaf: state.self_deafened,
+                                });
+                            }
+                            ui.same_line();
                             if ui.button("Disconnect") {
-                                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: guild_id.clone() });
+                                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: Some(guild_id.clone()) });
+                                state.self_muted = false;
+                                state.self_deafened = false;
                             }
                             ui.unindent();
                         }
@@ -932,8 +964,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let seen_count = state.last_seen_message_count.get(&channel_key).copied().unwrap_or(0);
             let has_new_messages = messages.len() > seen_count;
 
+            let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
+            let header_height = if dm_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
+            if let Some(dm) = &dm_channel {
+                draw_dm_header(ui, state, cmd_tx, dm);
+            }
+
             ui.child_window("history")
-                .size([0.0, display_h - 60.0 - status_height])
+                .size([0.0, display_h - 60.0 - status_height - header_height])
                 .build(|| {
                     if messages.is_empty() {
                         ui.text_disabled("No messages loaded yet.");
@@ -1341,6 +1379,9 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     ui.set_cursor_pos([bar_start[0] + width - SETTINGS_WIDTH + 4.0, bar_start[1] + (USER_BAR_HEIGHT - ui.frame_height()) / 2.0]);
     if ui.button("Settings") {
         state.show_settings = !state.show_settings;
+        if state.show_settings && state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
+            let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+        }
     }
     ui.set_cursor_pos([bar_start[0], bar_start[1] + USER_BAR_HEIGHT]);
 
@@ -1422,6 +1463,49 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
     if close_clicked || ui.is_key_pressed(imgui::Key::Escape) {
         state.image_lightbox = None;
     }
+}
+
+fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
+    let name = AppState::dm_display_name(dm);
+    let channel_id = dm.id.clone();
+    let is_connected = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+    let is_connecting = state.voice_connecting && state.pending_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+
+    ui.child_window("dm_header").size([0.0, HEADER_HEIGHT]).build(|| {
+        ui.set_cursor_pos([12.0, (HEADER_HEIGHT - 20.0) / 2.0]);
+        ui.text(&name);
+        ui.same_line();
+        let right_edge = ui.window_size()[0] - 16.0;
+        let icon_width = 28.0;
+        let icon_count = 2.0;
+        ui.set_cursor_pos([right_edge - icon_width * icon_count, (HEADER_HEIGHT - 20.0) / 2.0]);
+
+        if is_connected {
+            let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.accent);
+            if ui.button("\u{1F4DE}") {
+                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: None });
+            }
+            token.pop();
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Hang up");
+            }
+        } else if is_connecting {
+            ui.text_disabled("\u{1F4DE}");
+        } else if ui.button("\u{1F4DE}") {
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone() });
+            state.pending_voice_channel = Some((None, channel_id.clone()));
+        }
+        if !is_connected && !is_connecting && ui.is_item_hovered() {
+            ui.tooltip_text("Start Voice Call");
+        }
+
+        ui.same_line();
+        ui.text_disabled("\u{1F4F7}");
+        if ui.is_item_hovered() {
+            ui.tooltip_text("Video calls aren't supported yet");
+        }
+    });
+    ui.separator();
 }
 
 fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
@@ -1799,6 +1883,53 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                     let _ = cmd_tx.send(UiCommand::SetRpcEnabled { conn_id: app.conn_id, enabled });
                 }
                 ui.spacing();
+            }
+
+            ui.spacing();
+            ui.separator();
+            ui.text("Voice & Video");
+            ui.separator();
+            if state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
+                if ui.button("Refresh device list") {
+                    let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+                }
+            } else {
+                ui.text_colored(muted, "Input Device");
+                ui.set_next_item_width(-1.0);
+                let current_input = state.selected_input_device.clone().unwrap_or_else(|| "Default".to_string());
+                if let Some(_token) = ui.begin_combo("##input_device", &current_input) {
+                    if ui.selectable_config("Default").selected(state.selected_input_device.is_none()).build() {
+                        state.selected_input_device = None;
+                        let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: None });
+                    }
+                    let devices = state.voice_input_devices.clone();
+                    for device in &devices {
+                        let is_selected = state.selected_input_device.as_deref() == Some(device.as_str());
+                        if ui.selectable_config(device).selected(is_selected).build() {
+                            state.selected_input_device = Some(device.clone());
+                            let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: Some(device.clone()) });
+                        }
+                    }
+                }
+
+                ui.spacing();
+                ui.text_colored(muted, "Output Device");
+                ui.set_next_item_width(-1.0);
+                let current_output = state.selected_output_device.clone().unwrap_or_else(|| "Default".to_string());
+                if let Some(_token) = ui.begin_combo("##output_device", &current_output) {
+                    if ui.selectable_config("Default").selected(state.selected_output_device.is_none()).build() {
+                        state.selected_output_device = None;
+                        let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: None });
+                    }
+                    let devices = state.voice_output_devices.clone();
+                    for device in &devices {
+                        let is_selected = state.selected_output_device.as_deref() == Some(device.as_str());
+                        if ui.selectable_config(device).selected(is_selected).build() {
+                            state.selected_output_device = Some(device.clone());
+                            let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: Some(device.clone()) });
+                        }
+                    }
+                }
             }
 
             ui.spacing();
