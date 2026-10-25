@@ -22,7 +22,8 @@ impl VoiceRtc {
         let mut rtc = Rtc::builder().build(Instant::now());
 
         let local_ice = {
-            let api = rtc.direct_api();
+            let mut api = rtc.direct_api();
+            api.set_ice_controlling(true);
             let local_fingerprint = api.local_dtls_fingerprint().clone();
             let local_creds = api.local_ice_credentials();
             LocalIceParams {
@@ -49,7 +50,7 @@ impl VoiceRtc {
                 .map(|h| u8::from_str_radix(h, 16).unwrap_or(0))
                 .collect();
             api.set_remote_fingerprint(Fingerprint { hash_func: "sha-256".to_string(), bytes: fingerprint_bytes });
-            api.start_dtls(false).map_err(|e| ClientError::GatewayClosed(format!("voice rtc: start_dtls failed: {e}")))?;
+            api.start_dtls(true).map_err(|e| ClientError::GatewayClosed(format!("voice rtc: start_dtls failed: {e}")))?;
         }
 
         let candidate = remote
@@ -65,10 +66,9 @@ impl VoiceRtc {
 
         let local_ip = local_outbound_ip(addr)?;
         let local_port = self.socket.local_addr().map_err(|e| ClientError::GatewayClosed(format!("voice rtc: local_addr failed: {e}")))?.port();
-        let local_addr = SocketAddr::new(local_ip, local_port);
-        tracing::info!("voice rtc: remote candidate {addr}, local candidate {local_addr}");
+        let base_addr = SocketAddr::new(local_ip, local_port);
         let local_candidate =
-            Candidate::host(local_addr, "udp").map_err(|e| ClientError::GatewayClosed(format!("voice rtc: bad local candidate: {e}")))?;
+            Candidate::host(base_addr, "udp").map_err(|e| ClientError::GatewayClosed(format!("voice rtc: bad local candidate: {e}")))?;
         self.rtc.add_local_candidate(local_candidate);
 
         Ok(())
@@ -100,7 +100,6 @@ impl VoiceRtc {
                         }
                         recv = self.socket.recv_from(buf) => {
                             let (len, source) = recv.map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp recv failed: {e}")))?;
-                            tracing::info!("voice rtc: udp recv {len} bytes from {source}");
                             let destination = self.socket.local_addr().map_err(|e| ClientError::GatewayClosed(format!("voice rtc: local_addr failed: {e}")))?;
                             if let Ok(receive) = Receive::new(Protocol::Udp, source, destination, &buf[..len]) {
                                 self.rtc
@@ -113,7 +112,12 @@ impl VoiceRtc {
                     }
                 }
                 Output::Transmit(transmit) => {
-                    tracing::info!("voice rtc: udp send {} bytes to {}", transmit.contents.len(), transmit.destination);
+                    tracing::info!(
+                        "voice rtc: udp send {} bytes to {}: {:02x?}",
+                        transmit.contents.len(),
+                        transmit.destination,
+                        &transmit.contents[..]
+                    );
                     if let Err(e) = self.socket.send_to(&transmit.contents, transmit.destination).await {
                         tracing::warn!("voice rtc: udp send failed: {e}");
                     }
@@ -126,7 +130,9 @@ impl VoiceRtc {
                             return Ok(Some(RtcEvent::Disconnected));
                         }
                     }
-                    _ => {}
+                    other => {
+                        tracing::info!("voice rtc: other event: {other:?}");
+                    }
                 },
             }
         }
