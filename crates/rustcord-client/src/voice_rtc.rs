@@ -28,6 +28,7 @@ pub struct VoiceRtc {
     rtp_timestamp: u32,
     rtp_packets_sent: u64,
     rtp_packets_received: u64,
+    media_data_events: u64,
 }
 
 impl VoiceRtc {
@@ -63,7 +64,7 @@ impl VoiceRtc {
             .await
             .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp bind failed: {e}")))?;
 
-        Ok((Self { rtc, socket, audio_mid, audio_ssrc, remote_audio_mids: Vec::new(), rtp_timestamp: 0, rtp_packets_sent: 0, rtp_packets_received: 0 }, local_ice))
+        Ok((Self { rtc, socket, audio_mid, audio_ssrc, remote_audio_mids: Vec::new(), rtp_timestamp: 0, rtp_packets_sent: 0, rtp_packets_received: 0, media_data_events: 0 }, local_ice))
     }
 
     pub fn audio_ssrc(&self) -> u32 {
@@ -195,9 +196,19 @@ impl VoiceRtc {
                         }
                     }
                     Event::MediaData(data) => {
+                        self.media_data_events += 1;
+                        if self.media_data_events == 1 || self.media_data_events % 50 == 0 {
+                            tracing::info!("voice rtc: received {} MediaData events so far, latest mid {:?}, pt {:?}, {} bytes", self.media_data_events, data.mid, data.pt, data.data.len());
+                        }
                         if let Some((_, ssrc)) = self.remote_audio_mids.iter().find(|(mid, _)| *mid == data.mid) {
                             return Ok(Some(RtcEvent::AudioData { ssrc: *ssrc, payload: data.data.to_vec() }));
                         }
+                        tracing::warn!(
+                            "voice rtc: MediaData for unregistered mid {:?}, {} bytes; known mids {:?}",
+                            data.mid,
+                            data.data.len(),
+                            self.remote_audio_mids,
+                        );
                     }
                     _ => {}
                 },
