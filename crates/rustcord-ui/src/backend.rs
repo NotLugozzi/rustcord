@@ -392,7 +392,8 @@ fn try_spawn_voice_gateway(
             use rustcord_client::voice_gateway::VoiceGatewayEvent;
             match ev {
                 VoiceGatewayEvent::Connecting => {}
-                VoiceGatewayEvent::Ready { .. } => {
+                VoiceGatewayEvent::Ready => {}
+                VoiceGatewayEvent::MediaConnected => {
                     let _ = forward_tx.send(BackendEvent::VoiceConnected);
                 }
                 VoiceGatewayEvent::Disconnected { .. } => {

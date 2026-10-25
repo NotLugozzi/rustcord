@@ -66,6 +66,7 @@ impl VoiceRtc {
         let local_ip = local_outbound_ip(addr)?;
         let local_port = self.socket.local_addr().map_err(|e| ClientError::GatewayClosed(format!("voice rtc: local_addr failed: {e}")))?.port();
         let local_addr = SocketAddr::new(local_ip, local_port);
+        tracing::info!("voice rtc: remote candidate {addr}, local candidate {local_addr}");
         let local_candidate =
             Candidate::host(local_addr, "udp").map_err(|e| ClientError::GatewayClosed(format!("voice rtc: bad local candidate: {e}")))?;
         self.rtc.add_local_candidate(local_candidate);
@@ -99,22 +100,31 @@ impl VoiceRtc {
                         }
                         recv = self.socket.recv_from(buf) => {
                             let (len, source) = recv.map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp recv failed: {e}")))?;
+                            tracing::info!("voice rtc: udp recv {len} bytes from {source}");
                             let destination = self.socket.local_addr().map_err(|e| ClientError::GatewayClosed(format!("voice rtc: local_addr failed: {e}")))?;
                             if let Ok(receive) = Receive::new(Protocol::Udp, source, destination, &buf[..len]) {
                                 self.rtc
                                     .handle_input(Input::Receive(Instant::now(), receive))
                                     .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: handle_input receive failed: {e}")))?;
+                            } else {
+                                tracing::warn!("voice rtc: failed to parse received datagram");
                             }
                         }
                     }
                 }
                 Output::Transmit(transmit) => {
-                    let _ = self.socket.send_to(&transmit.contents, transmit.destination).await;
+                    tracing::info!("voice rtc: udp send {} bytes to {}", transmit.contents.len(), transmit.destination);
+                    if let Err(e) = self.socket.send_to(&transmit.contents, transmit.destination).await {
+                        tracing::warn!("voice rtc: udp send failed: {e}");
+                    }
                 }
                 Output::Event(event) => match event {
                     Event::Connected => return Ok(Some(RtcEvent::Connected)),
-                    Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                        return Ok(Some(RtcEvent::Disconnected));
+                    Event::IceConnectionStateChange(state) => {
+                        tracing::info!("voice rtc: ice connection state changed: {state:?}");
+                        if state == IceConnectionState::Disconnected {
+                            return Ok(Some(RtcEvent::Disconnected));
+                        }
                     }
                     _ => {}
                 },

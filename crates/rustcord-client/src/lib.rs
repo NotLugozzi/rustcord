@@ -6,6 +6,7 @@ pub mod models;
 pub mod rest;
 pub mod gateway;
 pub mod voice_gateway;
-pub mod voice_udp;
+pub mod voice_rtc;
+pub mod voice_sdp;
 
 pub use error::ClientError;

@@ -1,5 +1,7 @@
 use crate::dave::{self, DaveSession};
 use crate::error::ClientError;
+use crate::voice_rtc::{RtcEvent, VoiceRtc};
+use crate::voice_sdp;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -12,8 +14,8 @@ const VOICE_VERSION: &str = "v=8";
 #[derive(Debug, Clone)]
 pub enum VoiceGatewayEvent {
     Connecting,
-    Ready { ssrc: u32, ip: String, port: u16, modes: Vec<String> },
-    SessionDescription { mode: String, secret_key: [u8; 32] },
+    Ready,
+    MediaConnected,
     Speaking { ssrc: u32, user_id: Option<String> },
     DaveReady,
     Disconnected { reason: String },
@@ -23,6 +25,8 @@ pub enum VoiceGatewayEvent {
 struct Payload {
     op: u8,
     d: Option<Value>,
+    #[serde(default)]
+    seq: Option<u64>,
 }
 
 pub struct VoiceGateway {
@@ -78,6 +82,9 @@ impl VoiceGateway {
         tracing::info!("voice: identify sent");
 
         let mut dave_session = DaveSession::new(&self.user_id)?;
+        let mut rtc: Option<VoiceRtc> = None;
+        let mut rtc_buf = vec![0u8; 2000];
+        let mut seq_ack: u64 = 0;
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel::<()>();
         let heartbeat_task = tokio::spawn(async move {
@@ -117,20 +124,50 @@ impl VoiceGateway {
                                 Ok(p) => p,
                                 Err(e) => break Err(e.into()),
                             };
+                            if let Some(seq) = payload.seq {
+                                seq_ack = seq;
+                            }
                             if payload.op == 2 {
-                                let ready = match parse_ready(&payload) {
-                                    Some(r) => r,
-                                    None => break Err(ClientError::GatewayClosed("voice: malformed ready payload".into())),
-                                };
-                                match negotiate_udp(&ready).await {
-                                    Ok((udp_socket, select_protocol)) => {
-                                        socket = Some(udp_socket);
-                                        if let Err(e) = write.send(WsMessage::Text(select_protocol)).await {
-                                            break Err(e.into());
-                                        }
-                                    }
-                                    Err(e) => break Err(e),
+                                tracing::info!("voice: sending client info (op 16)");
+                                if let Err(e) = write.send(WsMessage::Text(json!({ "op": 16, "d": {} }).to_string())).await {
+                                    break Err(e.into());
                                 }
+                            } else if payload.op == 16 {
+                                let (new_rtc, params) = match VoiceRtc::new().await {
+                                    Ok(v) => v,
+                                    Err(e) => break Err(e),
+                                };
+                                let offer = voice_sdp::build_offer(&params);
+                                rtc = Some(new_rtc);
+                                let select_protocol = select_protocol_frame(&offer);
+                                tracing::info!("voice: sending select protocol: {select_protocol}");
+                                if let Err(e) = write.send(WsMessage::Text(select_protocol)).await {
+                                    break Err(e.into());
+                                }
+                                let _ = tx.send(VoiceGatewayEvent::Ready);
+                            } else if payload.op == 4 {
+                                let Some(active_rtc) = rtc.as_mut() else {
+                                    break Err(ClientError::GatewayClosed("voice: session description with no pending rtc".into()));
+                                };
+                                let remote_sdp = payload
+                                    .d
+                                    .as_ref()
+                                    .and_then(|d| d.get("sdp"))
+                                    .and_then(Value::as_str)
+                                    .and_then(voice_sdp::parse_remote_sdp);
+                                let Some(remote) = remote_sdp else {
+                                    break Err(ClientError::GatewayClosed("voice: session description missing parsable sdp".into()));
+                                };
+                                tracing::info!(
+                                    "voice: parsed remote sdp: ufrag={} candidates={}",
+                                    remote.ice_ufrag,
+                                    remote.candidates.len()
+                                );
+                                if let Err(e) = active_rtc.set_remote(&remote) {
+                                    tracing::warn!("voice: set_remote failed: {e}");
+                                    break Err(e);
+                                }
+                                tracing::info!("voice: rtc remote set, awaiting ice/dtls");
                             }
                             if let Err(e) = handle_payload(payload, &tx) {
                                 break Err(e);
@@ -161,9 +198,27 @@ impl VoiceGateway {
                     }
                 }
                 _ = heartbeat_rx.recv() => {
-                    let nonce = json!({ "op": 3, "d": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 });
-                    if let Err(e) = write.send(WsMessage::Text(nonce.to_string())).await {
+                    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                    let heartbeat = json!({ "op": 3, "d": { "t": t, "seq_ack": seq_ack } });
+                    if let Err(e) = write.send(WsMessage::Text(heartbeat.to_string())).await {
                         break Err(e.into());
+                    }
+                }
+                rtc_event = drive_rtc(rtc.as_mut(), &mut rtc_buf) => {
+                    match rtc_event {
+                        Ok(Some(RtcEvent::Connected)) => {
+                            tracing::info!("voice: rtc connected (ice+dtls established)");
+                            let _ = tx.send(VoiceGatewayEvent::MediaConnected);
+                        }
+                        Ok(Some(RtcEvent::Disconnected)) => {
+                            tracing::info!("voice: rtc disconnected");
+                            break Err(ClientError::GatewayClosed("voice media connection disconnected".into()));
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("voice: rtc drive failed: {e}");
+                            break Err(e);
+                        }
                     }
                 }
             }
@@ -175,28 +230,16 @@ impl VoiceGateway {
     }
 }
 
+async fn drive_rtc(rtc: Option<&mut VoiceRtc>, buf: &mut [u8]) -> Result<Option<RtcEvent>, ClientError> {
+    match rtc {
+        Some(rtc) => rtc.drive(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn handle_payload(payload: Payload, tx: &mpsc::UnboundedSender<VoiceGatewayEvent>) -> Result<(), ClientError> {
     let Some(data) = payload.d else { return Ok(()) };
     let event = match payload.op {
-        2 => {
-            let ssrc = data["ssrc"].as_u64().unwrap_or_default() as u32;
-            let ip = data["ip"].as_str().unwrap_or_default().to_string();
-            let port = data["port"].as_u64().unwrap_or_default() as u16;
-            let modes = data["modes"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            VoiceGatewayEvent::Ready { ssrc, ip, port, modes }
-        }
-        4 => {
-            let mode = data["mode"].as_str().unwrap_or_default().to_string();
-            let key_values = data["secret_key"].as_array().cloned().unwrap_or_default();
-            let mut secret_key = [0u8; 32];
-            for (i, v) in key_values.iter().take(32).enumerate() {
-                secret_key[i] = v.as_u64().unwrap_or_default() as u8;
-            }
-            VoiceGatewayEvent::SessionDescription { mode, secret_key }
-        }
         5 => {
             let ssrc = data["ssrc"].as_u64().unwrap_or_default() as u32;
             let user_id = data["user_id"].as_str().map(str::to_string);
@@ -238,16 +281,36 @@ fn handle_dave_frame(
     }
 }
 
-pub fn select_protocol_frame(address: &str, port: u16, mode: &str) -> String {
+fn random_uuid_v4() -> String {
+    let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in bytes.chunks_mut(8).enumerate() {
+        let mixed = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(i as u64 * 0x2545F4914F6CDD1D);
+        chunk.copy_from_slice(&mixed.to_le_bytes()[..chunk.len()]);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12],
+        bytes[13], bytes[14], bytes[15]
+    )
+}
+
+pub fn select_protocol_frame(offer: &str) -> String {
     json!({
         "op": 1,
         "d": {
-            "protocol": "udp",
-            "data": {
-                "address": address,
-                "port": port,
-                "mode": mode,
-            }
+            "protocol": "webrtc",
+            "data": offer,
+            "sdp": offer,
+            "codecs": [
+                { "name": "opus", "type": "audio", "priority": 1000, "payload_type": 111, "rtx_payload_type": null },
+                { "name": "H264", "type": "video", "priority": 1000, "payload_type": 102, "rtx_payload_type": 103 },
+                { "name": "VP8", "type": "video", "priority": 2000, "payload_type": 96, "rtx_payload_type": 97 },
+                { "name": "VP9", "type": "video", "priority": 3000, "payload_type": 98, "rtx_payload_type": 99 }
+            ],
+            "rtc_connection_id": random_uuid_v4(),
         }
     })
     .to_string()
