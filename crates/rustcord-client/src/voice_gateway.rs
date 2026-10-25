@@ -116,6 +116,10 @@ impl VoiceGateway {
         let mut seq_ack: u64 = 0;
         let mut mic_frame_count: u64 = 0;
         let mut received_audio_frame_count: u64 = 0;
+        let mut decrypt_success_count: u64 = 0;
+        let mut decrypt_failure_count: u64 = 0;
+        let mut decode_success_count: u64 = 0;
+        let mut decode_failure_count: u64 = 0;
         let mut codec = AudioCodec::new()?;
         let mut mic: Option<MicCapture> = None;
         let mut speaker: Option<SpeakerPlayback> = None;
@@ -458,11 +462,15 @@ impl VoiceGateway {
                                     continue;
                                 };
                                 match frame_crypto.decrypt(user_id, &payload) {
-                                    Some(plain) => plain,
+                                    Some(plain) => {
+                                        decrypt_success_count += 1;
+                                        plain
+                                    }
                                     None => {
-                                        if received_audio_frame_count == 1 || received_audio_frame_count % 50 == 0 {
+                                        decrypt_failure_count += 1;
+                                        if decrypt_failure_count == 1 || decrypt_failure_count % 20 == 0 {
                                             let tail = &payload[payload.len().saturating_sub(16)..];
-                                            tracing::warn!("voice: DAVE decryption failed for SSRC {ssrc} (user {user_id}); {} byte frame, tail {:02x?}", payload.len(), tail);
+                                            tracing::warn!("voice: DAVE decryption failed ({decrypt_failure_count} total, {decrypt_success_count} succeeded) for SSRC {ssrc} (user {user_id}); {} byte frame, tail {:02x?}", payload.len(), tail);
                                         }
                                         continue;
                                     }
@@ -472,13 +480,23 @@ impl VoiceGateway {
                             };
                             match codec.decode(&decoded_payload) {
                                 Ok(pcm) => {
+                                    decode_success_count += 1;
+                                    if decode_success_count == 1 || decode_success_count % 50 == 0 {
+                                        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+                                        tracing::info!("voice: decoded {decode_success_count} audio frames so far, latest peak sample magnitude {peak}");
+                                    }
                                     if let Some(speaker) = speaker.as_ref() {
                                         speaker.push_frame(pcm);
                                     } else {
                                         tracing::warn!("voice: decoded audio but no speaker available");
                                     }
                                 }
-                                Err(e) => tracing::warn!("voice: opus decode failed: {e}"),
+                                Err(e) => {
+                                    decode_failure_count += 1;
+                                    if decode_failure_count == 1 || decode_failure_count % 20 == 0 {
+                                        tracing::warn!("voice: opus decode failed ({decode_failure_count} total): {e}");
+                                    }
+                                }
                             }
                         }
                         Ok(None) => {}

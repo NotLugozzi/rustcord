@@ -171,9 +171,7 @@ impl FrameCrypto {
         let marker_offset = frame.len() - 2;
         let supplemental_size = *frame.get(marker_offset.checked_sub(1)?)? as usize;
         if supplemental_size < TAG_LEN + 1 + 2 || supplemental_size > marker_offset { return None; }
-        let supplemental_start = marker_offset.checked_sub(supplemental_size.checked_sub(2)?)?;
-        if supplemental_start < TAG_LEN { return None; }
-        let tag_start = supplemental_start;
+        let tag_start = marker_offset.checked_sub(supplemental_size.checked_sub(2)?)?;
         let mut cursor = tag_start.checked_add(TAG_LEN)?;
         let (nonce_value, nonce_len) = read_uleb128(&frame[cursor..marker_offset - 1])?;
         cursor += nonce_len;
@@ -278,4 +276,90 @@ fn read_uleb128(bytes: &[u8]) -> Option<(u32, usize)> {
         if byte & 0x80 == 0 { return Some((value, index + 1)); }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nist_gcm_vector_matches() {
+        // AES-128-GCM vector generated with Python's `cryptography` (OpenSSL backend),
+        // the same AEAD primitive Discord's BoringSSL cryptor uses.
+        let key: Vec<u8> = hex_vec("000102030405060708090a0b0c0d0e0f");
+        let key: [u8; 16] = key.try_into().unwrap();
+        let iv: Vec<u8> = hex_vec("202122232425262728292a2b");
+        let iv: [u8; 12] = iv.try_into().unwrap();
+        let plaintext = hex_vec("30313233343536373839");
+        let expected_ciphertext = hex_vec("f0c42097b2c54f3e8371");
+        let expected_tag = hex_vec("21a2c1a146e4aedf6e91cb17df0f533f");
+
+        let mut buffer = plaintext.clone();
+        let tag = encrypt_gcm(&key, &iv, &mut buffer).expect("encrypt_gcm should succeed");
+        assert_eq!(buffer, expected_ciphertext, "ciphertext mismatch vs NIST vector");
+        assert_eq!(&tag[..], &expected_tag[..], "tag mismatch vs NIST vector");
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip_single_sender() {
+        let base_secret = [0x42u8; 16];
+        let sender_id = 1234u64;
+        let mut tx = FrameCrypto::new(sender_id);
+        tx.set_sender_base_secret(sender_id, base_secret);
+
+        let mut rx = FrameCrypto::new(9999);
+        rx.set_sender_base_secret(sender_id, base_secret);
+
+        for i in 0..5 {
+            let opus = vec![0xAA; 20 + i];
+            let encrypted = tx.encrypt(&opus).expect("encrypt should succeed");
+            let decrypted = rx.decrypt(sender_id, &encrypted);
+            assert_eq!(decrypted, Some(opus), "round-trip failed at frame {i}");
+        }
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip_tiny_frame() {
+        // a ciphertext shorter than TAG_LEN bytes must still decrypt; this
+        // previously tripped a bogus `supplemental_start < TAG_LEN` guard
+        let base_secret = [0x11u8; 16];
+        let sender_id = 5u64;
+        let mut tx = FrameCrypto::new(sender_id);
+        tx.set_sender_base_secret(sender_id, base_secret);
+        let mut rx = FrameCrypto::new(6);
+        rx.set_sender_base_secret(sender_id, base_secret);
+
+        let opus = vec![0x01, 0x02];
+        let encrypted = tx.encrypt(&opus).expect("encrypt should succeed");
+        let decrypted = rx.decrypt(sender_id, &encrypted);
+        assert_eq!(decrypted, Some(opus));
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip_across_generations() {
+        let base_secret = [0x7u8; 16];
+        let sender_id = 1u64;
+        let mut tx = FrameCrypto::new(sender_id);
+        tx.set_sender_base_secret(sender_id, base_secret);
+        let mut rx = FrameCrypto::new(2);
+        rx.set_sender_base_secret(sender_id, base_secret);
+
+        // force the nonce counter past a generation boundary (2^24 frames is
+        // too slow for a test; fake it by manipulating next_nonce directly)
+        tx.next_nonce = (1u64 << 24) - 2;
+        for i in 0..4 {
+            let opus = vec![0xBB, i as u8];
+            let encrypted = tx.encrypt(&opus).expect("encrypt should succeed");
+            let decrypted = rx.decrypt(sender_id, &encrypted);
+            assert_eq!(decrypted, Some(opus), "round-trip failed crossing generation boundary at {i}");
+        }
+    }
+
+    fn hex_vec(s: &str) -> Vec<u8> {
+        let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 }
