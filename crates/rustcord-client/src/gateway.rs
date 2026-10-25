@@ -285,19 +285,25 @@ impl Gateway {
                 }
                 deduplicate_presences(&mut presences);
 
-                let voice_states: Vec<VoiceState> = data
-                    .get("guilds")
-                    .and_then(Value::as_array)
-                    .map(|guilds| {
-                        guilds
-                            .iter()
-                            .filter_map(|g| g.get("voice_states"))
-                            .filter_map(|v| v.as_array())
-                            .flatten()
-                            .filter_map(|vs| serde_json::from_value::<VoiceState>(vs.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let mut voice_states = Vec::new();
+                if let Some(guilds) = data.get("guilds").and_then(Value::as_array) {
+                    for guild in guilds {
+                        let guild_id = guild.get("id").and_then(Value::as_str);
+                        let Some(states) = guild.get("voice_states").and_then(Value::as_array) else { continue };
+                        for state in states {
+                            let mut state = state.clone();
+                            if state.get("guild_id").and_then(Value::as_str).is_none() {
+                                if let (Some(guild_id), Some(object)) = (guild_id, state.as_object_mut()) {
+                                    object.insert("guild_id".to_string(), Value::String(guild_id.to_string()));
+                                }
+                            }
+                            match serde_json::from_value::<VoiceState>(state) {
+                                Ok(state) => voice_states.push(state),
+                                Err(error) => tracing::debug!("skipping malformed initial voice state: {error}"),
+                            }
+                        }
+                    }
+                }
                 if !voice_states.is_empty() {
                     let _ = tx.send(GatewayEvent::InitialVoiceStates(voice_states));
                 }
