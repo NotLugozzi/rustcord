@@ -87,6 +87,8 @@ impl SpeakerPlayback {
         let (tx, mut rx) = mpsc::unbounded_channel::<Vec<i16>>();
         let deafened_cb = deafened.clone();
         let mut pending: std::collections::VecDeque<i16> = std::collections::VecDeque::new();
+        const PREBUFFER_SAMPLES: usize = FRAME_SAMPLES * CHANNELS as usize * 2;
+        let mut primed = false;
 
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: output stream error: {e}");
         let stream = device
@@ -97,11 +99,18 @@ impl SpeakerPlayback {
                         out.fill(0);
                         return;
                     }
-                    while pending.len() < out.len() {
-                        match rx.try_recv() {
-                            Ok(frame) => pending.extend(frame),
-                            Err(_) => break,
+                    while let Ok(frame) = rx.try_recv() {
+                        pending.extend(frame);
+                    }
+                    if !primed {
+                        if pending.len() < PREBUFFER_SAMPLES {
+                            out.fill(0);
+                            return;
                         }
+                        primed = true;
+                    }
+                    if pending.is_empty() {
+                        primed = false;
                     }
                     for sample in out.iter_mut() {
                         *sample = pending.pop_front().unwrap_or(0);
