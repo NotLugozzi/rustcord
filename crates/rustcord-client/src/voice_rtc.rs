@@ -21,7 +21,7 @@ pub enum RtcEvent {
 
 pub struct VoiceRtc {
     rtc: Rtc,
-    socket: UdpSocket,
+    socket: std::sync::Arc<UdpSocket>,
     audio_mid: Mid,
     audio_ssrc: Ssrc,
     remote_audio_mids: Vec<(Mid, u32)>,
@@ -60,9 +60,11 @@ impl VoiceRtc {
             ssrc
         };
 
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp bind failed: {e}")))?;
+        let socket = std::sync::Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp bind failed: {e}")))?,
+        );
 
         Ok((Self { rtc, socket, audio_mid, audio_ssrc, remote_audio_mids: Vec::new(), rtp_timestamp: 0, rtp_packets_sent: 0, rtp_packets_received: 0, media_data_events: 0 }, local_ice))
     }
@@ -128,12 +130,19 @@ impl VoiceRtc {
         Ok(())
     }
 
-    pub async fn drive(&mut self, buf: &mut [u8]) -> Result<Option<RtcEvent>, ClientError> {
+    /// Drains str0m's pending output without ever awaiting internally, so the
+    /// caller's own select! loop stays free to service other branches (mic
+    /// capture, websocket, etc.) between calls instead of being blocked for
+    /// however long str0m's next timer happens to be (RTCP housekeeping is
+    /// on the order of hundreds of ms, which used to starve mic frames).
+    /// Returns the deadline for the next time this should be called again
+    /// (from an `Output::Timeout`) once there is nothing left to do.
+    fn poll_output(&mut self) -> Result<PollOutcome, ClientError> {
         loop {
-            let output = match self.rtc.poll_output() {
-                Ok(o) => o,
-                Err(e) => return Err(ClientError::GatewayClosed(format!("voice rtc: poll_output failed: {e}"))),
-            };
+            let output = self
+                .rtc
+                .poll_output()
+                .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: poll_output failed: {e}")))?;
 
             match output {
                 Output::Timeout(deadline) => {
@@ -144,33 +153,7 @@ impl VoiceRtc {
                             .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: handle_input timeout failed: {e}")))?;
                         continue;
                     }
-
-                    let sleep_duration = deadline - now;
-                    tokio::select! {
-                        _ = tokio::time::sleep(sleep_duration) => {
-                            self.rtc
-                                .handle_input(Input::Timeout(Instant::now()))
-                                .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: handle_input timeout failed: {e}")))?;
-                        }
-                        recv = self.socket.recv_from(buf) => {
-                            let (len, source) = recv.map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp recv failed: {e}")))?;
-                            let destination = self.socket.local_addr().map_err(|e| ClientError::GatewayClosed(format!("voice rtc: local_addr failed: {e}")))?;
-                            if let Ok(receive) = Receive::new(Protocol::Udp, source, destination, &buf[..len]) {
-                                let first_byte = buf.first().copied().unwrap_or(0);
-                                if first_byte >= 128 {
-                                    self.rtp_packets_received += 1;
-                                    if self.rtp_packets_received % 50 == 1 {
-                                        tracing::info!("voice rtc: received {} rtp/rtcp-like packets so far (latest {len} bytes, first byte {:#04x})", self.rtp_packets_received, first_byte);
-                                    }
-                                }
-                                self.rtc
-                                    .handle_input(Input::Receive(Instant::now(), receive))
-                                    .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: handle_input receive failed: {e}")))?;
-                            } else {
-                                tracing::warn!("voice rtc: failed to parse received datagram, {len} bytes, first byte {:#04x}", buf.first().copied().unwrap_or(0));
-                            }
-                        }
-                    }
+                    return Ok(PollOutcome::WaitUntil(deadline));
                 }
                 Output::Transmit(transmit) => {
                     let first_byte = transmit.contents.first().copied().unwrap_or(0);
@@ -180,19 +163,17 @@ impl VoiceRtc {
                             tracing::info!("voice rtc: transmitted {} rtp/rtcp-like packets so far (latest {} bytes, first byte {:#04x})", self.rtp_packets_sent, transmit.contents.len(), first_byte);
                         }
                     }
-                    if let Err(e) = self.socket.send_to(&transmit.contents, transmit.destination).await {
-                        tracing::warn!("voice rtc: udp send failed: {e}");
-                    }
+                    return Ok(PollOutcome::Transmit(transmit.destination, transmit.contents.to_vec()));
                 }
                 Output::Event(event) => match event {
                     Event::Connected => {
                         tracing::info!("voice rtc: connected (ice+dtls established)");
-                        return Ok(Some(RtcEvent::Connected));
+                        return Ok(PollOutcome::Event(RtcEvent::Connected));
                     }
                     Event::IceConnectionStateChange(state) => {
                         if state == IceConnectionState::Disconnected {
                             tracing::info!("voice rtc: ice disconnected");
-                            return Ok(Some(RtcEvent::Disconnected));
+                            return Ok(PollOutcome::Event(RtcEvent::Disconnected));
                         }
                     }
                     Event::MediaData(data) => {
@@ -201,7 +182,7 @@ impl VoiceRtc {
                             tracing::info!("voice rtc: received {} MediaData events so far, latest mid {:?}, pt {:?}, {} bytes", self.media_data_events, data.mid, data.pt, data.data.len());
                         }
                         if let Some((_, ssrc)) = self.remote_audio_mids.iter().find(|(mid, _)| *mid == data.mid) {
-                            return Ok(Some(RtcEvent::AudioData { ssrc: *ssrc, payload: data.data.to_vec() }));
+                            return Ok(PollOutcome::Event(RtcEvent::AudioData { ssrc: *ssrc, payload: data.data.to_vec() }));
                         }
                         tracing::warn!(
                             "voice rtc: MediaData for unregistered mid {:?}, {} bytes; known mids {:?}",
@@ -215,6 +196,70 @@ impl VoiceRtc {
             }
         }
     }
+
+    /// Drives str0m's output queue and sends any pending transmits, looping
+    /// until either an RtcEvent is produced or str0m has nothing left to do
+    /// right now (returns the deadline for its next timer). Never awaits on
+    /// the socket or a sleep itself — the caller's select! owns that wait.
+    pub async fn drive(&mut self) -> Result<DriveResult, ClientError> {
+        loop {
+            match self.poll_output()? {
+                PollOutcome::WaitUntil(deadline) => return Ok(DriveResult::WaitUntil(deadline)),
+                PollOutcome::Transmit(destination, contents) => {
+                    if let Err(e) = self.socket.send_to(&contents, destination).await {
+                        tracing::warn!("voice rtc: udp send failed: {e}");
+                    }
+                }
+                PollOutcome::Event(event) => return Ok(DriveResult::Event(event)),
+            }
+        }
+    }
+
+    pub fn handle_timeout(&mut self) -> Result<(), ClientError> {
+        self.rtc
+            .handle_input(Input::Timeout(Instant::now()))
+            .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: handle_input timeout failed: {e}")))
+    }
+
+    /// A clone of the shared socket handle, so the caller can await a
+    /// datagram in its own select! branch without borrowing all of
+    /// `VoiceRtc` (which would conflict with the `drive()` branch's &mut
+    /// borrow in the same select!).
+    pub fn socket_handle(&self) -> std::sync::Arc<UdpSocket> {
+        self.socket.clone()
+    }
+
+    pub fn handle_datagram(&mut self, source: SocketAddr, data: &[u8]) -> Result<(), ClientError> {
+        let destination = self
+            .socket
+            .local_addr()
+            .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: local_addr failed: {e}")))?;
+        let Ok(receive) = Receive::new(Protocol::Udp, source, destination, data) else {
+            tracing::warn!("voice rtc: failed to parse received datagram, {} bytes, first byte {:#04x}", data.len(), data.first().copied().unwrap_or(0));
+            return Ok(());
+        };
+        let first_byte = data.first().copied().unwrap_or(0);
+        if first_byte >= 128 {
+            self.rtp_packets_received += 1;
+            if self.rtp_packets_received % 50 == 1 {
+                tracing::info!("voice rtc: received {} rtp/rtcp-like packets so far (latest {} bytes, first byte {:#04x})", self.rtp_packets_received, data.len(), first_byte);
+            }
+        }
+        self.rtc
+            .handle_input(Input::Receive(Instant::now(), receive))
+            .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: handle_input receive failed: {e}")))
+    }
+}
+
+enum PollOutcome {
+    WaitUntil(Instant),
+    Transmit(SocketAddr, Vec<u8>),
+    Event(RtcEvent),
+}
+
+pub enum DriveResult {
+    WaitUntil(Instant),
+    Event(RtcEvent),
 }
 
 fn local_outbound_ip(remote: SocketAddr) -> Result<std::net::IpAddr, ClientError> {

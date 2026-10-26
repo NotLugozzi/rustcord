@@ -160,6 +160,8 @@ pub struct Message {
     pub mentions: Vec<User>,
     #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
+    #[serde(default)]
+    pub embeds: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]

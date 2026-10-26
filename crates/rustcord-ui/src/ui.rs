@@ -238,6 +238,7 @@ const RAIL_WIDTH: f32 = 72.0;
 const RAIL_ICON_SIZE: [f32; 2] = [48.0, 48.0];
 const RAIL_PADDING_TOP: f32 = 12.0;
 const USER_BAR_HEIGHT: f32 = 44.0;
+const VOICE_STATUS_BAR_HEIGHT: f32 = 82.0;
 const HEADER_HEIGHT: f32 = 48.0;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
@@ -826,7 +827,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .no_decoration()
         .draw_background(true)
         .build(|| {
-            ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - 16.0]).build(|| {
+            let voice_bar_reserved = if state.connected_voice_channel.is_some() { VOICE_STATUS_BAR_HEIGHT } else { 0.0 };
+            ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - voice_bar_reserved - 16.0]).build(|| {
             if state.selected_guild.is_some() {
                 let groups: Vec<(Option<String>, Vec<(String, String)>)> = state
                     .grouped_channels_for_selected_guild()
@@ -871,53 +873,17 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     token.pop();
                     for (channel_id, name) in &voice_channels {
                         let is_connected = state.connected_voice_channel.as_ref() == Some(&(Some(guild_id.clone()), channel_id.clone()));
-                        let label = if is_connected { format!("\u{1F50A} {name} (connected)") } else { format!("\u{1F50A} {name}") };
+                        let label = if is_connected { format!("[voice] {name} (connected)") } else { format!("[voice] {name}") };
                         if ui.selectable(label) && !is_connected && !state.voice_connecting {
                             let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone() });
                             state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
                         }
                         for member in state.members_in_voice_channel(&guild_id, channel_id) {
                             ui.indent();
-                            let mute_icon = if member.self_deaf { " \u{1F507}" } else if member.self_mute { " \u{1F3A4}\u{0338}" } else { "" };
-                            let speaking_icon = if state.voice_speaking_users.contains(&member.user_id) { "\u{1F50A} " } else { "" };
-                            ui.text_disabled(format!("{speaking_icon}{}{mute_icon}", member.display_name()));
-                            ui.unindent();
-                        }
-                        if is_connected {
-                            ui.indent();
-                            let mute_label = if state.self_muted { "Unmute" } else { "Mute" };
-                            if ui.button(mute_label) {
-                                state.self_muted = !state.self_muted;
-                                if state.self_muted {
-                                    state.self_deafened = false;
-                                }
-                                let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
-                                    guild_id: Some(guild_id.clone()),
-                                    channel_id: channel_id.clone(),
-                                    self_mute: state.self_muted,
-                                    self_deaf: state.self_deafened,
-                                });
-                            }
-                            ui.same_line();
-                            let deaf_label = if state.self_deafened { "Undeafen" } else { "Deafen" };
-                            if ui.button(deaf_label) {
-                                state.self_deafened = !state.self_deafened;
-                                if state.self_deafened {
-                                    state.self_muted = true;
-                                }
-                                let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
-                                    guild_id: Some(guild_id.clone()),
-                                    channel_id: channel_id.clone(),
-                                    self_mute: state.self_muted,
-                                    self_deaf: state.self_deafened,
-                                });
-                            }
-                            ui.same_line();
-                            if ui.button("Disconnect") {
-                                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: Some(guild_id.clone()) });
-                                state.self_muted = false;
-                                state.self_deafened = false;
-                            }
+                            let mute_icon = if member.self_deaf { " [deafened]" } else if member.self_mute { " [muted]" } else { "" };
+                            let speaking_icon = if state.voice_speaking_users.contains(&member.user_id) { "[speaking] " } else { "" };
+                            let name = state.voice_state_display_name(member);
+                            ui.text_disabled(format!("{speaking_icon}{name}{mute_icon}"));
                             ui.unindent();
                         }
                     }
@@ -930,6 +896,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             }
             });
 
+            if state.connected_voice_channel.is_some() {
+                ui.separator();
+                ui.child_window("voice_status_bar").size([0.0, VOICE_STATUS_BAR_HEIGHT]).build(|| {
+                    draw_voice_status_bar(ui, state, cmd_tx);
+                });
+            }
             ui.separator();
             draw_user_bar(ui, state, cmd_tx, textures);
         });
@@ -1052,6 +1024,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
                                 }
+                                if !msg.embeds.is_empty() {
+                                    ui.text_disabled("(embed content not supported)");
+                                }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
@@ -1067,6 +1042,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
+                                }
+                                if !msg.embeds.is_empty() {
+                                    ui.text_disabled("(embed content not supported)");
                                 }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
@@ -1330,6 +1308,64 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_image_lightbox(ui, state, textures);
 }
 
+fn format_bitrate(bps: u32) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1} Mbps", bps as f32 / 1_000_000.0)
+    } else {
+        format!("{} kbps", bps / 1000)
+    }
+}
+
+fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
+    let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
+
+    ui.text(format!("[voice] {channel_name}"));
+    let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+    ui.set_window_font_scale(0.85);
+    ui.text(format!(
+        "up {} / down {}",
+        format_bitrate(state.voice_bitrate_up_bps),
+        format_bitrate(state.voice_bitrate_down_bps),
+    ));
+    ui.set_window_font_scale(1.0);
+    token.pop();
+
+    let mute_label = if state.self_muted { "Unmute" } else { "Mute" };
+    if ui.button(mute_label) {
+        state.self_muted = !state.self_muted;
+        if state.self_muted {
+            state.self_deafened = false;
+        }
+        let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+            guild_id: guild_id.clone(),
+            channel_id: channel_id.clone(),
+            self_mute: state.self_muted,
+            self_deaf: state.self_deafened,
+        });
+    }
+    ui.same_line();
+    let deaf_label = if state.self_deafened { "Undeafen" } else { "Deafen" };
+    if ui.button(deaf_label) {
+        state.self_deafened = !state.self_deafened;
+        if state.self_deafened {
+            state.self_muted = true;
+        }
+        let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+            guild_id: guild_id.clone(),
+            channel_id: channel_id.clone(),
+            self_mute: state.self_muted,
+            self_deaf: state.self_deafened,
+        });
+    }
+    ui.same_line();
+    if ui.button("Disconnect") {
+        let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
+        state.self_muted = false;
+        state.self_deafened = false;
+    }
+}
+
 fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let Some(user) = state.current_user.clone() else { return };
     const SETTINGS_WIDTH: f32 = 70.0;
@@ -1483,7 +1519,7 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
 
         if is_connected {
             let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.accent);
-            if ui.button("\u{1F4DE}") {
+            if ui.button("Call") {
                 let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: None });
             }
             token.pop();
@@ -1491,8 +1527,8 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
                 ui.tooltip_text("Hang up");
             }
         } else if is_connecting {
-            ui.text_disabled("\u{1F4DE}");
-        } else if ui.button("\u{1F4DE}") {
+            ui.text_disabled("Call");
+        } else if ui.button("Call") {
             let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone() });
             state.pending_voice_channel = Some((None, channel_id.clone()));
         }
@@ -1501,7 +1537,7 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
         }
 
         ui.same_line();
-        ui.text_disabled("\u{1F4F7}");
+        ui.text_disabled("Video");
         if ui.is_item_hovered() {
             ui.tooltip_text("Video calls aren't supported yet");
         }

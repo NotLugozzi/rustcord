@@ -63,6 +63,7 @@ pub struct AppState {
     pub context_dm: Option<String>,
     pub profiles: HashMap<String, rustcord_client::models::UserProfile>,
     pub profiles_requested: std::collections::HashSet<String>,
+    pub known_users: HashMap<String, User>,
     pub notes: HashMap<String, String>,
     pub profile_tab: usize,
     pub rpc_apps: Vec<crate::presence::RpcAppInfo>,
@@ -112,6 +113,8 @@ pub struct AppState {
     pub self_deafened: bool,
     pub voice_input_devices: Vec<String>,
     pub voice_output_devices: Vec<String>,
+    pub voice_bitrate_up_bps: u32,
+    pub voice_bitrate_down_bps: u32,
     pub selected_input_device: Option<String>,
     pub selected_output_device: Option<String>,
     pub show_voice_device_picker: bool,
@@ -210,6 +213,7 @@ impl AppState {
     }
 
     pub fn push_message(&mut self, message: Message) {
+        self.known_users.insert(message.author.id.clone(), message.author.clone());
         if let Some(dm) = self.dm_channels.iter_mut().find(|c| c.id == message.channel_id) {
             dm.last_message_id = Some(message.id.clone());
         }
@@ -280,6 +284,9 @@ impl AppState {
     }
 
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
+        if let Some(user) = voice_state.member.as_ref().and_then(|m| m.user.clone()) {
+            self.known_users.insert(voice_state.user_id.clone(), user);
+        }
         let Some(guild_id) = voice_state.guild_id.clone() else { return };
         let states = self.voice_channel_states.entry(guild_id).or_default();
         states.retain(|s| s.user_id != voice_state.user_id);
@@ -299,9 +306,30 @@ impl AppState {
         voice
     }
 
+    pub fn connected_voice_channel_name(&self) -> Option<String> {
+        let (_, channel_id) = self.connected_voice_channel.as_ref()?;
+        for channels in self.guild_channels.values() {
+            if let Some(channel) = channels.iter().find(|c| &c.id == channel_id) {
+                return Some(channel.name.clone().unwrap_or_else(|| channel.id.clone()));
+            }
+        }
+        Some(channel_id.clone())
+    }
+
     pub fn members_in_voice_channel(&self, guild_id: &str, channel_id: &str) -> Vec<&rustcord_client::models::VoiceState> {
         let Some(states) = self.voice_channel_states.get(guild_id) else { return Vec::new() };
         states.iter().filter(|s| s.channel_id.as_deref() == Some(channel_id)).collect()
+    }
+
+    pub fn voice_state_display_name(&self, voice_state: &rustcord_client::models::VoiceState) -> String {
+        let name = voice_state.display_name();
+        if name != voice_state.user_id {
+            return name;
+        }
+        if let Some(user) = self.known_users.get(&voice_state.user_id) {
+            return user.global_name.clone().unwrap_or_else(|| user.username.clone());
+        }
+        name
     }
 
     pub fn set_voice_speaking(&mut self, user_id: String, speaking: bool) {

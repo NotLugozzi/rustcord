@@ -11,6 +11,10 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 1;
 pub const FRAME_SAMPLES: usize = 960;
 
+fn low_latency_buffer_size() -> cpal::BufferSize {
+    cpal::BufferSize::Fixed(FRAME_SAMPLES as u32)
+}
+
 fn audio_host() -> cpal::Host {
     #[cfg(target_os = "linux")]
     {
@@ -36,7 +40,7 @@ impl MicCapture {
         let device = find_device(&host, device_name, true)
             .ok_or_else(|| ClientError::GatewayClosed("voice audio: no input device available".into()))?;
 
-        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: cpal::BufferSize::Default };
+        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
 
         let muted_cb = muted.clone();
         let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
@@ -82,13 +86,14 @@ impl SpeakerPlayback {
         let device = find_device(&host, device_name, false)
             .ok_or_else(|| ClientError::GatewayClosed("voice audio: no output device available".into()))?;
 
-        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: cpal::BufferSize::Default };
+        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<(u32, Vec<i16>)>();
         let deafened_cb = deafened.clone();
         let mut pending: std::collections::HashMap<u32, std::collections::VecDeque<i16>> = std::collections::HashMap::new();
         let mut primed: std::collections::HashSet<u32> = std::collections::HashSet::new();
         const PREBUFFER_SAMPLES: usize = FRAME_SAMPLES * CHANNELS as usize * 2;
+        const MAX_QUEUED_SAMPLES: usize = SAMPLE_RATE as usize * CHANNELS as usize / 5;
 
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: output stream error: {e}");
         let stream = device
@@ -100,7 +105,12 @@ impl SpeakerPlayback {
                         return;
                     }
                     while let Ok((ssrc, frame)) = rx.try_recv() {
-                        pending.entry(ssrc).or_default().extend(frame);
+                        let queue = pending.entry(ssrc).or_default();
+                        queue.extend(frame);
+                        if queue.len() > MAX_QUEUED_SAMPLES {
+                            let drop = queue.len() - MAX_QUEUED_SAMPLES;
+                            queue.drain(..drop);
+                        }
                     }
                     out.fill(0);
                     for (ssrc, queue) in pending.iter_mut() {

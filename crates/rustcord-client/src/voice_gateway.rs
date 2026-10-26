@@ -114,8 +114,11 @@ impl VoiceGateway {
         let mut rtc: Option<VoiceRtc> = None;
         let mut media_connected = false;
         let mut rtc_buf = vec![0u8; 2000];
+        let mut next_rtc_deadline: Option<Instant> = None;
+        let mut rtc_socket: Option<std::sync::Arc<tokio::net::UdpSocket>> = None;
         let mut seq_ack: u64 = 0;
         let mut mic_frame_count: u64 = 0;
+        let mut last_select_entry: Option<Instant> = None;
         let mut received_audio_frame_count: u64 = 0;
         let mut decrypt_success_count: u64 = 0;
         let mut decrypt_failure_count: u64 = 0;
@@ -194,6 +197,16 @@ impl VoiceGateway {
                     }
                 }
                 frame = read.next() => {
+                    {
+                        let now = Instant::now();
+                        if let Some(prev) = last_select_entry {
+                            let gap = now.duration_since(prev);
+                            if gap > Duration::from_millis(60) {
+                                tracing::warn!("voice: [ws read] {gap:?} since previous select! iteration");
+                            }
+                        }
+                        last_select_entry = Some(now);
+                    }
                     let Some(frame) = frame else {
                         break Err(ClientError::GatewayClosed("voice stream ended".into()));
                     };
@@ -237,6 +250,7 @@ impl VoiceGateway {
                                     new_rtc.expect_remote_audio(remote_ssrc);
                                 }
                                 let offer = voice_sdp::build_offer(&params);
+                                rtc_socket = Some(new_rtc.socket_handle());
                                 rtc = Some(new_rtc);
                                 let select_protocol = select_protocol_frame(&offer);
                                 if let Err(e) = write.send(WsMessage::Text(select_protocol)).await {
@@ -457,7 +471,25 @@ impl VoiceGateway {
                         break Err(e.into());
                     }
                 }
-                rtc_event = drive_rtc(rtc.as_mut(), &mut rtc_buf) => {
+                drive_result = drive_rtc(rtc.as_mut()) => {
+                    {
+                        let now = Instant::now();
+                        if let Some(prev) = last_select_entry {
+                            let gap = now.duration_since(prev);
+                            if gap > Duration::from_millis(60) {
+                                tracing::warn!("voice: [drive_rtc] {gap:?} since previous select! iteration");
+                            }
+                        }
+                        last_select_entry = Some(now);
+                    }
+                    let rtc_event = match drive_result {
+                        Ok(crate::voice_rtc::DriveResult::WaitUntil(deadline)) => {
+                            next_rtc_deadline = Some(deadline);
+                            Ok(None)
+                        }
+                        Ok(crate::voice_rtc::DriveResult::Event(event)) => Ok(Some(event)),
+                        Err(e) => Err(e),
+                    };
                     match rtc_event {
                         Ok(Some(RtcEvent::Connected)) => {
                             media_connected = true;
@@ -569,7 +601,38 @@ impl VoiceGateway {
                         }
                     }
                 }
+                recv = recv_rtc_datagram(rtc_socket.as_ref(), &mut rtc_buf) => {
+                    match recv {
+                        Ok((len, source)) => {
+                            if let Some(active_rtc) = rtc.as_mut() {
+                                if let Err(e) = active_rtc.handle_datagram(source, &rtc_buf[..len]) {
+                                    break Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("voice: rtc datagram recv failed: {e}");
+                            break Err(e);
+                        }
+                    }
+                }
+                _ = sleep_until_deadline(next_rtc_deadline) => {
+                    next_rtc_deadline = None;
+                    if let Some(active_rtc) = rtc.as_mut() {
+                        if let Err(e) = active_rtc.handle_timeout() {
+                            break Err(e);
+                        }
+                    }
+                }
                 Some(pcm_frame) = mic_frame_rx.recv() => {
+                    let now = Instant::now();
+                    if let Some(prev) = last_select_entry {
+                        let gap = now.duration_since(prev);
+                        if gap > Duration::from_millis(60) {
+                            tracing::warn!("voice: [mic_frame_rx] {gap:?} since previous select! iteration (queue depth now {}, DAVE enabled={dave_enabled})", mic_frame_rx.len());
+                        }
+                    }
+                    last_select_entry = Some(now);
                     mic_frame_count += 1;
                     if mic_frame_count % 50 == 0 {
                         tracing::info!("voice: sent {mic_frame_count} mic frames so far");
@@ -618,9 +681,29 @@ impl VoiceGateway {
     }
 }
 
-async fn drive_rtc(rtc: Option<&mut VoiceRtc>, buf: &mut [u8]) -> Result<Option<RtcEvent>, ClientError> {
+async fn drive_rtc(rtc: Option<&mut VoiceRtc>) -> Result<crate::voice_rtc::DriveResult, ClientError> {
     match rtc {
-        Some(rtc) => rtc.drive(buf).await,
+        Some(rtc) => rtc.drive().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_rtc_datagram(
+    socket: Option<&std::sync::Arc<tokio::net::UdpSocket>>,
+    buf: &mut [u8],
+) -> Result<(usize, std::net::SocketAddr), ClientError> {
+    match socket {
+        Some(socket) => socket
+            .recv_from(buf)
+            .await
+            .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp recv failed: {e}"))),
+        None => std::future::pending().await,
+    }
+}
+
+async fn sleep_until_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
         None => std::future::pending().await,
     }
 }

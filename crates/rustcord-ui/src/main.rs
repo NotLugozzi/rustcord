@@ -178,9 +178,15 @@ pub fn drain_backend_events(
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
                 state.voice_speaking_users.clear();
+                state.voice_bitrate_up_bps = 0;
+                state.voice_bitrate_down_bps = 0;
             }
             BackendEvent::VoiceSpeaking { user_id, speaking } => {
                 state.set_voice_speaking(user_id, speaking);
+            }
+            BackendEvent::VoiceStats { bitrate_up_bps, bitrate_down_bps } => {
+                state.voice_bitrate_up_bps = bitrate_up_bps;
+                state.voice_bitrate_down_bps = bitrate_down_bps;
             }
             BackendEvent::VoiceDevicesLoaded { inputs, outputs } => {
                 state.voice_input_devices = inputs;
