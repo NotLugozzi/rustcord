@@ -776,6 +776,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .position([0.0, 0.0], imgui::Condition::Always)
         .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
         .no_decoration()
+        .scrollable(false)
         .draw_background(true)
         .build(|| {
             let rail_center_x = (RAIL_WIDTH - RAIL_ICON_SIZE[0]) / 2.0;
@@ -828,6 +829,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
         .size([sidebar_width, display_h], imgui::Condition::Always)
         .no_decoration()
+        .scrollable(false)
         .draw_background(true)
         .build(|| {
             let voice_bar_reserved = if state.connected_voice_channel.is_some() { VOICE_STATUS_BAR_HEIGHT } else { 0.0 };
@@ -907,7 +909,6 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             }
             ui.separator();
             draw_user_bar(ui, state, cmd_tx, textures);
-            ui.dummy([0.0, 20.0]);
         });
         _channels_bg.pop();
 
@@ -933,6 +934,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
         .size([display_w - RAIL_WIDTH - sidebar_width, display_h], imgui::Condition::Always)
         .no_decoration()
+        .scrollable(false)
         .draw_background(true)
         .build(|| {
             let show_reconnecting = state.logged_in && !state.gateway_connected;
@@ -1310,7 +1312,6 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                 }
             }
-            ui.dummy([0.0, 20.0]);
         });
 
     draw_image_lightbox(ui, state, textures);
@@ -1367,7 +1368,7 @@ fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender
         });
     }
     ui.same_line();
-    if ui.button("Disconnect") {
+    if ui.button("DSC") {
         let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
         state.self_muted = false;
         state.self_deafened = false;
