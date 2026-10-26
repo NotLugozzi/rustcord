@@ -24,7 +24,7 @@ jobs:
     if: needs.check-skip.outputs.skip == 'false'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system dependencies
         run: |
@@ -43,6 +43,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Install cargo-deb and cargo-generate-rpm
         run: |
@@ -69,7 +71,7 @@ jobs:
           mkdir -p dist
           cp target/generate-rpm/*.rpm dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: rustcord-linux
           path: dist/*
@@ -79,13 +81,17 @@ jobs:
     if: needs.check-skip.outputs.skip == 'false'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Build release binary
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release -p rustcord-ui
 
       - name: Package .dmg
@@ -94,7 +100,7 @@ jobs:
           cp target/release/rustcord dmg-root/
           hdiutil create -volname "RustCord" -srcfolder dmg-root -ov -format UDZO dist/rustcord-macos.dmg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: rustcord-macos
           path: dist/*
@@ -104,13 +110,17 @@ jobs:
     if: needs.check-skip.outputs.skip == 'false'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Build release binary
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release -p rustcord-ui
 
       - name: Package .exe
@@ -119,7 +129,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path target/release/rustcord.exe -DestinationPath dist/rustcord-windows-x86_64.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: rustcord-windows
           path: dist/*
