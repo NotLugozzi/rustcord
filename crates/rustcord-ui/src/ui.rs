@@ -769,6 +769,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
 
+    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.servers_bg);
+
     ui.window("servers")
         .position([0.0, 0.0], imgui::Condition::Always)
         .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
@@ -818,14 +820,16 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 ui.set_cursor_pos([rail_center_x, next_y]);
             }
         });
+        _server_bg.pop(); // <- Non dimenticare il pop()!
 
+    let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
     ui.window("channels")
         .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
         .size([sidebar_width, display_h], imgui::Condition::Always)
         .no_decoration()
         .draw_background(true)
         .build(|| {
-            ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - 16.0]).build(|| {
+            ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - 36.0]).build(|| {
             if state.selected_guild.is_some() {
                 let groups: Vec<(Option<String>, Vec<(String, String)>)> = state
                     .grouped_channels_for_selected_guild()
@@ -863,7 +867,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
             ui.separator();
             draw_user_bar(ui, state, cmd_tx, textures);
+            ui.dummy([0.0, 20.0]);
         });
+        _channels_bg.pop(); // <- Non dimenticare il pop()!
 
     ui.window("##sidebar_splitter")
         .position([RAIL_WIDTH + sidebar_width - SPLITTER_WIDTH / 2.0, 0.0], imgui::Condition::Always)
@@ -897,7 +903,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let has_new_messages = messages.len() > seen_count;
 
             ui.child_window("history")
-                .size([0.0, display_h - 60.0 - status_height])
+                .size([0.0, display_h - 80.0 - status_height])
                 .build(|| {
                     if messages.is_empty() {
                         ui.text_disabled("No messages loaded yet.");
@@ -1136,9 +1142,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let bar_start = ui.cursor_screen_pos();
             let bar_width = ui.content_region_avail()[0];
             ui.get_window_draw_list()
-                .add_rect(bar_start, [bar_start[0] + bar_width, bar_start[1] + ui.frame_height()], state.theme.panel)
+                .add_rect([bar_start[0], bar_start[1] - 4.0], [bar_start[0] + bar_width, bar_start[1] + ui.frame_height() + 4.0], state.theme.panel) // Usa theme.panel (o servers_bg) per staccarlo dallo sfondo chat
                 .filled(true)
-                .rounding(8.0)
+                .rounding(20.0) // Rounding estremo per l'effetto a pillola
                 .build();
 
             if ui.button("+") {
@@ -1250,6 +1256,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                 }
             }
+            ui.dummy([0.0, 20.0]);
         });
 
     draw_image_lightbox(ui, state, textures);
