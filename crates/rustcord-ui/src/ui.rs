@@ -771,7 +771,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
 
-    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.servers_bg);
+    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.servers_bg());
     ui.window("servers")
         .position([0.0, 0.0], imgui::Condition::Always)
         .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
@@ -1521,9 +1521,13 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
         ui.text(&name);
         ui.same_line();
         let right_edge = ui.window_size()[0] - 16.0;
-        let icon_width = 28.0;
-        let icon_count = 2.0;
-        ui.set_cursor_pos([right_edge - icon_width * icon_count, (HEADER_HEIGHT - 20.0) / 2.0]);
+        let spacing = ui.clone_style().item_spacing[0];
+        let frame_padding_x = ui.clone_style().frame_padding[0];
+        let call_width = ui.calc_text_size("Call")[0] + frame_padding_x * 2.0;
+        let video_width = ui.calc_text_size("Video")[0];
+        let row_width = call_width + spacing + video_width;
+        let button_height = ui.text_line_height() + ui.clone_style().frame_padding[1] * 2.0;
+        ui.set_cursor_pos([right_edge - row_width, (HEADER_HEIGHT - button_height) / 2.0]);
 
         if is_connected {
             let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.accent);

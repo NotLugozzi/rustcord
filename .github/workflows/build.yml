@@ -1,0 +1,125 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  check-skip:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - id: check
+        run: |
+          msg=$(echo "${{ github.event.head_commit.message }}" | tr '[:upper:]' '[:lower:]')
+          if [[ "$msg" == *"[skip-ci]"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-linux:
+    needs: check-skip
+    if: needs.check-skip.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libpulse-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: |
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+
+      - name: Build release binary
+        run: cargo build --release -p rustcord-ui
+
+      - name: Package tar.gz
+        run: |
+          mkdir -p dist
+          tar -czf dist/rustcord-linux-x86_64.tar.gz -C target/release rustcord
+
+      - name: Package .deb
+        run: |
+          cargo deb -p rustcord-ui --no-build
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+
+      - name: Package .rpm
+        run: |
+          cargo generate-rpm -p crates/rustcord-ui
+          mkdir -p dist
+          cp target/generate-rpm/*.rpm dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustcord-linux
+          path: dist/*
+
+  build-macos:
+    needs: check-skip
+    if: needs.check-skip.outputs.skip == 'false'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p rustcord-ui
+
+      - name: Package .dmg
+        run: |
+          mkdir -p dist dmg-root
+          cp target/release/rustcord dmg-root/
+          hdiutil create -volname "RustCord" -srcfolder dmg-root -ov -format UDZO dist/rustcord-macos.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustcord-macos
+          path: dist/*
+
+  build-windows:
+    needs: check-skip
+    if: needs.check-skip.outputs.skip == 'false'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p rustcord-ui
+
+      - name: Package .exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/rustcord.exe -DestinationPath dist/rustcord-windows-x86_64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustcord-windows
+          path: dist/*

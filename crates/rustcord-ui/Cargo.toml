@@ -3,10 +3,27 @@ name = "rustcord-ui"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
+description = "A Discord client written in Rust"
 
 [[bin]]
 name = "rustcord"
 path = "src/main.rs"
+
+[package.metadata.deb]
+name = "rustcord"
+maintainer = "RustCord contributors"
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["../../target/release/rustcord", "usr/bin/", "755"],
+]
+
+[package.metadata.generate-rpm]
+name = "rustcord"
+assets = [
+    { source = "../../target/release/rustcord", dest = "/usr/bin/rustcord", mode = "755" },
+]
 
 [dependencies]
 rustcord-client = { path = "../rustcord-client" }

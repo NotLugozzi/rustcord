@@ -7,10 +7,10 @@ pub struct Theme {
     pub background: [f32; 4],
     pub panel: [f32; 4],
     pub text: [f32; 4],
-    #[serde(default = "default_servers_bg")]
-    pub servers_bg: [f32; 4],
-    #[serde(default = "default_user_bar_bg")]
-    pub user_bar_bg: [f32; 4],
+    #[serde(default)]
+    pub servers_bg: Option<[f32; 4]>,
+    #[serde(default)]
+    pub user_bar_bg: Option<[f32; 4]>,
     pub text_muted: [f32; 4],
     pub accent: [f32; 4],
     pub accent_hover: [f32; 4],
@@ -19,8 +19,9 @@ pub struct Theme {
     pub gradient: Option<[[f32; 4]; 2]>,
 }
 
-fn default_servers_bg() -> [f32; 4] { [0.125, 0.133, 0.145, 1.0] } // #202225
-fn default_user_bar_bg() -> [f32; 4] { [0.161, 0.169, 0.184, 1.0] } // #292b2f
+fn darken(color: [f32; 4], factor: f32) -> [f32; 4] {
+    [color[0] * factor, color[1] * factor, color[2] * factor, color[3]]
+}
 
 impl Default for Theme {
     fn default() -> Self {
@@ -28,9 +29,9 @@ impl Default for Theme {
             name: "discord-dark".into(),
             background: [0.212, 0.224, 0.247, 1.0],
             panel: [0.184, 0.192, 0.212, 1.0],
-            servers_bg: default_servers_bg(),
-            user_bar_bg: default_user_bar_bg(),
-            text: [0.863, 0.867, 0.871, 1.0],        
+            servers_bg: None,
+            user_bar_bg: None,
+            text: [0.863, 0.867, 0.871, 1.0],
             text_muted: [0.584, 0.612, 0.639, 1.0],  
             accent: [0.345, 0.396, 0.949, 1.0],      
             accent_hover: [0.278, 0.322, 0.816, 1.0],
@@ -41,6 +42,14 @@ impl Default for Theme {
 }
 
 impl Theme {
+    pub fn servers_bg(&self) -> [f32; 4] {
+        self.servers_bg.unwrap_or_else(|| darken(self.background, 0.8))
+    }
+
+    pub fn user_bar_bg(&self) -> [f32; 4] {
+        self.user_bar_bg.unwrap_or_else(|| darken(self.panel, 0.92))
+    }
+
     const BUNDLED: [(&'static str, &'static str); 6] = [
         ("discord-dark.toml", include_str!("../../../themes/discord-dark.toml")),
         ("nord.toml", include_str!("../../../themes/nord.toml")),
