@@ -72,7 +72,7 @@ impl MicCapture {
 
 pub struct SpeakerPlayback {
     _stream: cpal::Stream,
-    tx: mpsc::UnboundedSender<Vec<i16>>,
+    tx: mpsc::UnboundedSender<(u32, Vec<i16>)>,
     pub deafened: Arc<AtomicBool>,
 }
 
@@ -84,11 +84,11 @@ impl SpeakerPlayback {
 
         let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: cpal::BufferSize::Default };
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<i16>>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(u32, Vec<i16>)>();
         let deafened_cb = deafened.clone();
-        let mut pending: std::collections::VecDeque<i16> = std::collections::VecDeque::new();
+        let mut pending: std::collections::HashMap<u32, std::collections::VecDeque<i16>> = std::collections::HashMap::new();
+        let mut primed: std::collections::HashSet<u32> = std::collections::HashSet::new();
         const PREBUFFER_SAMPLES: usize = FRAME_SAMPLES * CHANNELS as usize * 2;
-        let mut primed = false;
 
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: output stream error: {e}");
         let stream = device
@@ -99,22 +99,27 @@ impl SpeakerPlayback {
                         out.fill(0);
                         return;
                     }
-                    while let Ok(frame) = rx.try_recv() {
-                        pending.extend(frame);
+                    while let Ok((ssrc, frame)) = rx.try_recv() {
+                        pending.entry(ssrc).or_default().extend(frame);
                     }
-                    if !primed {
-                        if pending.len() < PREBUFFER_SAMPLES {
-                            out.fill(0);
-                            return;
+                    out.fill(0);
+                    for (ssrc, queue) in pending.iter_mut() {
+                        if !primed.contains(ssrc) {
+                            if queue.len() < PREBUFFER_SAMPLES {
+                                continue;
+                            }
+                            primed.insert(*ssrc);
                         }
-                        primed = true;
+                        if queue.is_empty() {
+                            primed.remove(ssrc);
+                            continue;
+                        }
+                        for sample in out.iter_mut() {
+                            let Some(mixed) = queue.pop_front() else { break };
+                            *sample = sample.saturating_add(mixed);
+                        }
                     }
-                    if pending.is_empty() {
-                        primed = false;
-                    }
-                    for sample in out.iter_mut() {
-                        *sample = pending.pop_front().unwrap_or(0);
-                    }
+                    pending.retain(|_, queue| !queue.is_empty());
                 },
                 err_fn,
                 None,
@@ -126,8 +131,8 @@ impl SpeakerPlayback {
         Ok(Self { _stream: stream, tx, deafened })
     }
 
-    pub fn push_frame(&self, pcm: Vec<i16>) {
-        let _ = self.tx.send(pcm);
+    pub fn push_frame(&self, ssrc: u32, pcm: Vec<i16>) {
+        let _ = self.tx.send((ssrc, pcm));
     }
 
     pub fn set_deafened(&self, deafened: bool) {
@@ -137,7 +142,10 @@ impl SpeakerPlayback {
 
 pub struct AudioCodec {
     encoder: OpusEncoder,
-    decoder: OpusDecoder,
+    // Opus decoders carry per-stream state (packet loss concealment,
+    // continuity); sharing one across multiple remote speakers corrupts
+    // that state and causes audible glitches when people talk at once.
+    decoders: std::collections::HashMap<u32, OpusDecoder>,
 }
 
 impl AudioCodec {
@@ -145,9 +153,7 @@ impl AudioCodec {
         let channels = if CHANNELS == 2 { Channels::Stereo } else { Channels::Mono };
         let encoder = OpusEncoder::new(SampleRate::Hz48000, channels, Application::Voip)
             .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus encoder init failed: {e}")))?;
-        let decoder = OpusDecoder::new(SampleRate::Hz48000, channels)
-            .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus decoder init failed: {e}")))?;
-        Ok(Self { encoder, decoder })
+        Ok(Self { encoder, decoders: std::collections::HashMap::new() })
     }
 
     pub fn encode(&self, pcm: &[i16]) -> Result<Vec<u8>, ClientError> {
@@ -159,14 +165,22 @@ impl AudioCodec {
         Ok(out[..len].to_vec())
     }
 
-    pub fn decode(&mut self, opus: &[u8]) -> Result<Vec<i16>, ClientError> {
+    pub fn decode(&mut self, ssrc: u32, opus: &[u8]) -> Result<Vec<i16>, ClientError> {
+        let channels = if CHANNELS == 2 { Channels::Stereo } else { Channels::Mono };
+        let decoder = match self.decoders.entry(ssrc) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let decoder = OpusDecoder::new(SampleRate::Hz48000, channels)
+                    .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus decoder init failed: {e}")))?;
+                entry.insert(decoder)
+            }
+        };
         let mut out = vec![0i16; FRAME_SAMPLES * CHANNELS as usize];
         let packet: audiopus::packet::Packet =
             opus.try_into().map_err(|e| ClientError::GatewayClosed(format!("voice audio: invalid opus packet: {e}")))?;
         let signals: audiopus::MutSignals<i16> =
             out.as_mut_slice().try_into().map_err(|e| ClientError::GatewayClosed(format!("voice audio: invalid output buffer: {e}")))?;
-        let samples = self
-            .decoder
+        let samples = decoder
             .decode(Some(packet), signals, false)
             .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus decode failed: {e}")))?;
         out.truncate(samples * CHANNELS as usize);

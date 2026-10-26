@@ -111,6 +111,7 @@ pub enum BackendEvent {
     VoiceConnected,
     VoiceDisconnected,
     VoiceSpeaking { user_id: String, speaking: bool },
+    VoiceStats { bitrate_up_bps: u32, bitrate_down_bps: u32 },
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
 }
 
@@ -447,6 +448,9 @@ fn try_spawn_voice_gateway(
                 }
                 VoiceGatewayEvent::Speaking { user_id: Some(user_id), speaking, .. } => {
                     let _ = forward_tx.send(BackendEvent::VoiceSpeaking { user_id, speaking });
+                }
+                VoiceGatewayEvent::Stats { bitrate_up_bps, bitrate_down_bps } => {
+                    let _ = forward_tx.send(BackendEvent::VoiceStats { bitrate_up_bps, bitrate_down_bps });
                 }
                 _ => {}
             }

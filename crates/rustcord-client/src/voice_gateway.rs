@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -31,6 +31,7 @@ pub enum VoiceGatewayEvent {
     Speaking { ssrc: u32, user_id: Option<String>, speaking: bool },
     DaveReady,
     AudioReceived { payload: Vec<u8> },
+    Stats { bitrate_up_bps: u32, bitrate_down_bps: u32 },
     Disconnected { reason: String },
 }
 
@@ -120,6 +121,11 @@ impl VoiceGateway {
         let mut decrypt_failure_count: u64 = 0;
         let mut decode_success_count: u64 = 0;
         let mut decode_failure_count: u64 = 0;
+        let mut speaking_activity: HashMap<String, Instant> = HashMap::new();
+        let mut speaking_check = tokio::time::interval(Duration::from_millis(200));
+        let mut bytes_sent: u64 = 0;
+        let mut bytes_received: u64 = 0;
+        let mut stats_check = tokio::time::interval(Duration::from_secs(1));
         let mut codec = AudioCodec::new()?;
         let mut mic: Option<MicCapture> = None;
         let mut speaker: Option<SpeakerPlayback> = None;
@@ -141,6 +147,25 @@ impl VoiceGateway {
 
         let result = loop {
             tokio::select! {
+                _ = speaking_check.tick() => {
+                    const SPEAKING_TIMEOUT: Duration = Duration::from_millis(500);
+                    let now = Instant::now();
+                    speaking_activity.retain(|user_id, last_active| {
+                        if now.duration_since(*last_active) < SPEAKING_TIMEOUT {
+                            return true;
+                        }
+                        let ssrc = remote_speakers.iter().find(|(_, id)| *id == user_id).map(|(ssrc, _)| *ssrc).unwrap_or_default();
+                        let _ = tx.send(VoiceGatewayEvent::Speaking { ssrc, user_id: Some(user_id.clone()), speaking: false });
+                        false
+                    });
+                }
+                _ = stats_check.tick() => {
+                    let up = (bytes_sent * 8) as u32;
+                    let down = (bytes_received * 8) as u32;
+                    bytes_sent = 0;
+                    bytes_received = 0;
+                    let _ = tx.send(VoiceGatewayEvent::Stats { bitrate_up_bps: up, bitrate_down_bps: down });
+                }
                 _ = device_check.tick(), if media_connected => {
                     let input_device = self.media_state.input_device.lock().unwrap().clone();
                     if attempted_input_device.as_ref() != Some(&input_device) {
@@ -199,14 +224,18 @@ impl VoiceGateway {
                                 tracing::info!("voice: received DAVE control opcode {}, data {:?}", payload.op, payload.d);
                             }
                             if payload.op == 2 {
+                                tracing::info!("voice: op 2 Ready payload: {:?}", payload.d);
                                 if let Err(e) = write.send(WsMessage::Text(json!({ "op": 16, "d": {} }).to_string())).await {
                                     break Err(e.into());
                                 }
                             } else if payload.op == 16 {
-                                let (new_rtc, params) = match VoiceRtc::new().await {
+                                let (mut new_rtc, params) = match VoiceRtc::new().await {
                                     Ok(v) => v,
                                     Err(e) => break Err(e),
                                 };
+                                for &remote_ssrc in remote_speakers.keys() {
+                                    new_rtc.expect_remote_audio(remote_ssrc);
+                                }
                                 let offer = voice_sdp::build_offer(&params);
                                 rtc = Some(new_rtc);
                                 let select_protocol = select_protocol_frame(&offer);
@@ -341,6 +370,31 @@ impl VoiceGateway {
                                 dave_enabled = target_dave_version > 0;
                                 tracing::info!("voice: executing DAVE transition; protocol version {}, enabled={dave_enabled}", target_dave_version);
                                 let _ = tx.send(VoiceGatewayEvent::DaveReady);
+                            } else if payload.op == 12 {
+                                if let Some(data) = &payload.d {
+                                    let user_id = data["user_id"].as_str();
+                                    let audio_ssrc = data["audio_ssrc"].as_u64().unwrap_or_default() as u32;
+                                    tracing::info!("voice: op 12 client connect, user {:?}, audio_ssrc {audio_ssrc}", user_id);
+                                    if let (Some(user_id), true) = (user_id, audio_ssrc != 0) {
+                                        remote_speakers.insert(audio_ssrc, user_id.to_string());
+                                        if dave_enabled {
+                                            if let Ok(secret) = dave_session.sender_base_secret(user_id) {
+                                                if let Ok(id) = user_id.parse::<u64>() {
+                                                    if pending_frame_epoch_update {
+                                                        frame_crypto.prepare_sender_base_secret(id, secret);
+                                                    } else {
+                                                        frame_crypto.set_sender_base_secret(id, secret);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if let Some(active_rtc) = rtc.as_mut() {
+                                            active_rtc.expect_remote_audio(audio_ssrc);
+                                        }
+                                    }
+                                }
+                            } else if !matches!(payload.op, 3 | 8) {
+                                tracing::info!("voice: unhandled opcode {}, data {:?}", payload.op, payload.d);
                             }
                             if let Err(e) = handle_payload(payload, &tx) {
                                 break Err(e);
@@ -448,13 +502,22 @@ impl VoiceGateway {
                         }
                         Ok(Some(RtcEvent::AudioData { ssrc, payload })) => {
                             received_audio_frame_count += 1;
+                            bytes_received += payload.len() as u64;
                             if received_audio_frame_count == 1 || received_audio_frame_count % 50 == 0 {
                                 tracing::info!("voice: received {received_audio_frame_count} decoded RTP audio events; latest SSRC {ssrc}, {} bytes, DAVE enabled={dave_enabled}", payload.len());
                             }
                             if payload.is_empty() {
                                 continue;
                             }
-                            let decoded_payload = if dave_enabled && payload == [0xf8, 0xff, 0xfe] {
+                            let is_dtx = payload == [0xf8, 0xff, 0xfe];
+                            if !is_dtx {
+                                if let Some(user_id) = remote_speakers.get(&ssrc) {
+                                    if speaking_activity.insert(user_id.clone(), Instant::now()).is_none() {
+                                        let _ = tx.send(VoiceGatewayEvent::Speaking { ssrc, user_id: Some(user_id.clone()), speaking: true });
+                                    }
+                                }
+                            }
+                            let decoded_payload = if dave_enabled && is_dtx {
                                 payload
                             } else if dave_enabled {
                                 let Some(user_id) = remote_speakers.get(&ssrc).and_then(|id| id.parse::<u64>().ok()) else {
@@ -478,7 +541,7 @@ impl VoiceGateway {
                             } else {
                                 payload
                             };
-                            match codec.decode(&decoded_payload) {
+                            match codec.decode(ssrc, &decoded_payload) {
                                 Ok(pcm) => {
                                     decode_success_count += 1;
                                     if decode_success_count == 1 || decode_success_count % 50 == 0 {
@@ -486,7 +549,7 @@ impl VoiceGateway {
                                         tracing::info!("voice: decoded {decode_success_count} audio frames so far, latest peak sample magnitude {peak}");
                                     }
                                     if let Some(speaker) = speaker.as_ref() {
-                                        speaker.push_frame(pcm);
+                                        speaker.push_frame(ssrc, pcm);
                                     } else {
                                         tracing::warn!("voice: decoded audio but no speaker available");
                                     }
@@ -511,6 +574,10 @@ impl VoiceGateway {
                     if mic_frame_count % 50 == 0 {
                         tracing::info!("voice: sent {mic_frame_count} mic frames so far");
                     }
+                    if speaking_activity.insert(self.user_id.clone(), Instant::now()).is_none() {
+                        let local_ssrc = rtc.as_ref().map(|r| r.audio_ssrc()).unwrap_or_default();
+                        let _ = tx.send(VoiceGatewayEvent::Speaking { ssrc: local_ssrc, user_id: Some(self.user_id.clone()), speaking: true });
+                    }
                     match codec.encode(&pcm_frame) {
                         Ok(opus_payload) => {
                             let outgoing_payload = if dave_enabled {
@@ -528,6 +595,7 @@ impl VoiceGateway {
                                 if mic_frame_count == 1 || mic_frame_count % 100 == 0 {
                                     tracing::info!("voice: submitting {} byte Opus frame to RTC, DAVE enabled={dave_enabled}", outgoing_payload.len());
                                 }
+                                bytes_sent += outgoing_payload.len() as u64;
                                 if let Err(e) = active_rtc.send_audio_frame(&outgoing_payload) {
                                     tracing::warn!("voice: failed to send audio frame: {e}");
                                 }
