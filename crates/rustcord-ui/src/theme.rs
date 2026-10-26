@@ -7,6 +7,10 @@ pub struct Theme {
     pub background: [f32; 4],
     pub panel: [f32; 4],
     pub text: [f32; 4],
+    #[serde(default = "default_servers_bg")]
+    pub servers_bg: [f32; 4],
+    #[serde(default = "default_user_bar_bg")]
+    pub user_bar_bg: [f32; 4],
     pub text_muted: [f32; 4],
     pub accent: [f32; 4],
     pub accent_hover: [f32; 4],
@@ -15,17 +19,22 @@ pub struct Theme {
     pub gradient: Option<[[f32; 4]; 2]>,
 }
 
+fn default_servers_bg() -> [f32; 4] { [0.125, 0.133, 0.145, 1.0] } // #202225
+fn default_user_bar_bg() -> [f32; 4] { [0.161, 0.169, 0.184, 1.0] } // #292b2f
+
 impl Default for Theme {
     fn default() -> Self {
         Self {
             name: "discord-dark".into(),
-            background: [0.13, 0.14, 0.16, 1.0],
-            panel: [0.17, 0.18, 0.20, 1.0],
-            text: [0.90, 0.90, 0.92, 1.0],
-            text_muted: [0.60, 0.62, 0.66, 1.0],
-            accent: [0.35, 0.40, 0.95, 1.0],
-            accent_hover: [0.45, 0.50, 1.0, 1.0],
-            border: [0.08, 0.09, 0.10, 1.0],
+            background: [0.212, 0.224, 0.247, 1.0],
+            panel: [0.184, 0.192, 0.212, 1.0],
+            servers_bg: default_servers_bg(),
+            user_bar_bg: default_user_bar_bg(),
+            text: [0.863, 0.867, 0.871, 1.0],        
+            text_muted: [0.584, 0.612, 0.639, 1.0],  
+            accent: [0.345, 0.396, 0.949, 1.0],      
+            accent_hover: [0.278, 0.322, 0.816, 1.0],
+            border: [0.133, 0.141, 0.153, 1.0],  
             gradient: None,
         }
     }
@@ -69,6 +78,26 @@ impl Theme {
         style[FrameBg] = self.panel;
         style[FrameBgHovered] = self.accent;
         style[FrameBgActive] = self.accent_hover;
+
+        style[ScrollbarGrabHovered] = self.border;
+        style[ScrollbarGrabActive] = self.panel;
+
+        style.window_border_size = 0.0;
+        style.child_border_size = 0.0;
+        style.popup_border_size = 1.0;
+        style.frame_border_size = 0.0;
+
+        style.frame_rounding = 6.0;
+        style.popup_rounding = 8.0;
+        style.scrollbar_rounding = 8.0;
+        style.grab_rounding = 4.0;
+
+        style.window_padding = [12.0, 12.0];
+        style.frame_padding = [10.0, 8.0];
+        style.item_spacing = [8.0, 8.0];
+        
+        // Scrollbar sottile stile Discord
+        style.scrollbar_size = 10.0;
     }
 
     pub fn themes_dir() -> Option<PathBuf> {
