@@ -12,7 +12,7 @@ pub const CHANNELS: u16 = 1;
 pub const FRAME_SAMPLES: usize = 960;
 
 fn low_latency_buffer_size() -> cpal::BufferSize {
-    cpal::BufferSize::Fixed(FRAME_SAMPLES as u32)
+    cpal::BufferSize::Fixed(FRAME_SAMPLES as u32 * 2)
 }
 
 fn audio_host() -> cpal::Host {
@@ -45,6 +45,10 @@ impl MicCapture {
         let muted_cb = muted.clone();
         let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
 
+        const GATE_THRESHOLD: i64 = 200;
+        const GATE_HANG_FRAMES: u32 = 15;
+        let mut gate_hang_remaining: u32 = 0;
+
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: input stream error: {e}");
         let stream = device
             .build_input_stream(
@@ -56,6 +60,15 @@ impl MicCapture {
                     pending.extend_from_slice(data);
                     while pending.len() >= FRAME_SAMPLES {
                         let frame: Vec<i16> = pending.drain(..FRAME_SAMPLES).collect();
+                        let sum_sq: i64 = frame.iter().map(|&s| (s as i64) * (s as i64)).sum();
+                        let rms = ((sum_sq / frame.len() as i64) as f64).sqrt() as i64;
+                        if rms >= GATE_THRESHOLD {
+                            gate_hang_remaining = GATE_HANG_FRAMES;
+                        } else if gate_hang_remaining > 0 {
+                            gate_hang_remaining -= 1;
+                        } else {
+                            continue;
+                        }
                         on_frame(frame);
                     }
                 },
