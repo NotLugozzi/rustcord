@@ -924,8 +924,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 _ => true,
                             };
 
-                        let row_start = ui.cursor_pos();
-                        let row_screen_start = ui.cursor_screen_pos();
+                        let mut row_start = ui.cursor_pos();
+                        let mut row_screen_start = ui.cursor_screen_pos();
+
+                        row_start[0] += 24.0;
+                        row_screen_start[0] += 24.0;
+
                         let mut content_top = row_start[1];
 
                         if let Some(replied) = &msg.referenced_message {
