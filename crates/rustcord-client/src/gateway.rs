@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Guild, MergedPresences, Message, Presence, User};
+use crate::models::{Guild, MergedPresences, Message, Presence, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +23,9 @@ pub enum GatewayEvent {
     PresenceUpdate(Presence),
     MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String> },
     MessageDelete { channel_id: String, id: String },
+    VoiceStateUpdate(VoiceState),
+    VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
+    InitialVoiceStates(Vec<VoiceState>),
     Unknown { op_name: String, raw: Value },
 }
 
@@ -39,7 +42,10 @@ struct Identify<'a> {
     token: &'a str,
     properties: IdentifyProperties,
     intents: Option<u64>,
+    capabilities: u64,
 }
+
+const CAPABILITY_PRIORITIZED_READY_PAYLOAD: u64 = 1 << 5;
 
 #[derive(Serialize)]
 struct IdentifyProperties {
@@ -57,6 +63,19 @@ struct Resume<'a> {
 
 pub fn presence_frame(status: &str, activities: &[Value]) -> String {
     json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
+}
+
+pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>, self_mute: bool, self_deaf: bool) -> String {
+    json!({
+        "op": 4,
+        "d": {
+            "guild_id": guild_id,
+            "channel_id": channel_id,
+            "self_mute": self_mute,
+            "self_deaf": self_deaf,
+        }
+    })
+    .to_string()
 }
 
 #[derive(Default)]
@@ -130,10 +149,11 @@ impl Gateway {
                     token: &self.token,
                     properties: IdentifyProperties {
                         os: "Windows",
-                        browser: "Chrome",
-                        device: "",
+                        browser: "Discord Client",
+                        device: "Discord Client",
                     },
                     intents: None,
+                    capabilities: CAPABILITY_PRIORITIZED_READY_PAYLOAD,
                 };
                 let identify_payload = json!({ "op": 2, "d": identify });
                 write.send(WsMessage::Text(identify_payload.to_string())).await?;
@@ -248,6 +268,11 @@ impl Gateway {
             Some("READY") => {
                 let user: User = serde_json::from_value(data["user"].clone())?;
                 let guilds: Vec<Guild> = serde_json::from_value(data["guilds"].clone())?;
+                let voice_states = parse_initial_voice_states(data.get("guilds"));
+                tracing::info!("READY supplied {} initial voice states", voice_states.len());
+                if !voice_states.is_empty() {
+                    let _ = tx.send(GatewayEvent::InitialVoiceStates(voice_states));
+                }
                 let mut friend_presences = parse_presence_list(data.get("presences"));
                 match data.get("merged_presences") {
                     Some(v) => {
@@ -268,6 +293,13 @@ impl Gateway {
                     presences.extend(parse_merged_presences(merged));
                 }
                 deduplicate_presences(&mut presences);
+
+                let voice_states = parse_initial_voice_states(data.get("guilds"));
+                tracing::info!("READY_SUPPLEMENTAL supplied {} initial voice states", voice_states.len());
+                if !voice_states.is_empty() {
+                    let _ = tx.send(GatewayEvent::InitialVoiceStates(voice_states));
+                }
+
                 GatewayEvent::Presences(presences)
             }
             Some("MESSAGE_CREATE") => {
@@ -296,12 +328,43 @@ impl Gateway {
                 let presence: Presence = serde_json::from_value(data)?;
                 GatewayEvent::PresenceUpdate(presence)
             }
+            Some("VOICE_STATE_UPDATE") => {
+                let voice_state: VoiceState = serde_json::from_value(data)?;
+                GatewayEvent::VoiceStateUpdate(voice_state)
+            }
+            Some("VOICE_SERVER_UPDATE") => GatewayEvent::VoiceServerUpdate {
+                token: data["token"].as_str().unwrap_or_default().to_string(),
+                guild_id: data["guild_id"].as_str().unwrap_or_default().to_string(),
+                endpoint: data["endpoint"].as_str().map(str::to_string),
+            },
             Some(other) => GatewayEvent::Unknown { op_name: other.to_string(), raw: data },
             None => return Ok(()),
         };
         let _ = tx.send(event);
         Ok(())
     }
+}
+
+fn parse_initial_voice_states(guilds: Option<&Value>) -> Vec<VoiceState> {
+    let mut voice_states = Vec::new();
+    let Some(guilds) = guilds.and_then(Value::as_array) else { return voice_states };
+    for guild in guilds {
+        let guild_id = guild.get("id").and_then(Value::as_str);
+        let Some(states) = guild.get("voice_states").and_then(Value::as_array) else { continue };
+        for state in states {
+            let mut state = state.clone();
+            if state.get("guild_id").and_then(Value::as_str).is_none() {
+                if let (Some(guild_id), Some(object)) = (guild_id, state.as_object_mut()) {
+                    object.insert("guild_id".to_string(), Value::String(guild_id.to_string()));
+                }
+            }
+            match serde_json::from_value::<VoiceState>(state) {
+                Ok(state) => voice_states.push(state),
+                Err(error) => tracing::debug!("skipping malformed initial voice state: {error}"),
+            }
+        }
+    }
+    voice_states
 }
 
 fn frame_is_resumable(reason: &str) -> bool {

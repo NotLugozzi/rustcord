@@ -26,10 +26,11 @@ Use at your own risk.
 - [x] Typing indicators (send + receive)
 - [x] Real avatars (users) and guild icons
 - [x] User bar with settings dialog (account info, logout, theme switcher)
+- [x] Server Calls
+- [x] Message editing/deleting, reactions
+- [x] Custom emote rendering/sending
 - [ ] Per-channel permission filtering (all guild channels show regardless of your actual access)
-- [ ] Custom emote rendering/sending
 - [ ] Voice calls (not yet implemented)
-- [ ] Message editing/deleting, reactions
 - [ ] Non-image attachments/embeds rendering
 - [ ] Guild folders
 

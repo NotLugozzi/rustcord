@@ -1,0 +1,606 @@
+use openmls_traits::{crypto::OpenMlsCrypto, signatures::Signer, types::Ciphersuite};
+use tls_codec::Serialize;
+
+#[cfg(feature = "extensions-draft")]
+use crate::schedule::application_export_tree::ApplicationExportTree;
+use crate::{
+    binary_tree::{array_representation::TreeSize, LeafNodeIndex},
+    credentials::CredentialWithKey,
+    error::LibraryError,
+    extensions::Extensions,
+    group::{
+        config::PastEpochDeletionPolicy, past_secrets::MessageSecretsStore,
+        public_group::errors::PublicGroupBuildError, GroupContext, GroupId, MlsGroup,
+        MlsGroupCreateConfig, MlsGroupCreateConfigBuilder, MlsGroupState, NewGroupError,
+        PublicGroup, WireFormatPolicy,
+    },
+    key_packages::Lifetime,
+    schedule::{
+        psk::{load_psks, store::ResumptionPskStore, PskSecret},
+        EpochSecretsResult, InitSecret, JoinerSecret, KeySchedule, PreSharedKeyId,
+    },
+    storage::OpenMlsProvider,
+    tree::sender_ratchet::SenderRatchetConfiguration,
+    treesync::{
+        errors::LeafNodeValidationError,
+        node::leaf_node::{Capabilities, LeafNode},
+    },
+};
+
+/// Builder struct for an [`MlsGroup`].
+#[derive(Default, Debug)]
+pub struct MlsGroupBuilder {
+    group_id: Option<GroupId>,
+    mls_group_create_config_builder: MlsGroupCreateConfigBuilder,
+    replace_old_group: bool,
+    psk_ids: Vec<PreSharedKeyId>,
+    creator_key_package: Option<crate::key_packages::KeyPackageBundle>,
+    #[cfg(feature = "virtual-clients-draft")]
+    vc_epoch_id: Option<crate::components::vc_derivation_info::EpochId>,
+}
+
+impl MlsGroupBuilder {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the group ID of the [`MlsGroup`].
+    pub fn with_group_id(mut self, group_id: GroupId) -> Self {
+        self.group_id = Some(group_id);
+        self
+    }
+
+    /// Use the supplied key package's leaf node as the creator's leaf.
+    pub fn with_creator_key_package(
+        mut self,
+        key_package: crate::key_packages::KeyPackageBundle,
+    ) -> Self {
+        self.creator_key_package = Some(key_package);
+        self
+    }
+
+    /// Create the group as a virtual client on the emulation epoch `epoch_id`.
+    ///
+    /// The creator's leaf is `key_package`-sourced and its key material is
+    /// derived from a fresh `key_package` operation secret of that epoch (so
+    /// sibling emulator clients can reconstruct it), and the epoch-0
+    /// `epoch_secret` is derived from the same KeyPackage seed rather than
+    /// transmitted. Siblings bootstrap into the group with
+    /// [`MlsGroup::vc_join_at_creation`].
+    ///
+    /// [`MlsGroup::vc_join_at_creation`]: crate::group::MlsGroup::vc_join_at_creation
+    #[cfg(feature = "virtual-clients-draft")]
+    pub fn vc_emulation(
+        mut self,
+        epoch_id: crate::components::vc_derivation_info::EpochId,
+    ) -> Self {
+        self.vc_epoch_id = Some(epoch_id);
+        self
+    }
+
+    /// Instruct the builder to replace any existing group with the same ID.
+    pub fn replace_old_group(mut self) -> Self {
+        self.replace_old_group = true;
+        self
+    }
+
+    /// Build a new group as configured by this builder.
+    pub fn build<Provider: OpenMlsProvider>(
+        self,
+        provider: &Provider,
+        signer: &impl Signer,
+        credential_with_key: CredentialWithKey,
+    ) -> Result<MlsGroup, NewGroupError<Provider::StorageError>> {
+        self.build_internal(provider, signer, credential_with_key, None)
+    }
+
+    /// Build a new group with the given group ID.
+    ///
+    /// If an [`MlsGroupCreateConfig`] is provided, it will be used to configure the
+    /// group. Otherwise, the internal builder is used to build one with the
+    /// parameters set on this builder.
+    ///
+    /// If a group with the same ID already exists in storage and
+    /// `replace_old_group` was not set, an error will be returned.
+    pub(super) fn build_internal<Provider: OpenMlsProvider>(
+        mut self,
+        provider: &Provider,
+        signer: &impl Signer,
+        credential_with_key: CredentialWithKey,
+        mls_group_create_config_option: Option<MlsGroupCreateConfig>,
+    ) -> Result<MlsGroup, NewGroupError<Provider::StorageError>> {
+        let mls_group_create_config = mls_group_create_config_option
+            .unwrap_or_else(|| self.mls_group_create_config_builder.build());
+        let group_id = self
+            .group_id
+            .unwrap_or_else(|| GroupId::random(provider.rand()));
+        let ciphersuite = mls_group_create_config.ciphersuite;
+
+        provider
+            .crypto()
+            .supports(ciphersuite)
+            .map_err(|_| NewGroupError::UnsupportedCiphersuite(ciphersuite))?;
+
+        #[cfg(feature = "virtual-clients-draft")]
+        if let Some(epoch_id) = self.vc_epoch_id.clone() {
+            return build_vc_internal(
+                provider,
+                signer,
+                credential_with_key,
+                mls_group_create_config,
+                group_id,
+                self.replace_old_group,
+                epoch_id,
+            );
+        }
+
+        if !self.replace_old_group
+            && MlsGroup::load(provider.storage(), &group_id)
+                .map_err(NewGroupError::StorageError)?
+                .is_some()
+        {
+            return Err(NewGroupError::GroupAlreadyExists);
+        }
+
+        let mut public_group = PublicGroup::builder(group_id, ciphersuite, credential_with_key)
+            .with_group_context_extensions(
+                mls_group_create_config.group_context_extensions.clone(),
+            )
+            .with_leaf_node_extensions(mls_group_create_config.leaf_node_extensions.clone())
+            .with_lifetime(*mls_group_create_config.lifetime())
+            .with_capabilities(mls_group_create_config.capabilities.clone());
+        if let Some(key_package) = self.creator_key_package.take() {
+            public_group = public_group.with_key_package_bundle(key_package);
+        }
+        let (public_group_builder, commit_secret, leaf_keypair) = public_group
+                .get_secrets(provider, signer)
+                .map_err(|e| match e {
+                    PublicGroupBuildError::LibraryError(e) => NewGroupError::LibraryError(e),
+                    PublicGroupBuildError::InvalidExtensions(e) => e.into(),
+                })?;
+
+        let serialized_group_context = public_group_builder
+            .group_context()
+            .tls_serialize_detached()
+            .map_err(LibraryError::missing_bound_check)?;
+
+        // Derive an initial joiner secret based on the commit secret.
+        // Derive an epoch secret from the joiner secret.
+        // We use a random `InitSecret` for initialization.
+        let joiner_secret = JoinerSecret::new(
+            provider.crypto(),
+            ciphersuite,
+            commit_secret,
+            &InitSecret::random(ciphersuite, provider.rand())
+                .map_err(LibraryError::unexpected_crypto_error)?,
+            &serialized_group_context,
+        )
+        .map_err(LibraryError::unexpected_crypto_error)?;
+
+        // TODO(#1357)
+        let mut resumption_psk_store = ResumptionPskStore::new(32);
+
+        // Prepare the PskSecret
+        let psk_secret = load_psks(provider.storage(), &resumption_psk_store, &self.psk_ids)
+            .and_then(|psks| PskSecret::new(provider.crypto(), ciphersuite, psks))
+            .map_err(|e| {
+                log::debug!("Unexpected PSK error: {e:?}");
+                LibraryError::custom("Unexpected PSK error")
+            })?;
+
+        let mut key_schedule =
+            KeySchedule::init(ciphersuite, provider.crypto(), &joiner_secret, psk_secret)?;
+        key_schedule
+            .add_context(provider.crypto(), &serialized_group_context)
+            .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+
+        let EpochSecretsResult {
+            epoch_secrets,
+            #[cfg(feature = "extensions-draft")]
+            application_exporter,
+        } = key_schedule
+            .epoch_secrets(provider.crypto(), ciphersuite)
+            .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+
+        let (group_epoch_secrets, message_secrets) = epoch_secrets.split_secrets(
+            serialized_group_context,
+            TreeSize::new(1),
+            LeafNodeIndex::new(0u32),
+        );
+
+        let initial_confirmation_tag = message_secrets
+            .confirmation_key()
+            .tag(provider.crypto(), ciphersuite, &[])
+            .map_err(LibraryError::unexpected_crypto_error)?;
+
+        let message_secrets_store = MessageSecretsStore::new_with_secret(
+            mls_group_create_config
+                .join_config
+                .past_epoch_deletion_policy(),
+            message_secrets,
+        );
+
+        let public_group = public_group_builder
+            .with_confirmation_tag(initial_confirmation_tag)
+            .build(provider.crypto())?;
+
+        // We already add a resumption PSK for epoch 0 to make things more unified.
+        let resumption_psk = group_epoch_secrets.resumption_psk();
+        resumption_psk_store.add(public_group.group_context().epoch(), resumption_psk.clone());
+
+        #[cfg(feature = "extensions-draft")]
+        let application_export_tree = ApplicationExportTree::new(application_exporter);
+
+        let mls_group = MlsGroup {
+            mls_group_config: mls_group_create_config.join_config.clone(),
+            own_leaf_nodes: vec![],
+            aad: vec![],
+            #[cfg(feature = "extensions-draft")]
+            safe_aad: crate::framing::SafeAad::empty(),
+            group_state: MlsGroupState::Operational,
+            public_group,
+            group_epoch_secrets,
+            own_leaf_index: LeafNodeIndex::new(0),
+            message_secrets_store,
+            resumption_psk_store,
+            #[cfg(feature = "extensions-draft")]
+            application_export_tree: Some(application_export_tree),
+        };
+
+        mls_group
+            .store(provider.storage())
+            .map_err(NewGroupError::StorageError)?;
+        mls_group
+            .store_epoch_keypairs(provider.storage(), &[leaf_keypair])
+            .map_err(NewGroupError::StorageError)?;
+
+        Ok(mls_group)
+    }
+
+    // MlsGroupCreateConfigBuilder options
+
+    /// Sets the `wire_format` property of the MlsGroup.
+    pub fn with_wire_format_policy(mut self, wire_format_policy: WireFormatPolicy) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .wire_format_policy(wire_format_policy);
+        self
+    }
+
+    /// Sets the `padding_size` property of the MlsGroup.
+    pub fn padding_size(mut self, padding_size: usize) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .padding_size(padding_size);
+        self
+    }
+
+    /// Sets the `max_past_epochs` property of the MlsGroup.
+    /// This allows application messages from previous epochs to be decrypted.
+    ///
+    /// This method overrides the policy set by [`Self::set_past_epoch_deletion_policy()`],
+    /// and is equivalent to setting the past epoch deletion policy to
+    /// `PastEpochDeletionPolicy::MaxEpochs(max_past_epochs)`.
+    ///
+    /// **WARNING**
+    ///
+    ///
+    /// This feature enables the storage of message secrets from past epochs.
+    /// It is a trade-off between functionality and forward secrecy and should only be enabled
+    /// if the Delivery Service cannot guarantee that application messages will be sent in
+    /// the same epoch in which they were generated. The number for `max_epochs` should be
+    /// as low as possible.
+    ///
+    /// NOTE: This function will be deprecated in future releases.
+    pub fn max_past_epochs(mut self, max_past_epochs: usize) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .max_past_epochs(max_past_epochs);
+        self
+    }
+
+    /// Set the policy for deleting past epoch secrets.
+    ///
+    /// By default, storage of past epoch secrets is disabled.
+    ///
+    /// This method overrides the configuration set by [`Self::max_past_epochs()`].
+    ///
+    /// **WARNING**
+    ///
+    /// This feature enables the storage of message secrets from past epochs.
+    /// It is a trade-off between functionality and forward secrecy and should only be enabled
+    /// if the Delivery Service cannot guarantee that application messages will be sent in
+    /// the same epoch in which they were generated. The number for `max_epochs` should be
+    /// as low as possible.
+    pub fn set_past_epoch_deletion_policy(mut self, policy: PastEpochDeletionPolicy) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .set_past_epoch_deletion_policy(policy);
+        self
+    }
+
+    /// Sets the `number_of_resumption_psks` property of the MlsGroup.
+    pub fn number_of_resumption_psks(mut self, number_of_resumption_psks: usize) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .number_of_resumption_psks(number_of_resumption_psks);
+        self
+    }
+
+    /// Sets the `use_ratchet_tree_extension` property of the MlsGroup.
+    pub fn use_ratchet_tree_extension(mut self, use_ratchet_tree_extension: bool) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .use_ratchet_tree_extension(use_ratchet_tree_extension);
+        self
+    }
+
+    /// Sets the `sender_ratchet_configuration` property of the MlsGroup.
+    /// See [`SenderRatchetConfiguration`] for more information.
+    pub fn sender_ratchet_configuration(
+        mut self,
+        sender_ratchet_configuration: SenderRatchetConfiguration,
+    ) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .sender_ratchet_configuration(sender_ratchet_configuration);
+        self
+    }
+
+    /// Sets the `lifetime` of the group creator's leaf.
+    pub fn lifetime(mut self, lifetime: Lifetime) -> Self {
+        self.mls_group_create_config_builder =
+            self.mls_group_create_config_builder.lifetime(lifetime);
+        self
+    }
+
+    /// Sets the `ciphersuite` of the MlsGroup.
+    pub fn ciphersuite(mut self, ciphersuite: Ciphersuite) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .ciphersuite(ciphersuite);
+        self
+    }
+
+    /// Sets the initial group context extensions
+    pub fn with_group_context_extensions(mut self, extensions: Extensions<GroupContext>) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .with_group_context_extensions(extensions);
+        self
+    }
+
+    /// Sets the initial leaf node extensions
+    pub fn with_leaf_node_extensions(
+        mut self,
+        extensions: Extensions<LeafNode>,
+    ) -> Result<Self, LeafNodeValidationError> {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .with_leaf_node_extensions(extensions)?;
+        Ok(self)
+    }
+
+    /// Sets the group creator's [`Capabilities`]
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.mls_group_create_config_builder = self
+            .mls_group_create_config_builder
+            .capabilities(capabilities);
+        self
+    }
+}
+
+/// Create a new group with the virtual client as the creator (epoch 0, single
+/// leaf).
+///
+/// The creator's leaf is `key_package`-sourced and its key material is derived
+/// from a fresh `key_package` operation secret of the emulation epoch
+/// `epoch_id` (batch index 0). The epoch-0 `epoch_secret` is derived from the
+/// same KeyPackage seed under the created group's ciphersuite. A sibling
+/// emulator client reconstructs this exact state with
+/// [`MlsGroup::vc_join_at_creation`]: it shares the operation secret tree, so it
+/// rederives the same seed and hence the same epoch secret without any secret
+/// travelling on the wire. Because the `epoch_secret` is derived rather than run
+/// through the joiner key schedule, this path bypasses it entirely.
+///
+/// [`MlsGroup::vc_join_at_creation`]: crate::group::MlsGroup::vc_join_at_creation
+#[cfg(feature = "virtual-clients-draft")]
+#[allow(clippy::too_many_arguments)]
+fn build_vc_internal<Provider: OpenMlsProvider>(
+    provider: &Provider,
+    signer: &impl Signer,
+    credential_with_key: CredentialWithKey,
+    mls_group_create_config: MlsGroupCreateConfig,
+    group_id: GroupId,
+    replace_old_group: bool,
+    epoch_id: crate::components::vc_derivation_info::EpochId,
+) -> Result<MlsGroup, NewGroupError<Provider::StorageError>> {
+    use openmls_traits::storage::StorageProvider as _;
+
+    use crate::{
+        components::vc_derivation_info::{
+            load_vc_epoch_state_and_tree, DerivationInfo, DerivationInfoTbe,
+            VirtualClientOperationType, VirtualClientsError,
+        },
+        schedule::EpochSecrets,
+        treesync::TreeSync,
+    };
+
+    if !replace_old_group
+        && MlsGroup::load(provider.storage(), &group_id)
+            .map_err(NewGroupError::StorageError)?
+            .is_some()
+    {
+        return Err(NewGroupError::GroupAlreadyExists);
+    }
+
+    let ciphersuite = mls_group_create_config.ciphersuite;
+    let capabilities = mls_group_create_config.capabilities.clone();
+
+    // Validate that the creator's leaf declares `AppDataDictionary` and lists
+    // `VC_COMPONENT_ID` before allocating a generation, so a deterministic
+    // precondition failure does not burn an operation secret.
+    let resolved_dictionary = crate::components::vc_derivation_info::resolve_vc_leaf_dictionary(
+        Some(&capabilities),
+        Some(&mls_group_create_config.leaf_node_extensions),
+        None,
+    )?;
+
+    // Load the emulation epoch state and operation tree, allocate a fresh
+    // `key_package` generation (empty operation context, matching the KeyPackage
+    // batch path), and persist the advanced tree right away. A retried creation
+    // consumes a fresh generation.
+    let (state, mut operation_tree) = load_vc_epoch_state_and_tree(provider, &epoch_id)?;
+    let (emulation_leaf_index, epoch_encryption_key, emulation_ciphersuite) = state.into_parts();
+    let (generation, operation_secret) = operation_tree.next_operation_secret(
+        provider.crypto(),
+        emulation_ciphersuite,
+        &epoch_id,
+        emulation_leaf_index,
+        VirtualClientOperationType::KeyPackage,
+        b"",
+    )?;
+    provider
+        .storage()
+        .write_vc_operation_tree(&epoch_id, &operation_tree)
+        .map_err(NewGroupError::StorageError)?;
+
+    // The creator batch consists of this single derivation and is closed
+    // immediately: no `KeyPackageUpload` is sent and no
+    // `RetainedKeyPackageMaterial` is written, because a creator leaf has no
+    // KeyPackage / KeyPackageRef. Import the per-KeyPackage seed (index 0) under
+    // the created group's ciphersuite, then derive the creator leaf's encryption
+    // keypair and the epoch-0 secret from that seed.
+    let key_package_index = 0;
+    let key_package_seed = operation_secret.derive_key_package_seed_secret(
+        provider.crypto(),
+        ciphersuite,
+        key_package_index,
+    )?;
+    let leaf_encryption_keypair = key_package_seed
+        .derive_encryption_key_secret(provider.crypto(), ciphersuite)?
+        .generate_encryption_key_pair(provider.crypto(), ciphersuite)?;
+    let epoch_secret =
+        key_package_seed.derive_group_creation_secret(provider.crypto(), ciphersuite)?;
+
+    // Wrap the derivation info under the per-epoch AEAD key, bound to the leaf
+    // via its serialized encryption key.
+    let leaf_encryption_key = leaf_encryption_keypair
+        .public_key()
+        .tls_serialize_detached()
+        .map_err(VirtualClientsError::from)?;
+    let tbe = DerivationInfoTbe::KeyPackage {
+        leaf_index: emulation_leaf_index,
+        generation,
+        key_package_index,
+    };
+    let derivation_info = DerivationInfo::encrypt(
+        provider.crypto(),
+        emulation_ciphersuite,
+        &epoch_encryption_key,
+        epoch_id.clone(),
+        &leaf_encryption_key,
+        &tbe,
+    )?;
+    let derivation_info_bytes = derivation_info
+        .tls_serialize_detached()
+        .map_err(VirtualClientsError::from)?;
+    let leaf_extensions = crate::components::vc_derivation_info::merge_vc_derivation_info(
+        Some(&mls_group_create_config.leaf_node_extensions),
+        resolved_dictionary,
+        derivation_info_bytes,
+    )?;
+
+    // Build the single-leaf tree with the derived key_package-sourced leaf.
+    let (treesync, leaf_keypair) = TreeSync::new_vc(
+        provider,
+        signer,
+        ciphersuite,
+        credential_with_key,
+        *mls_group_create_config.lifetime(),
+        capabilities,
+        leaf_extensions,
+        leaf_encryption_keypair,
+    )?;
+    let group_context = GroupContext::create_initial_group_context(
+        ciphersuite,
+        group_id.clone(),
+        treesync.tree_hash().to_vec(),
+        mls_group_create_config.group_context_extensions.clone(),
+    );
+    let serialized_group_context = group_context
+        .tls_serialize_detached()
+        .map_err(LibraryError::missing_bound_check)?;
+
+    // Derive epoch-0 secrets from the epoch secret derived above.
+    let epoch_secrets =
+        EpochSecrets::from_epoch_secret(provider.crypto(), ciphersuite, epoch_secret)
+            .map_err(LibraryError::unexpected_crypto_error)?;
+    let (group_epoch_secrets, message_secrets) = epoch_secrets.split_secrets(
+        serialized_group_context,
+        TreeSize::new(1),
+        LeafNodeIndex::new(0),
+    );
+    let initial_confirmation_tag = message_secrets
+        .confirmation_key()
+        .tag(provider.crypto(), ciphersuite, &[])
+        .map_err(LibraryError::unexpected_crypto_error)?;
+    let message_secrets_store = MessageSecretsStore::new_with_secret(
+        mls_group_create_config
+            .join_config
+            .past_epoch_deletion_policy(),
+        message_secrets,
+    );
+    let public_group = PublicGroup::new(
+        provider.crypto(),
+        treesync,
+        group_context,
+        initial_confirmation_tag,
+    )?;
+
+    let mut resumption_psk_store = ResumptionPskStore::new(32);
+    let resumption_psk = group_epoch_secrets.resumption_psk();
+    resumption_psk_store.add(public_group.group_context().epoch(), resumption_psk.clone());
+
+    let mls_group = MlsGroup {
+        mls_group_config: mls_group_create_config.join_config.clone(),
+        own_leaf_nodes: vec![],
+        aad: vec![],
+        safe_aad: crate::framing::SafeAad::empty(),
+        group_state: MlsGroupState::Operational,
+        public_group,
+        group_epoch_secrets,
+        own_leaf_index: LeafNodeIndex::new(0),
+        message_secrets_store,
+        resumption_psk_store,
+        // Reconstructed VC groups do not populate the application export tree,
+        // matching the other VC group-entry paths.
+        application_export_tree: None,
+    };
+
+    // Bind epoch 0 of the new group to the emulation epoch so later VC
+    // operations in this group resolve the right emulation state. Written before
+    // the group itself, so an error between the writes cannot leave a loadable
+    // group without a binding (a bound group is required for the reuse-guard
+    // MUST).
+    let mut bindings: crate::components::vc_derivation_info::VcEmulationBindings = provider
+        .storage()
+        .vc_emulation_bindings(&group_id)
+        .map_err(NewGroupError::StorageError)?
+        .unwrap_or_default();
+    let max_entries = mls_group.message_secrets_store.max_epochs.saturating_add(1);
+    bindings.insert(mls_group.epoch(), epoch_id, max_entries);
+    provider
+        .storage()
+        .write_vc_emulation_bindings(&group_id, &bindings)
+        .map_err(NewGroupError::StorageError)?;
+
+    mls_group
+        .store(provider.storage())
+        .map_err(NewGroupError::StorageError)?;
+    mls_group
+        .store_epoch_keypairs(provider.storage(), &[leaf_keypair])
+        .map_err(NewGroupError::StorageError)?;
+
+    Ok(mls_group)
+}

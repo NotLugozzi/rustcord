@@ -1,0 +1,82 @@
+//! # Key Package errors
+//!
+//! `KeyPackageError` are thrown on errors handling `KeyPackage`s.
+
+use openmls_traits::types::Ciphersuite;
+use thiserror::Error;
+
+use crate::{
+    ciphersuite::signable::SignatureError, error::LibraryError,
+    prelude::ExtensionTypeNotValidInKeyPackageError, treesync::errors::LifetimeError,
+};
+
+/// KeyPackage verify error
+#[derive(Error, Debug, PartialEq, Clone)]
+pub enum KeyPackageVerifyError {
+    /// See [`LibraryError`] for more details.
+    #[error(transparent)]
+    LibraryError(#[from] LibraryError),
+    /// See [`LifetimeError`] for more details.
+    #[error(transparent)]
+    LifetimeError(#[from] LifetimeError),
+    /// The lifetime of the leaf node is missing.
+    #[error("The lifetime of the leaf node is missing.")]
+    MissingLifetime,
+    /// A key package extension is not supported in the leaf's capabilities.
+    #[error("A key package extension is not supported in the leaf's capabilities.")]
+    UnsupportedExtension,
+    /// The key package signature is not valid.
+    #[error("The key package signature is not valid.")]
+    InvalidSignature,
+    /// The leaf node signature is not valid.
+    #[error("The leaf node signature is not valid.")]
+    InvalidLeafNodeSignature,
+    /// Invalid LeafNode source type
+    #[error("Invalid LeafNode source type")]
+    InvalidLeafNodeSourceType,
+    /// The init key and the encryption key are equal.
+    #[error("The init key and the encryption key are equal.")]
+    InitKeyEqualsEncryptionKey,
+    /// The protocol version is not valid.
+    #[error("The protocol version is not valid.")]
+    InvalidProtocolVersion,
+    /// The provided extension is not allowed in key packages
+    #[error(transparent)]
+    ExtensionTypeNotValidInKeyPackage(#[from] ExtensionTypeNotValidInKeyPackageError),
+}
+
+/// KeyPackage extension support error
+#[derive(Error, Debug, PartialEq, Eq, Clone)]
+pub enum KeyPackageExtensionSupportError {
+    /// The key package does not support all required extensions.
+    #[error("The key package does not support all required extensions.")]
+    UnsupportedExtension,
+}
+
+/// KeyPackage new error
+#[derive(Error, Debug, PartialEq, Clone)]
+pub enum KeyPackageNewError {
+    /// See [`LibraryError`] for more details.
+    #[error(transparent)]
+    LibraryError(#[from] LibraryError),
+    /// The ciphersuite does not match the signature scheme.
+    #[error("The ciphersuite does not match the signature scheme.")]
+    CiphersuiteSignatureSchemeMismatch,
+    /// The ciphersuite is not supported by the crypto provider.
+    #[error("Ciphersuite {0:?} is not supported by the crypto provider.")]
+    UnsupportedCiphersuite(Ciphersuite),
+    /// Accessing storage failed.
+    #[error("Accessing storage failed.")]
+    StorageError,
+    /// See [`SignatureError`] for more details.
+    #[error(transparent)]
+    SignatureError(#[from] SignatureError),
+    /// A virtual-clients operation failed while building the key package.
+    #[cfg(feature = "virtual-clients-draft")]
+    #[error(transparent)]
+    VirtualClientsError(#[from] crate::components::vc_derivation_info::VirtualClientsError),
+    /// A virtual-clients KeyPackage batch was requested with a count of 0.
+    #[cfg(feature = "virtual-clients-draft")]
+    #[error("A virtual-clients KeyPackage batch must request at least one KeyPackage.")]
+    EmptyBatch,
+}

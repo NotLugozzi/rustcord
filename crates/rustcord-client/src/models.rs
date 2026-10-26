@@ -31,16 +31,103 @@ pub struct Emoji {
     pub animated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]
-#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelType {
-    GuildText = 0,
-    Dm = 1,
-    GuildVoice = 2,
-    GroupDm = 3,
-    GuildCategory = 4,
-    GuildAnnouncement = 5,
-    GuildStageVoice = 13,
+    GuildText,
+    Dm,
+    GuildVoice,
+    GroupDm,
+    GuildCategory,
+    GuildAnnouncement,
+    GuildAnnouncementThread,
+    GuildPublicThread,
+    GuildPrivateThread,
+    GuildStageVoice,
+    GuildDirectory,
+    GuildForum,
+    GuildMedia,
+    Unknown(u8),
+}
+
+impl<'de> Deserialize<'de> for ChannelType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match u8::deserialize(deserializer)? {
+            0 => ChannelType::GuildText,
+            1 => ChannelType::Dm,
+            2 => ChannelType::GuildVoice,
+            3 => ChannelType::GroupDm,
+            4 => ChannelType::GuildCategory,
+            5 => ChannelType::GuildAnnouncement,
+            10 => ChannelType::GuildAnnouncementThread,
+            11 => ChannelType::GuildPublicThread,
+            12 => ChannelType::GuildPrivateThread,
+            13 => ChannelType::GuildStageVoice,
+            14 => ChannelType::GuildDirectory,
+            15 => ChannelType::GuildForum,
+            16 => ChannelType::GuildMedia,
+            other => ChannelType::Unknown(other),
+        })
+    }
+}
+
+impl Serialize for ChannelType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value: u8 = match self {
+            ChannelType::GuildText => 0,
+            ChannelType::Dm => 1,
+            ChannelType::GuildVoice => 2,
+            ChannelType::GroupDm => 3,
+            ChannelType::GuildCategory => 4,
+            ChannelType::GuildAnnouncement => 5,
+            ChannelType::GuildAnnouncementThread => 10,
+            ChannelType::GuildPublicThread => 11,
+            ChannelType::GuildPrivateThread => 12,
+            ChannelType::GuildStageVoice => 13,
+            ChannelType::GuildDirectory => 14,
+            ChannelType::GuildForum => 15,
+            ChannelType::GuildMedia => 16,
+            ChannelType::Unknown(other) => *other,
+        };
+        value.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceState {
+    pub guild_id: Option<Snowflake>,
+    pub channel_id: Option<Snowflake>,
+    pub user_id: Snowflake,
+    pub session_id: String,
+    #[serde(default)]
+    pub self_mute: bool,
+    #[serde(default)]
+    pub self_deaf: bool,
+    #[serde(default)]
+    pub mute: bool,
+    #[serde(default)]
+    pub deaf: bool,
+    #[serde(default)]
+    pub member: Option<VoiceStateMember>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceStateMember {
+    pub nick: Option<String>,
+    pub user: Option<User>,
+}
+
+impl VoiceState {
+    pub fn display_name(&self) -> String {
+        if let Some(member) = &self.member {
+            if let Some(nick) = &member.nick {
+                return nick.clone();
+            }
+            if let Some(user) = &member.user {
+                return user.global_name.clone().unwrap_or_else(|| user.username.clone());
+            }
+        }
+        self.user_id.clone()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -73,6 +160,8 @@ pub struct Message {
     pub mentions: Vec<User>,
     #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
+    #[serde(default)]
+    pub embeds: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]

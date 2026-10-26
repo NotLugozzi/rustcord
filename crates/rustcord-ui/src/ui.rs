@@ -238,6 +238,8 @@ const RAIL_WIDTH: f32 = 72.0;
 const RAIL_ICON_SIZE: [f32; 2] = [48.0, 48.0];
 const RAIL_PADDING_TOP: f32 = 12.0;
 const USER_BAR_HEIGHT: f32 = 44.0;
+const VOICE_STATUS_BAR_HEIGHT: f32 = 82.0;
+const HEADER_HEIGHT: f32 = 48.0;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const SPLITTER_WIDTH: f32 = 6.0;
@@ -825,7 +827,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .no_decoration()
         .draw_background(true)
         .build(|| {
-            ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - 16.0]).build(|| {
+            let voice_bar_reserved = if state.connected_voice_channel.is_some() { VOICE_STATUS_BAR_HEIGHT } else { 0.0 };
+            ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - voice_bar_reserved - 16.0]).build(|| {
             if state.selected_guild.is_some() {
                 let groups: Vec<(Option<String>, Vec<(String, String)>)> = state
                     .grouped_channels_for_selected_guild()
@@ -856,11 +859,49 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                     }
                 }
+
+                let guild_id = state.selected_guild.clone().unwrap_or_default();
+                let voice_channels: Vec<(String, String)> = state
+                    .voice_channels_for_selected_guild()
+                    .into_iter()
+                    .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone())))
+                    .collect();
+                if !voice_channels.is_empty() {
+                    ui.spacing();
+                    let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+                    ui.text("VOICE CHANNELS");
+                    token.pop();
+                    for (channel_id, name) in &voice_channels {
+                        let is_connected = state.connected_voice_channel.as_ref() == Some(&(Some(guild_id.clone()), channel_id.clone()));
+                        let label = if is_connected { format!("[voice] {name} (connected)") } else { format!("[voice] {name}") };
+                        if ui.selectable(label) && !is_connected && !state.voice_connecting {
+                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone() });
+                            state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
+                        }
+                        for member in state.members_in_voice_channel(&guild_id, channel_id) {
+                            ui.indent();
+                            let mute_icon = if member.self_deaf { " [deafened]" } else if member.self_mute { " [muted]" } else { "" };
+                            let speaking_icon = if state.voice_speaking_users.contains(&member.user_id) { "[speaking] " } else { "" };
+                            let name = state.voice_state_display_name(member);
+                            ui.text_disabled(format!("{speaking_icon}{name}{mute_icon}"));
+                            ui.unindent();
+                        }
+                    }
+                    if state.voice_connecting {
+                        ui.text_disabled("Connecting to voice...");
+                    }
+                }
             } else {
                 draw_dm_sidebar(ui, state, cmd_tx, textures);
             }
             });
 
+            if state.connected_voice_channel.is_some() {
+                ui.separator();
+                ui.child_window("voice_status_bar").size([0.0, VOICE_STATUS_BAR_HEIGHT]).build(|| {
+                    draw_voice_status_bar(ui, state, cmd_tx);
+                });
+            }
             ui.separator();
             draw_user_bar(ui, state, cmd_tx, textures);
         });
@@ -896,8 +937,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let seen_count = state.last_seen_message_count.get(&channel_key).copied().unwrap_or(0);
             let has_new_messages = messages.len() > seen_count;
 
+            let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
+            let header_height = if dm_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
+            if let Some(dm) = &dm_channel {
+                draw_dm_header(ui, state, cmd_tx, dm);
+            }
+
             ui.child_window("history")
-                .size([0.0, display_h - 60.0 - status_height])
+                .size([0.0, display_h - 60.0 - status_height - header_height])
                 .build(|| {
                     if messages.is_empty() {
                         ui.text_disabled("No messages loaded yet.");
@@ -977,6 +1024,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
                                 }
+                                if !msg.embeds.is_empty() {
+                                    ui.text_disabled("(embed content not supported)");
+                                }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
@@ -992,6 +1042,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
+                                }
+                                if !msg.embeds.is_empty() {
+                                    ui.text_disabled("(embed content not supported)");
                                 }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
@@ -1255,6 +1308,64 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_image_lightbox(ui, state, textures);
 }
 
+fn format_bitrate(bps: u32) -> String {
+    if bps >= 1_000_000 {
+        format!("{:.1} Mbps", bps as f32 / 1_000_000.0)
+    } else {
+        format!("{} kbps", bps / 1000)
+    }
+}
+
+fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
+    let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
+
+    ui.text(format!("[voice] {channel_name}"));
+    let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+    ui.set_window_font_scale(0.85);
+    ui.text(format!(
+        "up {} / down {}",
+        format_bitrate(state.voice_bitrate_up_bps),
+        format_bitrate(state.voice_bitrate_down_bps),
+    ));
+    ui.set_window_font_scale(1.0);
+    token.pop();
+
+    let mute_label = if state.self_muted { "Unmute" } else { "Mute" };
+    if ui.button(mute_label) {
+        state.self_muted = !state.self_muted;
+        if state.self_muted {
+            state.self_deafened = false;
+        }
+        let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+            guild_id: guild_id.clone(),
+            channel_id: channel_id.clone(),
+            self_mute: state.self_muted,
+            self_deaf: state.self_deafened,
+        });
+    }
+    ui.same_line();
+    let deaf_label = if state.self_deafened { "Undeafen" } else { "Deafen" };
+    if ui.button(deaf_label) {
+        state.self_deafened = !state.self_deafened;
+        if state.self_deafened {
+            state.self_muted = true;
+        }
+        let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+            guild_id: guild_id.clone(),
+            channel_id: channel_id.clone(),
+            self_mute: state.self_muted,
+            self_deaf: state.self_deafened,
+        });
+    }
+    ui.same_line();
+    if ui.button("Disconnect") {
+        let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
+        state.self_muted = false;
+        state.self_deafened = false;
+    }
+}
+
 fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let Some(user) = state.current_user.clone() else { return };
     const SETTINGS_WIDTH: f32 = 70.0;
@@ -1305,6 +1416,9 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     ui.set_cursor_pos([bar_start[0] + width - SETTINGS_WIDTH + 4.0, bar_start[1] + (USER_BAR_HEIGHT - ui.frame_height()) / 2.0]);
     if ui.button("Settings") {
         state.show_settings = !state.show_settings;
+        if state.show_settings && state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
+            let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+        }
     }
     ui.set_cursor_pos([bar_start[0], bar_start[1] + USER_BAR_HEIGHT]);
 
@@ -1386,6 +1500,49 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
     if close_clicked || ui.is_key_pressed(imgui::Key::Escape) {
         state.image_lightbox = None;
     }
+}
+
+fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
+    let name = AppState::dm_display_name(dm);
+    let channel_id = dm.id.clone();
+    let is_connected = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+    let is_connecting = state.voice_connecting && state.pending_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+
+    ui.child_window("dm_header").size([0.0, HEADER_HEIGHT]).build(|| {
+        ui.set_cursor_pos([12.0, (HEADER_HEIGHT - 20.0) / 2.0]);
+        ui.text(&name);
+        ui.same_line();
+        let right_edge = ui.window_size()[0] - 16.0;
+        let icon_width = 28.0;
+        let icon_count = 2.0;
+        ui.set_cursor_pos([right_edge - icon_width * icon_count, (HEADER_HEIGHT - 20.0) / 2.0]);
+
+        if is_connected {
+            let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.accent);
+            if ui.button("Call") {
+                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: None });
+            }
+            token.pop();
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Hang up");
+            }
+        } else if is_connecting {
+            ui.text_disabled("Call");
+        } else if ui.button("Call") {
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone() });
+            state.pending_voice_channel = Some((None, channel_id.clone()));
+        }
+        if !is_connected && !is_connecting && ui.is_item_hovered() {
+            ui.tooltip_text("Start Voice Call");
+        }
+
+        ui.same_line();
+        ui.text_disabled("Video");
+        if ui.is_item_hovered() {
+            ui.tooltip_text("Video calls aren't supported yet");
+        }
+    });
+    ui.separator();
 }
 
 fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
@@ -1767,6 +1924,57 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
 
             ui.spacing();
             ui.separator();
+            ui.text("Voice & Video");
+            ui.separator();
+            if state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
+                if ui.button("Refresh device list") {
+                    let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+                }
+            } else {
+                ui.text_colored(muted, "Input Device");
+                ui.set_next_item_width(-1.0);
+                let current_input = state.selected_input_device.clone().unwrap_or_else(|| "Default".to_string());
+                if let Some(_token) = ui.begin_combo("##input_device", &current_input) {
+                    if ui.selectable_config("Default").selected(state.selected_input_device.is_none()).build() {
+                        state.selected_input_device = None;
+                        crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: None, output_device: state.selected_output_device.clone() });
+                        let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: None });
+                    }
+                    let devices = state.voice_input_devices.clone();
+                    for device in &devices {
+                        let is_selected = state.selected_input_device.as_deref() == Some(device.as_str());
+                        if ui.selectable_config(device).selected(is_selected).build() {
+                            state.selected_input_device = Some(device.clone());
+                            crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: Some(device.clone()), output_device: state.selected_output_device.clone() });
+                            let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: Some(device.clone()) });
+                        }
+                    }
+                }
+
+                ui.spacing();
+                ui.text_colored(muted, "Output Device");
+                ui.set_next_item_width(-1.0);
+                let current_output = state.selected_output_device.clone().unwrap_or_else(|| "Default".to_string());
+                if let Some(_token) = ui.begin_combo("##output_device", &current_output) {
+                    if ui.selectable_config("Default").selected(state.selected_output_device.is_none()).build() {
+                        state.selected_output_device = None;
+                        crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: None });
+                        let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: None });
+                    }
+                    let devices = state.voice_output_devices.clone();
+                    for device in &devices {
+                        let is_selected = state.selected_output_device.as_deref() == Some(device.as_str());
+                        if ui.selectable_config(device).selected(is_selected).build() {
+                            state.selected_output_device = Some(device.clone());
+                            crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: Some(device.clone()) });
+                            let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: Some(device.clone()) });
+                        }
+                    }
+                }
+            }
+
+            ui.spacing();
+            ui.separator();
             ui.text("Theme");
             ui.separator();
 
@@ -1780,11 +1988,22 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                 if ui.selectable_config(&label).selected(is_current).build() {
                     if let Ok(theme) = crate::theme::Theme::load_from_file(path) {
                         state.theme = theme;
+                        let theme_file = path.file_name().map(|name| name.to_string_lossy().into_owned());
+                        crate::settings::save(&crate::settings::Settings { theme_file, input_device: state.selected_input_device.clone(), output_device: state.selected_output_device.clone() });
                     }
                 }
             }
         });
     state.show_settings = open;
+}
+
+fn current_theme_file(theme: &crate::theme::Theme) -> Option<String> {
+    crate::theme::Theme::themes_dir().and_then(|dir| {
+        crate::theme::Theme::list_available().into_iter().find(|path| {
+            crate::theme::Theme::load_from_file(path).is_ok_and(|candidate| candidate.name == theme.name)
+        }).and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .or_else(|| Some(dir.join(format!("{}.toml", theme.name)).file_name()?.to_string_lossy().into_owned()))
+    })
 }
 
 fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
