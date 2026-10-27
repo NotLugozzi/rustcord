@@ -25,6 +25,30 @@ fn groups_path() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("dm_groups.toml"))
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct GuildFolder {
+    pub name: String,
+    pub color: [f32; 4],
+    pub guild_ids: Vec<String>,
+    pub expanded: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub enum RailItem {
+    Guild(String),
+    Folder(usize),
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct RailFile {
+    folders: Vec<GuildFolder>,
+    order: Vec<RailItem>,
+}
+
+fn rail_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("server_rail.toml"))
+}
+
 fn notes_path() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("notes.toml"))
 }
@@ -47,6 +71,12 @@ pub fn save_notes(notes: &HashMap<String, String>) {
 pub fn load_groups() -> Vec<DmGroup> {
     let text = groups_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     toml::from_str::<GroupsFile>(&text).map(|f| f.groups).unwrap_or_default()
+}
+
+pub fn load_rail() -> (Vec<GuildFolder>, Vec<RailItem>) {
+    let text = rail_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let file = toml::from_str::<RailFile>(&text).unwrap_or_default();
+    (file.folders, file.order)
 }
 
 #[derive(Default)]
@@ -118,6 +148,10 @@ pub struct AppState {
     pub selected_input_device: Option<String>,
     pub selected_output_device: Option<String>,
     pub show_voice_device_picker: bool,
+    pub rail_folders: Vec<GuildFolder>,
+    pub rail_order: Vec<RailItem>,
+    pub renaming_folder: Option<usize>,
+    pub folder_rename_buf: String,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -160,6 +194,154 @@ impl AppState {
         if let Ok(text) = toml::to_string(&file) {
             let _ = std::fs::write(path, text);
         }
+    }
+
+    pub fn save_rail(&self) {
+        let Some(path) = rail_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = RailFile { folders: self.rail_folders.clone(), order: self.rail_order.clone() };
+        if let Ok(text) = toml::to_string(&file) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    pub fn reconcile_rail_order(&mut self) {
+        let known_guild_ids: std::collections::HashSet<String> = self.guilds.iter().map(|g| g.id.clone()).collect();
+
+        for folder in &mut self.rail_folders {
+            folder.guild_ids.retain(|id| known_guild_ids.contains(id.as_str()));
+        }
+        self.compact_folders();
+
+        self.rail_order.retain(|item| match item {
+            RailItem::Guild(id) => known_guild_ids.contains(id.as_str()),
+            RailItem::Folder(_) => true,
+        });
+
+        let mut seen_folders = std::collections::HashSet::new();
+        let mut seen_guilds = std::collections::HashSet::new();
+        self.rail_order.retain(|item| match item {
+            RailItem::Folder(idx) => seen_folders.insert(*idx),
+            RailItem::Guild(id) => seen_guilds.insert(id.clone()),
+        });
+
+        let placed_guild_ids: std::collections::HashSet<String> = self
+            .rail_order
+            .iter()
+            .filter_map(|item| match item {
+                RailItem::Guild(id) => Some(id.clone()),
+                RailItem::Folder(_) => None,
+            })
+            .chain(self.rail_folders.iter().flat_map(|f| f.guild_ids.iter().cloned()))
+            .collect();
+
+        for guild in &self.guilds {
+            if !placed_guild_ids.contains(&guild.id) {
+                self.rail_order.push(RailItem::Guild(guild.id.clone()));
+            }
+        }
+        self.save_rail();
+    }
+
+    pub fn guild_has_active_voice(&self, guild_id: &str) -> bool {
+        self.voice_channel_states.get(guild_id).is_some_and(|states| !states.is_empty())
+    }
+
+    pub fn folder_has_active_voice(&self, folder: &GuildFolder) -> bool {
+        folder.guild_ids.iter().any(|id| self.guild_has_active_voice(id))
+    }
+
+    fn remove_guild_from_rail(&mut self, guild_id: &str) {
+        self.rail_order.retain(|item| !matches!(item, RailItem::Guild(id) if id == guild_id));
+        for folder in &mut self.rail_folders {
+            folder.guild_ids.retain(|id| id != guild_id);
+        }
+    }
+
+    fn compact_folders(&mut self) {
+        let mut new_index = vec![None; self.rail_folders.len()];
+        let mut compacted = Vec::with_capacity(self.rail_folders.len());
+        for (old_idx, folder) in std::mem::take(&mut self.rail_folders).into_iter().enumerate() {
+            if folder.guild_ids.is_empty() {
+                continue;
+            }
+            new_index[old_idx] = Some(compacted.len());
+            compacted.push(folder);
+        }
+        self.rail_folders = compacted;
+
+        self.rail_order.retain_mut(|item| {
+            if let RailItem::Folder(idx) = item {
+                match new_index.get(*idx).copied().flatten() {
+                    Some(new_idx) => *idx = new_idx,
+                    None => return false,
+                }
+            }
+            true
+        });
+        if let Some(idx) = self.renaming_folder {
+            self.renaming_folder = new_index.get(idx).copied().flatten();
+        }
+    }
+
+    pub fn move_guild_to_rail_index(&mut self, guild_id: &str, target_index: usize) {
+        let was_before_target = self
+            .rail_order
+            .iter()
+            .take(target_index)
+            .any(|item| matches!(item, RailItem::Guild(id) if id == guild_id));
+        self.remove_guild_from_rail(guild_id);
+        self.compact_folders();
+        let target_index = if was_before_target { target_index.saturating_sub(1) } else { target_index };
+        let target_index = target_index.min(self.rail_order.len());
+        self.rail_order.insert(target_index, RailItem::Guild(guild_id.to_string()));
+        self.save_rail();
+    }
+
+    pub fn move_folder_to_rail_index(&mut self, folder_idx: usize, target_index: usize) {
+        let Some(current_pos) = self.rail_order.iter().position(|item| matches!(item, RailItem::Folder(idx) if *idx == folder_idx)) else { return };
+        let was_before_target = current_pos < target_index;
+        self.rail_order.remove(current_pos);
+        let target_index = if was_before_target { target_index.saturating_sub(1) } else { target_index };
+        let target_index = target_index.min(self.rail_order.len());
+        self.rail_order.insert(target_index, RailItem::Folder(folder_idx));
+        self.save_rail();
+    }
+
+    pub fn move_guild_into_folder(&mut self, guild_id: &str, folder_idx: usize) {
+        self.remove_guild_from_rail(guild_id);
+        self.compact_folders();
+        if let Some(folder) = self.rail_folders.get_mut(folder_idx) {
+            folder.guild_ids.push(guild_id.to_string());
+        }
+        self.save_rail();
+    }
+
+    pub fn create_folder_from_guilds(&mut self, dragged_guild_id: &str, target_guild_id: &str) {
+        self.remove_guild_from_rail(dragged_guild_id);
+        self.compact_folders();
+        let Some(target_pos) = self.rail_order.iter().position(|item| matches!(item, RailItem::Guild(id) if id == target_guild_id)) else { return };
+
+        let folder = GuildFolder {
+            name: "Folder".to_string(),
+            color: self.theme.accent,
+            guild_ids: vec![target_guild_id.to_string(), dragged_guild_id.to_string()],
+            expanded: false,
+        };
+        self.rail_folders.push(folder);
+        let folder_idx = self.rail_folders.len() - 1;
+        self.rail_order[target_pos] = RailItem::Folder(folder_idx);
+        self.save_rail();
+    }
+
+    pub fn remove_guild_from_folder(&mut self, folder_idx: usize, guild_id: &str) {
+        let Some(folder) = self.rail_folders.get_mut(folder_idx) else { return };
+        folder.guild_ids.retain(|id| id != guild_id);
+        self.compact_folders();
+        self.rail_order.push(RailItem::Guild(guild_id.to_string()));
+        self.save_rail();
     }
 
     pub fn activity_for(&self, user_id: &str) -> Option<String> {

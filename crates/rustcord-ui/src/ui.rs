@@ -1,4 +1,4 @@
-use crate::app_state::AppState;
+use crate::app_state::{AppState, GuildFolder, RailItem};
 use crate::backend::UiCommand;
 use crate::images::TextureCache;
 use crate::markdown::{self, Block, Span, Style};
@@ -244,12 +244,12 @@ const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const SPLITTER_WIDTH: f32 = 6.0;
 
-fn draw_rail_circle(ui: &Ui, color: [f32; 4]) {
+fn draw_rail_circle(ui: &Ui, color: [f32; 4], size: [f32; 2]) {
     let p_min = ui.cursor_screen_pos();
-    let p_max = [p_min[0] + RAIL_ICON_SIZE[0], p_min[1] + RAIL_ICON_SIZE[1]];
+    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
     let center = [(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0];
     ui.get_window_draw_list()
-        .add_circle(center, RAIL_ICON_SIZE[0] / 2.0, color)
+        .add_circle(center, size[0].min(size[1]) / 2.0, color)
         .filled(true)
         .build();
 }
@@ -404,6 +404,380 @@ fn draw_circular_image_button(ui: &Ui, id: &str, texture_id: imgui::TextureId, s
             .build();
     }
     clicked
+}
+
+const VOICE_ACTIVE_COLOR: [f32; 4] = [0.23, 0.79, 0.35, 1.0];
+
+fn draw_voice_active_dot(ui: &Ui, icon_min: [f32; 2], size: [f32; 2]) {
+    let radius = 7.0;
+    let center = [icon_min[0] + size[0] - radius + 1.0, icon_min[1] + size[1] - radius + 1.0];
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_circle(center, radius + 2.0, [0.0, 0.0, 0.0, 0.0]).filled(true).build();
+    draw_list.add_circle(center, radius + 2.0, [0.13, 0.14, 0.17, 1.0]).filled(true).build();
+    draw_list.add_circle(center, radius, VOICE_ACTIVE_COLOR).filled(true).build();
+}
+
+fn draw_guild_icon(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild, size: [f32; 2]) -> bool {
+    let icon_url = rustcord_client::cdn::guild_icon_url(guild, 64);
+    if let Some(url) = &icon_url {
+        if let Some((texture_id, _)) = textures.get_still(url) {
+            draw_circular_image_button(ui, &format!("guild_icon_{}", guild.id), texture_id, size)
+        } else {
+            textures.request(url, cmd_tx);
+            let label = guild.name.chars().take(2).collect::<String>();
+            draw_rail_circle(ui, [0.23, 0.24, 0.27, 1.0], size);
+            draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, size)
+        }
+    } else {
+        let label = guild.name.chars().take(2).collect::<String>();
+        draw_rail_circle(ui, [0.23, 0.24, 0.27, 1.0], size);
+        draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, size)
+    }
+}
+
+const RAIL_DRAG_GUILD: &str = "RAIL_DRAG_GUILD";
+
+fn draw_folder_icon(ui: &Ui, state: &AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, folder: &GuildFolder, folder_idx: usize, size: [f32; 2]) -> bool {
+    let p_min = ui.cursor_screen_pos();
+    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_rect(p_min, p_max, folder.color).filled(true).rounding(size[0] * 0.3).build();
+
+    let guilds: Vec<&rustcord_client::models::Guild> = folder.guild_ids.iter().filter_map(|id| state.guilds.iter().find(|g| &g.id == id)).collect();
+    let pad = 6.0;
+    let cell = (size[0] - pad * 3.0) / 2.0;
+    for (i, guild) in guilds.iter().take(4).enumerate() {
+        let col = (i % 2) as f32;
+        let row = (i / 2) as f32;
+        let cell_min = [p_min[0] + pad + col * (cell + pad), p_min[1] + pad + row * (cell + pad)];
+        let cell_max = [cell_min[0] + cell, cell_min[1] + cell];
+        let icon_url = rustcord_client::cdn::guild_icon_url(guild, 32);
+        if let Some(url) = &icon_url {
+            if let Some((texture_id, _)) = textures.get_still(url) {
+                draw_list.add_image_rounded(texture_id, cell_min, cell_max, cell * 0.2).build();
+                continue;
+            }
+            textures.request(url, cmd_tx);
+        }
+        draw_list.add_rect(cell_min, cell_max, [1.0, 1.0, 1.0, 0.25]).filled(true).rounding(cell * 0.2).build();
+        if icon_url.is_none() {
+            let label = guild.name.chars().take(1).collect::<String>();
+            let text_size = ui.calc_text_size(&label);
+            let center = [(cell_min[0] + cell_max[0]) / 2.0, (cell_min[1] + cell_max[1]) / 2.0];
+            draw_list.add_text([center[0] - text_size[0] / 2.0, center[1] - text_size[1] / 2.0], [1.0, 1.0, 1.0, 0.9], &label);
+        }
+    }
+
+    ui.set_cursor_screen_pos(p_min);
+    let clicked = ui.invisible_button(format!("folder_toggle_{}", folder_idx), size);
+    if ui.is_item_hovered() {
+        draw_list
+            .add_circle([(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0], size[0].min(size[1]) / 2.0 + 2.0, [1.0, 1.0, 1.0, 0.5])
+            .thickness(2.0)
+            .build();
+    }
+    clicked
+}
+
+const FOLDER_ITEM_GAP: f32 = 10.0;
+const FOLDER_PILL_PAD: f32 = 10.0;
+const FOLDER_ITEM_SIZE: [f32; 2] = [RAIL_ICON_SIZE[0] * 0.82, RAIL_ICON_SIZE[1] * 0.82];
+
+#[allow(clippy::too_many_arguments)]
+fn draw_expanded_folder(
+    ui: &Ui,
+    state: &AppState,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    folder: &GuildFolder,
+    folder_idx: usize,
+    rail_center_x: f32,
+    toggle_folder: &mut Option<usize>,
+    select_guild: &mut Option<String>,
+    remove_from_folder: &mut Option<(usize, String)>,
+    start_rename_folder: &mut Option<usize>,
+    drop_action: &mut Option<RailDropAction>,
+) {
+    let item_spacing_y = ui.clone_style().item_spacing[1];
+    let header_step = RAIL_ICON_SIZE[1] + item_spacing_y + FOLDER_ITEM_GAP;
+    let member_step = FOLDER_ITEM_SIZE[1] + item_spacing_y + FOLDER_ITEM_GAP;
+
+    let member_count = folder.guild_ids.len() as f32;
+    let pill_width = RAIL_ICON_SIZE[0] + FOLDER_PILL_PAD * 2.0;
+    let pill_height = FOLDER_PILL_PAD * 2.0 + header_step + member_step * member_count;
+    let pill_left_x = rail_center_x - (pill_width - RAIL_ICON_SIZE[0]) / 2.0;
+    let pill_top_y = ui.cursor_pos()[1];
+    ui.set_cursor_pos([pill_left_x, pill_top_y]);
+    let pill_screen = ui.cursor_screen_pos();
+    let pill_max_screen = [pill_screen[0] + pill_width, pill_screen[1] + pill_height];
+    let pill_bg = [folder.color[0] * 0.35, folder.color[1] * 0.35, folder.color[2] * 0.35, 1.0];
+    let draw_list = ui.get_window_draw_list();
+    let rounding = pill_width * 0.22;
+    draw_list.add_rect(pill_screen, pill_max_screen, pill_bg).filled(true).rounding(rounding).build();
+    draw_list.add_rect(pill_screen, pill_max_screen, folder.color).rounding(rounding).thickness(1.5).build();
+    drop(draw_list);
+
+    ui.set_cursor_pos([rail_center_x, pill_top_y + FOLDER_PILL_PAD]);
+    let icon_min = ui.cursor_screen_pos();
+    let header_clicked = draw_folder_icon(ui, state, textures, cmd_tx, folder, folder_idx, RAIL_ICON_SIZE);
+    if state.folder_has_active_voice(folder) {
+        draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
+    }
+    if header_clicked {
+        *toggle_folder = Some(folder_idx);
+    }
+    if ui.is_item_hovered() {
+        ui.tooltip_text(&folder.name);
+        if ui.is_mouse_clicked(imgui::MouseButton::Right) {
+            *start_rename_folder = Some(folder_idx);
+        }
+    }
+    if drop_action.is_none() {
+        if let Some(target) = ui.drag_drop_target() {
+            if let Some(Ok(payload)) = target.accept_payload::<[u8; 32], _>(RAIL_DRAG_GUILD, imgui::DragDropFlags::empty()) {
+                if let Some(DraggedRailItem::Guild(dragged_id)) = payload_to_rail_item(&payload.data) {
+                    *drop_action = Some(RailDropAction::IntoFolder(dragged_id, folder_idx));
+                }
+            }
+            target.pop();
+        }
+    }
+
+    let item_center_x = rail_center_x + (RAIL_ICON_SIZE[0] - FOLDER_ITEM_SIZE[0]) / 2.0;
+    for (i, guild_id) in folder.guild_ids.iter().enumerate() {
+        let Some(guild) = state.guilds.iter().find(|g| &g.id == guild_id).cloned() else { continue };
+        let item_y = pill_top_y + FOLDER_PILL_PAD + header_step + member_step * i as f32;
+        ui.set_cursor_pos([item_center_x, item_y]);
+        let icon_min = ui.cursor_screen_pos();
+        let clicked = draw_guild_icon(ui, textures, cmd_tx, &guild, FOLDER_ITEM_SIZE);
+        if state.guild_has_active_voice(guild_id) {
+            draw_voice_active_dot(ui, icon_min, FOLDER_ITEM_SIZE);
+        }
+        if clicked {
+            *select_guild = Some(guild_id.clone());
+        }
+        if ui.is_item_hovered() {
+            ui.tooltip_text(&guild.name);
+            if ui.is_mouse_clicked(imgui::MouseButton::Right) {
+                *remove_from_folder = Some((folder_idx, guild_id.clone()));
+            }
+        }
+        if let Some(_tooltip) = ui.drag_drop_source_config(RAIL_DRAG_GUILD).begin_payload(rail_item_payload(&DraggedRailItem::Guild(guild_id.clone()))) {
+            ui.text(&guild.name);
+        }
+    }
+
+    ui.set_cursor_pos([rail_center_x, pill_top_y + pill_height + FOLDER_ITEM_GAP]);
+}
+
+enum RailDropAction {
+    MoveGuildToIndex(String, usize),
+    MoveFolderToIndex(usize, usize),
+    IntoFolder(String, usize),
+    CreateFolder(String, String),
+}
+
+fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, rail_center_x: f32) {
+    let mut drop_action: Option<RailDropAction> = None;
+    let mut toggle_folder: Option<usize> = None;
+    let mut remove_from_folder: Option<(usize, String)> = None;
+    let mut select_guild: Option<String> = None;
+    let mut start_rename_folder: Option<usize> = None;
+
+    let order_len = state.rail_order.len();
+    for index in 0..order_len {
+        let item = state.rail_order[index].clone();
+        match item {
+            RailItem::Guild(guild_id) => {
+                let Some(guild) = state.guilds.iter().find(|g| g.id == guild_id).cloned() else { continue };
+                let icon_min = ui.cursor_screen_pos();
+                let clicked = draw_guild_icon(ui, textures, cmd_tx, &guild, RAIL_ICON_SIZE);
+                if state.guild_has_active_voice(&guild.id) {
+                    draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
+                }
+                if clicked {
+                    select_guild = Some(guild.id.clone());
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(&guild.name);
+                }
+
+                if let Some(_tooltip) = ui.drag_drop_source_config(RAIL_DRAG_GUILD).begin_payload(rail_item_payload(&DraggedRailItem::Guild(guild.id.clone()))) {
+                    ui.text(&guild.name);
+                }
+                if drop_action.is_none() {
+                    if let Some(target) = ui.drag_drop_target() {
+                        if let Some(Ok(payload)) = target.accept_payload::<[u8; 32], _>(RAIL_DRAG_GUILD, imgui::DragDropFlags::empty()) {
+                            match payload_to_rail_item(&payload.data) {
+                                Some(DraggedRailItem::Guild(dragged_id)) if dragged_id != guild.id => {
+                                    drop_action = Some(RailDropAction::CreateFolder(dragged_id, guild.id.clone()));
+                                }
+                                Some(DraggedRailItem::Folder(dragged_idx)) => {
+                                    drop_action = Some(RailDropAction::MoveFolderToIndex(dragged_idx, index));
+                                }
+                                _ => {}
+                            }
+                        }
+                        target.pop();
+                    }
+                }
+            }
+            RailItem::Folder(folder_idx) => {
+                let Some(folder) = state.rail_folders.get(folder_idx).cloned() else { continue };
+
+                if folder.expanded {
+                    draw_expanded_folder(
+                        ui,
+                        state,
+                        textures,
+                        cmd_tx,
+                        &folder,
+                        folder_idx,
+                        rail_center_x,
+                        &mut toggle_folder,
+                        &mut select_guild,
+                        &mut remove_from_folder,
+                        &mut start_rename_folder,
+                        &mut drop_action,
+                    );
+                } else {
+                    let icon_min = ui.cursor_screen_pos();
+                    let clicked = draw_folder_icon(ui, state, textures, cmd_tx, &folder, folder_idx, RAIL_ICON_SIZE);
+                    if state.folder_has_active_voice(&folder) {
+                        draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
+                    }
+                    if clicked {
+                        toggle_folder = Some(folder_idx);
+                    }
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(&folder.name);
+                        if ui.is_mouse_clicked(imgui::MouseButton::Right) {
+                            start_rename_folder = Some(folder_idx);
+                        }
+                    }
+                    if let Some(_tooltip) = ui.drag_drop_source_config(RAIL_DRAG_GUILD).begin_payload(rail_item_payload(&DraggedRailItem::Folder(folder_idx))) {
+                        ui.text(&folder.name);
+                    }
+                    if drop_action.is_none() {
+                        if let Some(target) = ui.drag_drop_target() {
+                            if let Some(Ok(payload)) = target.accept_payload::<[u8; 32], _>(RAIL_DRAG_GUILD, imgui::DragDropFlags::empty()) {
+                                match payload_to_rail_item(&payload.data) {
+                                    Some(DraggedRailItem::Guild(dragged_id)) => {
+                                        drop_action = Some(RailDropAction::IntoFolder(dragged_id, folder_idx));
+                                    }
+                                    Some(DraggedRailItem::Folder(dragged_idx)) if dragged_idx != folder_idx => {
+                                        drop_action = Some(RailDropAction::MoveFolderToIndex(dragged_idx, index));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            target.pop();
+                        }
+                    }
+                }
+
+                if state.renaming_folder == Some(folder_idx) {
+                    ui.open_popup(format!("rename_folder_{}", folder_idx));
+                }
+                ui.popup(format!("rename_folder_{}", folder_idx), || {
+                    ui.text("Rename folder");
+                    ui.input_text("##folder_name", &mut state.folder_rename_buf).build();
+                    if ui.button("Save") || ui.is_key_pressed(imgui::Key::Enter) {
+                        if let Some(f) = state.rail_folders.get_mut(folder_idx) {
+                            f.name = state.folder_rename_buf.trim().to_string();
+                            if f.name.is_empty() {
+                                f.name = "Folder".to_string();
+                            }
+                        }
+                        state.save_rail();
+                        state.renaming_folder = None;
+                        ui.close_current_popup();
+                    }
+                });
+            }
+        }
+        ui.set_cursor_pos([0.0, ui.cursor_pos()[1]]);
+        let gap_width = ui.content_region_avail()[0];
+        let gap_min = ui.cursor_screen_pos();
+        ui.invisible_button(&format!("rail_gap_{}", index), [gap_width, 8.0]);
+        if ui.is_item_hovered() {
+            ui.get_window_draw_list()
+                .add_line([gap_min[0] + 8.0, gap_min[1] + 4.0], [gap_min[0] + gap_width - 8.0, gap_min[1] + 4.0], state.theme.accent)
+                .thickness(2.0)
+                .build();
+        }
+        if drop_action.is_none() {
+            if let Some(target) = ui.drag_drop_target() {
+                if let Some(Ok(payload)) = target.accept_payload::<[u8; 32], _>(RAIL_DRAG_GUILD, imgui::DragDropFlags::empty()) {
+                    drop_action = match payload_to_rail_item(&payload.data) {
+                        Some(DraggedRailItem::Guild(dragged_id)) => Some(RailDropAction::MoveGuildToIndex(dragged_id, index + 1)),
+                        Some(DraggedRailItem::Folder(dragged_idx)) => Some(RailDropAction::MoveFolderToIndex(dragged_idx, index + 1)),
+                        None => None,
+                    };
+                }
+                target.pop();
+            }
+        }
+        let next_y = ui.cursor_pos()[1];
+        ui.set_cursor_pos([rail_center_x, next_y]);
+    }
+
+    if let Some(guild_id) = select_guild {
+        let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
+        state.selected_guild = Some(guild_id);
+        state.selected_channel = None;
+    }
+    match drop_action {
+        Some(RailDropAction::MoveGuildToIndex(dragged_id, target_index)) => state.move_guild_to_rail_index(&dragged_id, target_index),
+        Some(RailDropAction::MoveFolderToIndex(dragged_idx, target_index)) => state.move_folder_to_rail_index(dragged_idx, target_index),
+        Some(RailDropAction::IntoFolder(dragged_id, folder_idx)) => state.move_guild_into_folder(&dragged_id, folder_idx),
+        Some(RailDropAction::CreateFolder(dragged_id, target_id)) => state.create_folder_from_guilds(&dragged_id, &target_id),
+        None => {}
+    }
+    if let Some(folder_idx) = toggle_folder {
+        if let Some(folder) = state.rail_folders.get_mut(folder_idx) {
+            folder.expanded = !folder.expanded;
+            state.save_rail();
+        }
+    }
+    if let Some((folder_idx, guild_id)) = remove_from_folder {
+        state.remove_guild_from_folder(folder_idx, &guild_id);
+    }
+    if let Some(folder_idx) = start_rename_folder {
+        state.folder_rename_buf = state.rail_folders.get(folder_idx).map(|f| f.name.clone()).unwrap_or_default();
+        state.renaming_folder = Some(folder_idx);
+    }
+}
+
+#[derive(Clone, Debug)]
+enum DraggedRailItem {
+    Guild(String),
+    Folder(usize),
+}
+
+fn rail_item_payload(item: &DraggedRailItem) -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    let (tag, text) = match item {
+        DraggedRailItem::Guild(id) => (0u8, id.clone()),
+        DraggedRailItem::Folder(idx) => (1u8, idx.to_string()),
+    };
+    buf[0] = tag;
+    let bytes = text.as_bytes();
+    let len = bytes.len().min(31);
+    buf[1..1 + len].copy_from_slice(&bytes[..len]);
+    buf
+}
+
+fn payload_to_rail_item(payload: &[u8; 32]) -> Option<DraggedRailItem> {
+    let tag = payload[0];
+    let rest = &payload[1..];
+    let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    let text = String::from_utf8_lossy(&rest[..end]).into_owned();
+    match tag {
+        0 => Some(DraggedRailItem::Guild(text)),
+        1 => text.parse().ok().map(DraggedRailItem::Folder),
+        _ => None,
+    }
 }
 
 fn has_sprite(s: &str) -> bool {
@@ -783,7 +1157,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
             ui.set_cursor_pos([rail_center_x, RAIL_PADDING_TOP]);
             let dm_color = if state.selected_guild.is_none() { state.theme.accent_hover } else { state.theme.accent };
-            draw_rail_circle(ui, dm_color);
+            draw_rail_circle(ui, dm_color, RAIL_ICON_SIZE);
             if draw_circular_image_button_placeholder(ui, "dm_button", "DM", RAIL_ICON_SIZE) {
                 state.selected_guild = None;
                 state.selected_channel = None;
@@ -792,35 +1166,16 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             ui.set_cursor_pos([8.0, RAIL_PADDING_TOP + RAIL_ICON_SIZE[1] + 8.0]);
             ui.separator();
             let after_separator_y = ui.cursor_pos()[1];
-            ui.set_cursor_pos([rail_center_x, after_separator_y]);
+            ui.set_cursor_pos([0.0, after_separator_y]);
 
-            for guild in &state.guilds {
-                let icon_url = rustcord_client::cdn::guild_icon_url(guild, 64);
-                let clicked = if let Some(url) = &icon_url {
-                    if let Some((texture_id, _)) = textures.get_still(url) {
-                        draw_circular_image_button(ui, &format!("guild_icon_{}", guild.id), texture_id, RAIL_ICON_SIZE)
-                    } else {
-                        textures.request(url, cmd_tx);
-                        let label = guild.name.chars().take(2).collect::<String>();
-                        draw_rail_circle(ui, state.theme.panel);
-                        draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, RAIL_ICON_SIZE)
-                    }
-                } else {
-                    let label = guild.name.chars().take(2).collect::<String>();
-                    draw_rail_circle(ui, state.theme.panel);
-                    draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, RAIL_ICON_SIZE)
-                };
-                if clicked {
-                    let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild.id.clone() });
-                    state.selected_guild = Some(guild.id.clone());
-                    state.selected_channel = None;
-                }
-                if ui.is_item_hovered() {
-                    ui.tooltip_text(&guild.name);
-                }
-                let next_y = ui.cursor_pos()[1];
-                ui.set_cursor_pos([rail_center_x, next_y]);
-            }
+            let _no_pad = ui.push_style_var(imgui::StyleVar::WindowPadding([0.0, 0.0]));
+            let _child_bg = ui.push_style_color(imgui::StyleColor::ChildBg, state.theme.servers_bg());
+            ui.child_window("guilds_scroll").size([RAIL_WIDTH, display_h - after_separator_y]).build(|| {
+                ui.set_cursor_pos([rail_center_x, 0.0]);
+                draw_rail_items(ui, state, cmd_tx, textures, rail_center_x);
+            });
+            _child_bg.pop();
+            _no_pad.pop();
         });
         _server_bg.pop(); // <- Non dimenticare il pop()!
 

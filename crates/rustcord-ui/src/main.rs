@@ -26,7 +26,8 @@ fn main() {
     backend::spawn(&rt, cmd_rx, event_tx);
 
     let saved_settings = settings::load();
-    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), selected_input_device: saved_settings.input_device, selected_output_device: saved_settings.output_device, ..Default::default() };
+    let (rail_folders, rail_order) = app_state::load_rail();
+    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), selected_input_device: saved_settings.input_device, selected_output_device: saved_settings.output_device, rail_folders, rail_order, ..Default::default() };
     theme::Theme::install_bundled();
     if let Some(dir) = theme::Theme::themes_dir() {
         let selected_file = saved_settings.theme_file.unwrap_or_else(|| "discord-dark.toml".into());
@@ -113,6 +114,7 @@ pub fn drain_backend_events(
                 state.current_user = Some(user);
                 let guild_ids = guilds.iter().map(|g| g.id.clone()).collect();
                 state.guilds = guilds;
+                state.reconcile_rail_order();
                 for presence in friend_presences {
                     state.presences.insert(presence.user.id.clone(), presence);
                 }

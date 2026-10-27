@@ -47,7 +47,6 @@ struct AppWindow {
     window: Arc<Window>,
     surface_desc: wgpu::SurfaceConfiguration,
     surface: wgpu::Surface<'static>,
-    hidpi_factor: f64,
     imgui: ImguiState,
     textures: TextureCache,
 }
@@ -161,7 +160,6 @@ impl AppWindow {
             window,
             surface_desc,
             surface,
-            hidpi_factor: hidpi_factor,
             imgui,
             textures,
         }
