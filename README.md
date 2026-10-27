@@ -32,7 +32,13 @@ Use at your own risk.
 - [ ] Per-channel permission filtering (all guild channels show regardless of your actual access)
 - [ ] Voice calls (not yet implemented)
 - [ ] Non-image attachments/embeds rendering
-- [ ] Guild folders
+- [x] Guild folders
+- [ ] notify msg
+- [ ] video
+- [ ] programmable shortcut
+- [ ] better statistics for voice chat
+- [ ] right columnm of the server to see who is online (low priority)
+- [ ] server admin actions (low priority)
 
 ## Build prerequisites (Linux)
 
