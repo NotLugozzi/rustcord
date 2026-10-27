@@ -97,7 +97,7 @@ pub enum BackendEvent {
     LoggedIn,
     Error(String),
     RpcApps(Vec<crate::presence::RpcAppInfo>),
-    ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile },
+    ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile, user: Option<rustcord_client::models::User> },
     Gateway(GatewayEvent),
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
     GuildEmojisLoaded { guild_id: String, emojis: Vec<rustcord_client::models::Emoji> },
@@ -313,7 +313,8 @@ pub fn spawn(
                         match client.profile(&user_id).await {
                             Ok(v) => {
                                 let profile = rustcord_client::models::UserProfile::from_value(&v);
-                                let _ = event_tx.send(BackendEvent::ProfileLoaded { user_id, profile });
+                                let user = serde_json::from_value(v["user"].clone()).ok();
+                                let _ = event_tx.send(BackendEvent::ProfileLoaded { user_id, profile, user });
                             }
                             Err(e) => tracing::warn!("failed to load profile {user_id}: {e}"),
                         }

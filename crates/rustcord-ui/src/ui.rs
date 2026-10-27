@@ -3,6 +3,7 @@ use crate::backend::UiCommand;
 use crate::images::TextureCache;
 use crate::markdown::{self, Block, Span, Style};
 use imgui::Ui;
+use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone, Copy)]
@@ -38,6 +39,7 @@ fn same_group_window(a: &str, b: &str) -> bool {
     (b - a).num_minutes().abs() < 5
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_markdown(
     ui: &Ui,
     fonts: &Fonts,
@@ -47,11 +49,13 @@ fn draw_markdown(
     id_seed: &str,
     textures: &mut TextureCache,
     cmd_tx: &UnboundedSender<UiCommand>,
+    known_users: &HashMap<String, rustcord_client::models::User>,
+    profiles_requested: &mut std::collections::HashSet<String>,
 ) {
     let blocks = markdown::parse(content);
     for (block_idx, block) in blocks.iter().enumerate() {
         match block {
-            Block::Paragraph(spans) => draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx),
+            Block::Paragraph(spans) => draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested),
             Block::Heading { level, spans } => {
                 let font = match level {
                     1 => fonts.bold,
@@ -65,7 +69,7 @@ fn draw_markdown(
                 };
                 let token = ui.push_font(font);
                 ui.set_window_font_scale(scale);
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested);
                 ui.set_window_font_scale(1.0);
                 token.pop();
             }
@@ -73,7 +77,7 @@ fn draw_markdown(
                 let token = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
                 ui.text("| ");
                 ui.same_line();
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested);
                 token.pop();
             }
             Block::CodeBlock { code, language } => {
@@ -97,6 +101,7 @@ fn draw_markdown(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_spans(
     ui: &Ui,
     fonts: &Fonts,
@@ -107,6 +112,8 @@ fn draw_spans(
     block_idx: usize,
     textures: &mut TextureCache,
     cmd_tx: &UnboundedSender<UiCommand>,
+    known_users: &HashMap<String, rustcord_client::models::User>,
+    profiles_requested: &mut std::collections::HashSet<String>,
 ) {
     for (span_idx, span) in spans.iter().enumerate() {
         if span_idx > 0 {
@@ -156,6 +163,23 @@ fn draw_spans(
             Span::UnicodeEmoji { ch } => {
                 if !draw_unicode_emoji(ui, textures, *ch, [EMOJI_SIZE, EMOJI_SIZE]) {
                     ui.dummy([EMOJI_SIZE, EMOJI_SIZE]);
+                }
+            }
+            Span::Mention { user_id } => {
+                let name = known_users.get(user_id).map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()));
+                if name.is_none() && profiles_requested.insert(user_id.clone()) {
+                    let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user_id.clone() });
+                }
+                let label = format!("@{}", name.as_deref().unwrap_or(user_id));
+                let bg = ui.push_style_color(imgui::StyleColor::Button, [theme.accent[0], theme.accent[1], theme.accent[2], 0.25]);
+                let text = ui.push_style_color(imgui::StyleColor::Text, theme.accent);
+                let font = ui.push_font(fonts.bold);
+                ui.small_button(&label);
+                font.pop();
+                text.pop();
+                bg.pop();
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(format!("@{}", known_users.get(user_id).map(|u| u.username.as_str()).unwrap_or(user_id)));
                 }
             }
         }
@@ -417,6 +441,19 @@ fn draw_voice_active_dot(ui: &Ui, icon_min: [f32; 2], size: [f32; 2]) {
     draw_list.add_circle(center, radius, VOICE_ACTIVE_COLOR).filled(true).build();
 }
 
+fn draw_unread_badge(ui: &Ui, icon_min: [f32; 2]) {
+    let radius = 6.0;
+    let center = [icon_min[0] + radius - 1.0, icon_min[1] + radius - 1.0];
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_circle(center, radius + 2.0, [0.13, 0.14, 0.17, 1.0]).filled(true).build();
+    draw_list.add_circle(center, radius, [1.0, 1.0, 1.0, 0.95]).filled(true).build();
+}
+
+fn draw_unread_dot(ui: &Ui, row_screen_pos: [f32; 2]) {
+    let center = [row_screen_pos[0] - 8.0, row_screen_pos[1] + ui.text_line_height() / 2.0];
+    ui.get_window_draw_list().add_circle(center, 3.0, [1.0, 1.0, 1.0, 0.9]).filled(true).build();
+}
+
 fn draw_guild_icon(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild, size: [f32; 2]) -> bool {
     let icon_url = rustcord_client::cdn::guild_icon_url(guild, 64);
     if let Some(url) = &icon_url {
@@ -523,6 +560,9 @@ fn draw_expanded_folder(
     if state.folder_has_active_voice(folder) {
         draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
     }
+    if state.folder_has_unread(folder) {
+        draw_unread_badge(ui, icon_min);
+    }
     if header_clicked {
         *toggle_folder = Some(folder_idx);
     }
@@ -552,6 +592,9 @@ fn draw_expanded_folder(
         let clicked = draw_guild_icon(ui, textures, cmd_tx, &guild, FOLDER_ITEM_SIZE);
         if state.guild_has_active_voice(guild_id) {
             draw_voice_active_dot(ui, icon_min, FOLDER_ITEM_SIZE);
+        }
+        if state.guild_has_unread(guild_id) {
+            draw_unread_badge(ui, icon_min);
         }
         if clicked {
             *select_guild = Some(guild_id.clone());
@@ -594,6 +637,9 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
                 let clicked = draw_guild_icon(ui, textures, cmd_tx, &guild, RAIL_ICON_SIZE);
                 if state.guild_has_active_voice(&guild.id) {
                     draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
+                }
+                if state.guild_has_unread(&guild.id) {
+                    draw_unread_badge(ui, icon_min);
                 }
                 if clicked {
                     select_guild = Some(guild.id.clone());
@@ -645,6 +691,9 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
                     let clicked = draw_folder_icon(ui, state, textures, cmd_tx, &folder, folder_idx, RAIL_ICON_SIZE);
                     if state.folder_has_active_voice(&folder) {
                         draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
+                    }
+                    if state.folder_has_unread(&folder) {
+                        draw_unread_badge(ui, icon_min);
                     }
                     if clicked {
                         toggle_folder = Some(folder_idx);
@@ -830,6 +879,19 @@ impl EmojiMatch<'_> {
     }
 }
 
+fn trailing_mention_token(text: &str) -> Option<(usize, &str)> {
+    let at_pos = text.rfind('@')?;
+    let preceding_ok = at_pos == 0 || text[..at_pos].ends_with(char::is_whitespace);
+    if !preceding_ok {
+        return None;
+    }
+    let partial = &text[at_pos + 1..];
+    if partial.len() > 32 || partial.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((at_pos, partial))
+}
+
 fn trailing_emoji_token(text: &str) -> Option<(usize, &str)> {
     let colon_pos = text.rfind(':')?;
     let partial = &text[colon_pos + 1..];
@@ -926,6 +988,91 @@ fn draw_emoji_autocomplete(
                 }
                 if (selected && confirmed_by_key) || clicked {
                     picked = Some(m.insert_text());
+                }
+            }
+        });
+    picked.map(|text| (token_start, text))
+}
+
+fn mention_autocomplete_matches<'a>(state: &'a AppState, partial: &str) -> Vec<&'a rustcord_client::models::User> {
+    let partial = partial.to_lowercase();
+    let mut matches: Vec<&rustcord_client::models::User> = state
+        .mentionable_users_for_active_channel()
+        .into_iter()
+        .filter(|u| {
+            partial.is_empty()
+                || u.username.to_lowercase().starts_with(&partial)
+                || u.global_name.as_deref().is_some_and(|n| n.to_lowercase().starts_with(&partial))
+        })
+        .collect();
+    matches.truncate(AUTOCOMPLETE_MAX_RESULTS);
+    matches
+}
+
+/// Mirrors `draw_emoji_autocomplete`'s mechanics (popup above the compose bar, arrow-key
+/// navigation, Tab/Enter/click to confirm) for `@mention` instead of `:emoji:`.
+fn draw_mention_autocomplete(
+    ui: &Ui,
+    state: &mut AppState,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    bar_start: [f32; 2],
+) -> Option<(usize, String)> {
+    let (token_start, partial) = trailing_mention_token(&state.compose_buf)?;
+    let partial = partial.to_string();
+    let match_count = mention_autocomplete_matches(state, &partial).len();
+    if match_count == 0 {
+        return None;
+    }
+    if state.mention_autocomplete_selected >= match_count {
+        state.mention_autocomplete_selected = 0;
+    }
+    if ui.is_key_pressed(imgui::Key::DownArrow) {
+        state.mention_autocomplete_selected = (state.mention_autocomplete_selected + 1) % match_count;
+    }
+    if ui.is_key_pressed(imgui::Key::UpArrow) {
+        state.mention_autocomplete_selected = (state.mention_autocomplete_selected + match_count - 1) % match_count;
+    }
+    let confirmed_by_key = ui.is_key_pressed(imgui::Key::Tab) || ui.is_key_pressed(imgui::Key::Enter);
+    let matches: Vec<(String, String)> = mention_autocomplete_matches(state, &partial)
+        .into_iter()
+        .map(|u| (u.id.clone(), u.global_name.clone().unwrap_or_else(|| u.username.clone())))
+        .collect();
+
+    let mut picked = None;
+    let popup_pos = [bar_start[0], bar_start[1] - matches.len() as f32 * 28.0 - 8.0];
+    ui.window("##mention_autocomplete")
+        .position(popup_pos, imgui::Condition::Always)
+        .size([260.0, matches.len() as f32 * 28.0 + 12.0], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(true)
+        .no_inputs()
+        .focus_on_appearing(false)
+        .build(|| {
+            for (idx, (user_id, display_name)) in matches.iter().enumerate() {
+                let selected = idx == state.mention_autocomplete_selected;
+                let row_height = 20.0;
+                let row_start = ui.cursor_pos();
+                let clicked = ui.selectable_config(format!("##mention_autocomplete_{idx}")).selected(selected).size([0.0, row_height]).build();
+                ui.set_cursor_pos(row_start);
+                let avatar_url = state
+                    .known_users
+                    .get(user_id)
+                    .map(|u| rustcord_client::cdn::avatar_url(u, 32).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(u)));
+                if let Some(url) = &avatar_url {
+                    if let Some((texture_id, _)) = textures.get_still(url) {
+                        imgui::Image::new(texture_id, [18.0, 18.0]).build(ui);
+                    } else {
+                        textures.request(url, cmd_tx);
+                        ui.dummy([18.0, 18.0]);
+                    }
+                } else {
+                    ui.dummy([18.0, 18.0]);
+                }
+                ui.same_line();
+                ui.text(format!("@{display_name}"));
+                if (selected && confirmed_by_key) || clicked {
+                    picked = Some(format!("<@{user_id}>"));
                 }
             }
         });
@@ -1190,14 +1337,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let voice_bar_reserved = if state.connected_voice_channel.is_some() { VOICE_STATUS_BAR_HEIGHT } else { 0.0 };
             ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - voice_bar_reserved - 36.0]).build(|| {
             if state.selected_guild.is_some() {
-                let groups: Vec<(Option<String>, Vec<(String, String)>)> = state
+                let groups: Vec<(Option<String>, Vec<(String, String, Option<String>)>)> = state
                     .grouped_channels_for_selected_guild()
                     .into_iter()
                     .map(|g| {
                         let channels = g
                             .channels
                             .into_iter()
-                            .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone())))
+                            .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone()), c.last_message_id.clone()))
                             .collect();
                         (g.name.map(str::to_string), channels)
                     })
@@ -1212,10 +1359,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         ui.text(name.to_uppercase());
                         token.pop();
                     }
-                    for (channel_id, name) in channels {
+                    for (channel_id, name, last_message_id) in channels {
+                        let is_unread = state.channel_is_unread(channel_id, last_message_id.as_deref());
+                        let row_start = ui.cursor_screen_pos();
                         if ui.selectable(format!("# {name}")) {
                             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
                             state.selected_channel = Some(channel_id.clone());
+                            if let Some(last_id) = last_message_id {
+                                state.mark_channel_read(channel_id, last_id);
+                            }
+                        }
+                        if is_unread {
+                            draw_unread_dot(ui, row_start);
                         }
                     }
                 }
@@ -1238,18 +1393,46 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone() });
                             state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
                         }
-                        for member in state.members_in_voice_channel(&guild_id, channel_id) {
+                        let member_ids: Vec<String> = state.members_in_voice_channel(&guild_id, channel_id).into_iter().map(|m| m.user_id.clone()).collect();
+                        for member_id in member_ids {
+                            let Some(member) = state.voice_channel_states.get(&guild_id).and_then(|states| states.iter().find(|s| s.user_id == member_id)) else { continue };
                             ui.indent();
                             let mute_icon = if member.self_deaf { " [deafened]" } else if member.self_mute { " [muted]" } else { "" };
                             let speaking_icon = if state.voice_speaking_users.contains(&member.user_id) { "[speaking] " } else { "" };
                             let name = state.voice_state_display_name(member);
-                            ui.text_disabled(format!("{speaking_icon}{name}{mute_icon}"));
+                            let unresolved = name == member.user_id;
+                            ui.selectable(format!("{speaking_icon}{name}{mute_icon}##vc_member_{member_id}"));
+                            if ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right) {
+                                state.context_vc_member = Some(member_id.clone());
+                                ui.open_popup("vc_member_context");
+                            }
                             ui.unindent();
+                            if unresolved && state.profiles_requested.insert(member_id.clone()) {
+                                let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: member_id });
+                            }
                         }
                     }
                     if state.voice_connecting {
                         ui.text_disabled("Connecting to voice...");
                     }
+                    ui.popup("vc_member_context", || {
+                        let Some(member_id) = state.context_vc_member.clone() else { return };
+                        let display_name = state.known_users.get(&member_id).map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone())).unwrap_or_else(|| member_id.clone());
+                        ui.text_disabled(&display_name);
+                        ui.separator();
+                        if ui.selectable("Profile") {
+                            if let Some(user) = state.known_users.get(&member_id).cloned() {
+                                state.profile_popout = Some(user);
+                            }
+                        }
+                        if ui.selectable("Mention") {
+                            state.compose_buf.push_str(&format!("<@{member_id}> "));
+                            state.focus_compose = true;
+                        }
+                        if ui.selectable("Message") {
+                            let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: member_id.clone() });
+                        }
+                    });
                 }
             } else {
                 draw_dm_sidebar(ui, state, cmd_tx, textures);
@@ -1383,7 +1566,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 token.pop();
 
                                 if !msg.content.is_empty() {
-                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx);
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &state.known_users, &mut state.profiles_requested);
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
@@ -1402,7 +1585,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
                                 if !msg.content.is_empty() {
-                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx);
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &state.known_users, &mut state.profiles_requested);
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
@@ -1483,6 +1666,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                 });
             state.last_seen_message_count.insert(channel_key.clone(), messages.len());
+            if state.window_focused && !channel_key.is_empty() {
+                if let Some(newest) = messages.last() {
+                    state.mark_channel_read(&channel_key, &newest.id);
+                }
+            }
 
             if !channel_key.is_empty() {
                 let typing_names: Vec<String> = state
@@ -1585,10 +1773,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .enter_returns_true(true)
                 .build();
             let input_focused = ui.is_item_focused();
-            let autocomplete_active = trailing_emoji_token(&state.compose_buf).is_some();
+            let emoji_autocomplete_active = trailing_emoji_token(&state.compose_buf).is_some();
+            let mention_autocomplete_active = !emoji_autocomplete_active && trailing_mention_token(&state.compose_buf).is_some();
 
             let mut enter_pressed = enter_pressed_raw;
-            if input_focused && autocomplete_active {
+            if input_focused && emoji_autocomplete_active {
                 enter_pressed = false;
                 if let Some((token_start, insert_text)) = draw_emoji_autocomplete(ui, state, textures, cmd_tx, bar_start) {
                     state.compose_buf.truncate(token_start);
@@ -1596,6 +1785,15 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     state.compose_buf.push(' ');
                     state.focus_compose = true;
                     state.emoji_autocomplete_selected = 0;
+                }
+            } else if input_focused && mention_autocomplete_active {
+                enter_pressed = false;
+                if let Some((token_start, insert_text)) = draw_mention_autocomplete(ui, state, textures, cmd_tx, bar_start) {
+                    state.compose_buf.truncate(token_start);
+                    state.compose_buf.push_str(&insert_text);
+                    state.compose_buf.push(' ');
+                    state.focus_compose = true;
+                    state.mention_autocomplete_selected = 0;
                 }
             }
 
@@ -1880,7 +2078,7 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
         let spacing = ui.clone_style().item_spacing[0];
         let frame_padding_x = ui.clone_style().frame_padding[0];
         let call_width = ui.calc_text_size("Call")[0] + frame_padding_x * 2.0;
-        let video_width = ui.calc_text_size("Video")[0];
+        let video_width = ui.calc_text_size("Video")[0] + frame_padding_x * 2.0;
         let row_width = call_width + spacing + video_width;
         let button_height = ui.text_line_height() + ui.clone_style().frame_padding[1] * 2.0;
         ui.set_cursor_pos([right_edge - row_width, (HEADER_HEIGHT - button_height) / 2.0]);
@@ -1905,7 +2103,9 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
         }
 
         ui.same_line();
-        ui.text_disabled("Video");
+        let _disabled = ui.begin_disabled(true);
+        ui.button("Video");
+        drop(_disabled);
         if ui.is_item_hovered() {
             ui.tooltip_text("Video calls aren't supported yet");
         }
@@ -1978,17 +2178,18 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             return;
         }
     }
-    let dms: Vec<(String, String, Option<rustcord_client::models::User>)> = state
+    let dms: Vec<(String, String, Option<rustcord_client::models::User>, Option<String>)> = state
         .filtered_dm_channels()
         .into_iter()
         .filter(|dm| group.is_none_or(|g| state.groups[g].channels.contains(&dm.id)))
-        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned()))
+        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned(), dm.last_message_id.clone()))
         .collect();
     if dms.is_empty() {
         ui.text_disabled(if group.is_some() { "Empty group. Right-click a DM to add it." } else { "No direct messages." });
     }
-    for (channel_id, name, recipient) in &dms {
+    for (channel_id, name, recipient, last_message_id) in &dms {
         let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
+        let row_start = ui.cursor_screen_pos();
         let (row_clicked, avatar_clicked, right_clicked) = if let Some(user) = recipient {
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
@@ -1999,6 +2200,9 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             let clicked = ui.selectable_config(name).selected(is_selected).build();
             (clicked, false, ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right))
         };
+        if state.channel_is_unread(channel_id, last_message_id.as_deref()) {
+            draw_unread_dot(ui, row_start);
+        }
         if right_clicked {
             state.context_dm = Some(channel_id.clone());
             ui.open_popup("dm_context");
@@ -2010,6 +2214,9 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         } else if row_clicked {
             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
             state.selected_channel = Some(channel_id.clone());
+            if let Some(last_id) = last_message_id {
+                state.mark_channel_read(channel_id, last_id);
+            }
         }
     }
 

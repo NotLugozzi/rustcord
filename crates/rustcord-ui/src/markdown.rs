@@ -22,6 +22,7 @@ pub enum Span {
     Link { label: String, url: String },
     CustomEmoji { name: String, id: String, animated: bool },
     UnicodeEmoji { ch: char },
+    Mention { user_id: String },
 }
 
 pub fn parse(input: &str) -> Vec<Block> {
@@ -97,6 +98,12 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
         if let Some((name, id, animated, consumed)) = try_parse_custom_emoji(&chars[i..]) {
             flush!();
             spans.push(Span::CustomEmoji { name, id, animated });
+            i += consumed;
+            continue;
+        }
+        if let Some((user_id, consumed)) = try_parse_mention(&chars[i..]) {
+            flush!();
+            spans.push(Span::Mention { user_id });
             i += consumed;
             continue;
         }
@@ -223,6 +230,30 @@ fn find_matching_pair(chars: &[char], start: usize, marker: char) -> Option<usiz
         j += 1;
     }
     None
+}
+
+fn try_parse_mention(chars: &[char]) -> Option<(String, usize)> {
+    let mut j = 0;
+    if chars.first() != Some(&'<') {
+        return None;
+    }
+    j += 1;
+    if chars.get(j) != Some(&'@') {
+        return None;
+    }
+    j += 1;
+    if chars.get(j) == Some(&'!') {
+        j += 1;
+    }
+    let id_start = j;
+    while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+        j += 1;
+    }
+    if j == id_start || chars.get(j) != Some(&'>') {
+        return None;
+    }
+    let user_id: String = chars[id_start..j].iter().collect();
+    Some((user_id, j + 1))
 }
 
 fn try_parse_custom_emoji(chars: &[char]) -> Option<(String, String, bool, usize)> {

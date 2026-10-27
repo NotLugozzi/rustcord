@@ -27,7 +27,20 @@ fn main() {
 
     let saved_settings = settings::load();
     let (rail_folders, rail_order) = app_state::load_rail();
-    let mut state = AppState { sidebar_width: 240.0, my_status: rustcord_client::models::PresenceStatus::Online, notifications_enabled: true, window_focused: true, groups: app_state::load_groups(), notes: app_state::load_notes(), selected_input_device: saved_settings.input_device, selected_output_device: saved_settings.output_device, rail_folders, rail_order, ..Default::default() };
+    let mut state = AppState {
+        sidebar_width: 240.0,
+        my_status: rustcord_client::models::PresenceStatus::Online,
+        notifications_enabled: true,
+        window_focused: true,
+        groups: app_state::load_groups(),
+        notes: app_state::load_notes(),
+        selected_input_device: saved_settings.input_device,
+        selected_output_device: saved_settings.output_device,
+        rail_folders,
+        rail_order,
+        last_read_message_id: app_state::load_read_state(),
+        ..Default::default()
+    };
     theme::Theme::install_bundled();
     if let Some(dir) = theme::Theme::themes_dir() {
         let selected_file = saved_settings.theme_file.unwrap_or_else(|| "discord-dark.toml".into());
@@ -90,7 +103,10 @@ pub fn drain_backend_events(
             BackendEvent::CaptchaInProgress => {
                 state.login_status = Some("Solve the captcha in the popup window...".into());
             }
-            BackendEvent::ProfileLoaded { user_id, profile } => {
+            BackendEvent::ProfileLoaded { user_id, profile, user } => {
+                if let Some(user) = user {
+                    state.known_users.insert(user_id.clone(), user);
+                }
                 state.profiles.insert(user_id, profile);
             }
             BackendEvent::RpcApps(apps) => {
@@ -137,6 +153,10 @@ pub fn drain_backend_events(
                 notify_if_relevant(state, &message);
                 if message.guild_id.is_none() && !state.dm_channels.iter().any(|c| c.id == message.channel_id) {
                     let _ = cmd_tx.send(UiCommand::RefreshDmChannels);
+                }
+                let is_actively_viewing = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
+                if is_actively_viewing {
+                    state.mark_channel_read(&message.channel_id, &message.id);
                 }
                 state.push_message(message);
             }
@@ -204,6 +224,9 @@ pub fn drain_backend_events(
                 state.dm_channels = channels;
             }
             BackendEvent::MessagesLoaded { channel_id, messages } => {
+                if let Some(newest) = messages.iter().max_by_key(|m| m.id.parse::<u64>().unwrap_or(0)) {
+                    state.mark_channel_read(&channel_id, &newest.id);
+                }
                 state.set_message_history(channel_id, messages);
             }
             BackendEvent::OlderMessagesLoaded { channel_id, messages } => {

@@ -53,6 +53,20 @@ fn notes_path() -> Option<std::path::PathBuf> {
     directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("notes.toml"))
 }
 
+fn read_state_path() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("read_state.toml"))
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ReadStateFile {
+    last_read: HashMap<String, String>,
+}
+
+pub fn load_read_state() -> HashMap<String, String> {
+    let text = read_state_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    toml::from_str::<ReadStateFile>(&text).map(|f| f.last_read).unwrap_or_default()
+}
+
 pub fn load_notes() -> HashMap<String, String> {
     let text = notes_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
     toml::from_str(&text).unwrap_or_default()
@@ -91,6 +105,7 @@ pub struct AppState {
     pub groups: Vec<DmGroup>,
     pub new_group_name: String,
     pub context_dm: Option<String>,
+    pub context_vc_member: Option<String>,
     pub profiles: HashMap<String, rustcord_client::models::UserProfile>,
     pub profiles_requested: std::collections::HashSet<String>,
     pub known_users: HashMap<String, User>,
@@ -133,6 +148,7 @@ pub struct AppState {
     pub emoji_picker_filter: String,
     pub emoji_picker_category: usize,
     pub emoji_autocomplete_selected: usize,
+    pub mention_autocomplete_selected: usize,
     pub gateway_connected: bool,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
     pub voice_speaking_users: std::collections::HashSet<String>,
@@ -152,6 +168,7 @@ pub struct AppState {
     pub rail_order: Vec<RailItem>,
     pub renaming_folder: Option<usize>,
     pub folder_rename_buf: String,
+    pub last_read_message_id: HashMap<String, String>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -399,10 +416,60 @@ impl AppState {
         if let Some(dm) = self.dm_channels.iter_mut().find(|c| c.id == message.channel_id) {
             dm.last_message_id = Some(message.id.clone());
         }
+        if let Some(guild_id) = &message.guild_id {
+            if let Some(channels) = self.guild_channels.get_mut(guild_id) {
+                if let Some(channel) = channels.iter_mut().find(|c| c.id == message.channel_id) {
+                    channel.last_message_id = Some(message.id.clone());
+                }
+            }
+        }
         let list = self.messages.entry(message.channel_id.clone()).or_default();
         let new_id = snowflake_value(&message.id);
         let insert_at = list.partition_point(|m| snowflake_value(&m.id) <= new_id);
         list.insert(insert_at, message);
+    }
+
+    pub fn save_read_state(&self) {
+        let Some(path) = read_state_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = ReadStateFile { last_read: self.last_read_message_id.clone() };
+        if let Ok(text) = toml::to_string(&file) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    pub fn mark_channel_read(&mut self, channel_id: &str, message_id: &str) {
+        let is_newer = self
+            .last_read_message_id
+            .get(channel_id)
+            .is_none_or(|seen| snowflake_value(message_id) > snowflake_value(seen));
+        if is_newer {
+            self.last_read_message_id.insert(channel_id.to_string(), message_id.to_string());
+            self.save_read_state();
+        }
+    }
+
+    pub fn channel_is_unread(&self, channel_id: &str, last_message_id: Option<&str>) -> bool {
+        let Some(last_message_id) = last_message_id else { return false };
+        let seen = self.last_read_message_id.get(channel_id);
+        match seen {
+            Some(seen) => snowflake_value(last_message_id) > snowflake_value(seen),
+            None => true,
+        }
+    }
+
+    pub fn guild_has_unread(&self, guild_id: &str) -> bool {
+        let Some(channels) = self.guild_channels.get(guild_id) else { return false };
+        channels
+            .iter()
+            .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement))
+            .any(|c| self.channel_is_unread(&c.id, c.last_message_id.as_deref()))
+    }
+
+    pub fn folder_has_unread(&self, folder: &GuildFolder) -> bool {
+        folder.guild_ids.iter().any(|id| self.guild_has_unread(id))
     }
 
     pub fn set_message_history(&mut self, channel_id: String, mut messages: Vec<Message>) {
@@ -427,6 +494,27 @@ impl AppState {
             .and_then(|id| self.messages.get(id))
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    pub fn mentionable_users_for_active_channel(&self) -> Vec<&User> {
+        let Some(channel_id) = &self.selected_channel else { return Vec::new() };
+        let mut seen = std::collections::HashSet::new();
+        let mut users = Vec::new();
+        if let Some(dm) = self.dm_channels.iter().find(|c| &c.id == channel_id) {
+            for user in &dm.recipients {
+                if seen.insert(user.id.clone()) {
+                    users.push(user);
+                }
+            }
+        }
+        if let Some(messages) = self.messages.get(channel_id) {
+            for message in messages {
+                if seen.insert(message.author.id.clone()) {
+                    users.push(&message.author);
+                }
+            }
+        }
+        users
     }
 
     pub fn dm_display_name(dm: &Channel) -> String {
