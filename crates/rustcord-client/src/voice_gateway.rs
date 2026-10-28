@@ -19,6 +19,28 @@ pub struct VoiceMediaState {
     pub deafened: Arc<AtomicBool>,
     pub input_device: Arc<std::sync::Mutex<Option<String>>>,
     pub output_device: Arc<std::sync::Mutex<Option<String>>>,
+    pub mic: crate::voice_audio::MicProcessing,
+    pub user_volumes: Arc<std::sync::Mutex<HashMap<String, f32>>>,
+}
+
+/// One-second snapshot of the call's health, for the connection-info panel.
+#[derive(Debug, Clone, Default)]
+pub struct VoiceStats {
+    pub bitrate_up_bps: u32,
+    pub bitrate_down_bps: u32,
+    /// Voice-gateway websocket heartbeat round trip.
+    pub ws_rtt_ms: Option<u32>,
+    /// Media (RTCP) round trip from str0m.
+    pub rtc_rtt_ms: Option<f32>,
+    pub loss_up_pct: Option<f32>,
+    pub loss_down_pct: Option<f32>,
+    pub jitter_ms: Option<f32>,
+    pub endpoint: String,
+    pub audio_ssrc: u32,
+    pub dave_active: bool,
+    pub dave_version: u32,
+    pub dave_epoch: Option<u64>,
+    pub dave_code: Option<[u8; 4]>,
 }
 
 const VOICE_VERSION: &str = "v=8";
@@ -31,7 +53,7 @@ pub enum VoiceGatewayEvent {
     Speaking { ssrc: u32, user_id: Option<String>, speaking: bool },
     DaveReady,
     AudioReceived { payload: Vec<u8> },
-    Stats { bitrate_up_bps: u32, bitrate_down_bps: u32 },
+    Stats(VoiceStats),
     Disconnected { reason: String },
 }
 
@@ -117,6 +139,7 @@ impl VoiceGateway {
         let mut next_rtc_deadline: Option<Instant> = None;
         let mut rtc_socket: Option<std::sync::Arc<tokio::net::UdpSocket>> = None;
         let mut seq_ack: u64 = 0;
+        let mut ws_rtt_ms: Option<u32> = None;
         let mut mic_frame_count: u64 = 0;
         let mut last_select_entry: Option<Instant> = None;
         let mut received_audio_frame_count: u64 = 0;
@@ -167,19 +190,35 @@ impl VoiceGateway {
                     let down = (bytes_received * 8) as u32;
                     bytes_sent = 0;
                     bytes_received = 0;
-                    let _ = tx.send(VoiceGatewayEvent::Stats { bitrate_up_bps: up, bitrate_down_bps: down });
+                    let rtc_stats = rtc.as_ref().map(|r| r.stats.clone()).unwrap_or_default();
+                    let dave = dave_session.epoch_info();
+                    let _ = tx.send(VoiceGatewayEvent::Stats(VoiceStats {
+                        bitrate_up_bps: up,
+                        bitrate_down_bps: down,
+                        ws_rtt_ms,
+                        rtc_rtt_ms: rtc_stats.rtt_ms,
+                        loss_up_pct: rtc_stats.loss_up,
+                        loss_down_pct: rtc_stats.loss_down,
+                        jitter_ms: rtc_stats.jitter_ms,
+                        endpoint: self.endpoint.clone(),
+                        audio_ssrc: rtc.as_ref().map(|r| r.audio_ssrc()).unwrap_or_default(),
+                        dave_active: dave_enabled,
+                        dave_version: target_dave_version,
+                        dave_epoch: dave.map(|d| d.0),
+                        dave_code: dave.map(|d| d.1),
+                    }));
                 }
                 _ = device_check.tick(), if media_connected => {
                     let input_device = self.media_state.input_device.lock().unwrap().clone();
                     if attempted_input_device.as_ref() != Some(&input_device) {
                         attempted_input_device = Some(input_device.clone());
-                        match MicCapture::start(input_device.as_deref(), self.media_state.muted.clone(), {
+                        match MicCapture::start(input_device.as_deref(), self.media_state.muted.clone(), self.media_state.mic.clone(), {
                             let mic_frame_tx = mic_frame_tx.clone();
                             move |frame| { let _ = mic_frame_tx.send(frame); }
                         }) {
                             Ok(new_mic) => {
                                 mic = Some(new_mic);
-                                tracing::info!("voice: microphone switched to {}", input_device.as_deref().unwrap_or("Default"));
+                                tracing::debug!("voice: microphone switched to {}", input_device.as_deref().unwrap_or("Default"));
                             }
                             Err(error) => tracing::warn!("voice: failed to switch microphone to {}: {error}", input_device.as_deref().unwrap_or("Default")),
                         }
@@ -190,7 +229,7 @@ impl VoiceGateway {
                         match SpeakerPlayback::start(output_device.as_deref(), self.media_state.deafened.clone()) {
                             Ok(new_speaker) => {
                                 speaker = Some(new_speaker);
-                                tracing::info!("voice: speaker switched to {}", output_device.as_deref().unwrap_or("Default"));
+                                tracing::debug!("voice: speaker switched to {}", output_device.as_deref().unwrap_or("Default"));
                             }
                             Err(error) => tracing::warn!("voice: failed to switch speaker to {}: {error}", output_device.as_deref().unwrap_or("Default")),
                         }
@@ -202,7 +241,7 @@ impl VoiceGateway {
                         if let Some(prev) = last_select_entry {
                             let gap = now.duration_since(prev);
                             if gap > Duration::from_millis(60) {
-                                tracing::warn!("voice: [ws read] {gap:?} since previous select! iteration");
+                                tracing::trace!("voice: [ws read] {gap:?} since previous select! iteration");
                             }
                         }
                         last_select_entry = Some(now);
@@ -234,10 +273,10 @@ impl VoiceGateway {
                                 seq_ack = seq;
                             }
                             if matches!(payload.op, dave::OP_PREPARE_TRANSITION | dave::OP_EXECUTE_TRANSITION | dave::OP_PREPARE_EPOCH) {
-                                tracing::info!("voice: received DAVE control opcode {}, data {:?}", payload.op, payload.d);
+                                tracing::trace!("voice: received DAVE control opcode {}, data {:?}", payload.op, payload.d);
                             }
                             if payload.op == 2 {
-                                tracing::info!("voice: op 2 Ready payload: {:?}", payload.d);
+                                tracing::trace!("voice: op 2 Ready payload: {:?}", payload.d);
                                 if let Err(e) = write.send(WsMessage::Text(json!({ "op": 16, "d": {} }).to_string())).await {
                                     break Err(e.into());
                                 }
@@ -261,14 +300,14 @@ impl VoiceGateway {
                                 if let Some(data) = payload.d.as_ref() {
                                     target_dave_version = data["dave_protocol_version"].as_u64().unwrap_or(0) as u32;
                                     if target_dave_version > 0 {
-                                        tracing::info!("voice: gateway selected DAVE protocol version {target_dave_version}");
+                                        tracing::debug!("voice: gateway selected DAVE protocol version {target_dave_version}");
                                         pending_dave_group_id = data["group_id"].as_u64()
                                             .or_else(|| self.channel_id.parse::<u64>().ok());
                                         if dave_session.has_external_sender() {
                                             if let Some(group_id) = pending_dave_group_id.take() {
                                                 match dave_session.create_new_group(group_id) {
                                                     Ok(package) => {
-                                                        tracing::info!("voice: sending initial DAVE MLS key package");
+                                                        tracing::debug!("voice: sending initial DAVE MLS key package");
                                                         if let Err(e) = write.send(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &package))).await {
                                                             break Err(e.into());
                                                         }
@@ -301,7 +340,7 @@ impl VoiceGateway {
                                     let speaker_id = data["user_id"].as_str();
                                     if ssrc != 0 && speaker_id != Some(self.user_id.as_str()) {
                                         if let Some(user_id) = speaker_id {
-                                            tracing::info!("voice: mapped remote audio SSRC {ssrc} to user {user_id}");
+                                            tracing::debug!("voice: mapped remote audio SSRC {ssrc} to user {user_id}");
                                             remote_speakers.insert(ssrc, user_id.to_string());
                                             if dave_enabled {
                                                 if let Ok(secret) = dave_session.sender_base_secret(user_id) {
@@ -327,7 +366,7 @@ impl VoiceGateway {
                                             recognized_users.push(id.to_string());
                                         }
                                     }
-                                    tracing::info!("voice: gateway recognized {} DAVE users", recognized_users.len());
+                                    tracing::debug!("voice: gateway recognized {} DAVE users", recognized_users.len());
                                 }
                             } else if payload.op == 13 {
                                 if let Some(id) = payload.d.as_ref().and_then(|d| d["user_id"].as_str()) {
@@ -382,13 +421,13 @@ impl VoiceGateway {
                                     pending_frame_epoch_update = false;
                                 }
                                 dave_enabled = target_dave_version > 0;
-                                tracing::info!("voice: executing DAVE transition; protocol version {}, enabled={dave_enabled}", target_dave_version);
+                                tracing::debug!("voice: executing DAVE transition; protocol version {}, enabled={dave_enabled}", target_dave_version);
                                 let _ = tx.send(VoiceGatewayEvent::DaveReady);
                             } else if payload.op == 12 {
                                 if let Some(data) = &payload.d {
                                     let user_id = data["user_id"].as_str();
                                     let audio_ssrc = data["audio_ssrc"].as_u64().unwrap_or_default() as u32;
-                                    tracing::info!("voice: op 12 client connect, user {:?}, audio_ssrc {audio_ssrc}", user_id);
+                                    tracing::debug!("voice: op 12 client connect, user {:?}, audio_ssrc {audio_ssrc}", user_id);
                                     if let (Some(user_id), true) = (user_id, audio_ssrc != 0) {
                                         remote_speakers.insert(audio_ssrc, user_id.to_string());
                                         if dave_enabled {
@@ -407,8 +446,14 @@ impl VoiceGateway {
                                         }
                                     }
                                 }
+                            } else if payload.op == 6 {
+                                let sent = payload.d.as_ref().and_then(|d| d.get("t").and_then(Value::as_u64).or_else(|| d.as_u64()));
+                                if let Some(sent) = sent {
+                                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                    ws_rtt_ms = Some(now.saturating_sub(sent) as u32);
+                                }
                             } else if !matches!(payload.op, 3 | 8) {
-                                tracing::info!("voice: unhandled opcode {}, data {:?}", payload.op, payload.d);
+                                tracing::trace!("voice: unhandled opcode {}, data {:?}", payload.op, payload.d);
                             }
                             if let Err(e) = handle_payload(payload, &tx) {
                                 break Err(e);
@@ -427,7 +472,7 @@ impl VoiceGateway {
                                 matches!(frame.opcode, dave::OP_MLS_ANNOUNCE_COMMIT_TRANSITION | dave::OP_MLS_WELCOME)
                                     && frame.payload.get(..2).is_some_and(|id| id == [0, 0])
                             });
-                            tracing::info!("voice: received DAVE binary opcode {:?}", opcode);
+                            tracing::trace!("voice: received DAVE binary opcode {:?}", opcode);
                             if matches!(opcode, Some(dave::OP_MLS_ANNOUNCE_COMMIT_TRANSITION | dave::OP_MLS_WELCOME)) {
                                 target_dave_version = dave::DAVE_PROTOCOL_VERSION;
                             }
@@ -443,7 +488,7 @@ impl VoiceGateway {
                                         frame_crypto.execute_epoch();
                                         pending_frame_epoch_update = false;
                                         dave_enabled = target_dave_version > 0;
-                                        tracing::info!("voice: executed initial DAVE transition 0 locally; protocol version {}, enabled={dave_enabled}", target_dave_version);
+                                        tracing::debug!("voice: executed initial DAVE transition 0 locally; protocol version {}, enabled={dave_enabled}", target_dave_version);
                                     }
                                     if let Err(e) = write.send(reply).await {
                                         break Err(e.into());
@@ -477,7 +522,7 @@ impl VoiceGateway {
                         if let Some(prev) = last_select_entry {
                             let gap = now.duration_since(prev);
                             if gap > Duration::from_millis(60) {
-                                tracing::warn!("voice: [drive_rtc] {gap:?} since previous select! iteration");
+                                tracing::trace!("voice: [drive_rtc] {gap:?} since previous select! iteration");
                             }
                         }
                         last_select_entry = Some(now);
@@ -507,12 +552,12 @@ impl VoiceGateway {
 
                             let input_device = self.media_state.input_device.lock().unwrap().clone();
                             attempted_input_device = Some(input_device.clone());
-                            match MicCapture::start(input_device.as_deref(), self.media_state.muted.clone(), {
+                            match MicCapture::start(input_device.as_deref(), self.media_state.muted.clone(), self.media_state.mic.clone(), {
                                 let mic_frame_tx = mic_frame_tx.clone();
                                 move |frame| { let _ = mic_frame_tx.send(frame); }
                             }) {
                                 Ok(m) => {
-                                    tracing::info!("voice: mic capture started");
+                                    tracing::debug!("voice: mic capture started");
                                     mic = Some(m);
                                 }
                                 Err(e) => tracing::warn!("voice: failed to start mic capture: {e}"),
@@ -521,7 +566,7 @@ impl VoiceGateway {
                             attempted_output_device = Some(output_device.clone());
                             match SpeakerPlayback::start(output_device.as_deref(), self.media_state.deafened.clone()) {
                                 Ok(s) => {
-                                    tracing::info!("voice: speaker playback started");
+                                    tracing::debug!("voice: speaker playback started");
                                     speaker = Some(s);
                                 }
                                 Err(e) => tracing::warn!("voice: failed to start speaker playback: {e}"),
@@ -536,7 +581,7 @@ impl VoiceGateway {
                             received_audio_frame_count += 1;
                             bytes_received += payload.len() as u64;
                             if received_audio_frame_count == 1 || received_audio_frame_count % 50 == 0 {
-                                tracing::info!("voice: received {received_audio_frame_count} decoded RTP audio events; latest SSRC {ssrc}, {} bytes, DAVE enabled={dave_enabled}", payload.len());
+                                tracing::trace!("voice: received {received_audio_frame_count} decoded RTP audio events; latest SSRC {ssrc}, {} bytes, DAVE enabled={dave_enabled}", payload.len());
                             }
                             if payload.is_empty() {
                                 continue;
@@ -553,7 +598,7 @@ impl VoiceGateway {
                                 payload
                             } else if dave_enabled {
                                 let Some(user_id) = remote_speakers.get(&ssrc).and_then(|id| id.parse::<u64>().ok()) else {
-                                    tracing::warn!("voice: no speaker identity for encrypted stream SSRC {ssrc}");
+                                    tracing::debug!("voice: no speaker identity for encrypted stream SSRC {ssrc}");
                                     continue;
                                 };
                                 match frame_crypto.decrypt(user_id, &payload) {
@@ -574,16 +619,25 @@ impl VoiceGateway {
                                 payload
                             };
                             match codec.decode(ssrc, &decoded_payload) {
-                                Ok(pcm) => {
+                                Ok(mut pcm) => {
                                     decode_success_count += 1;
+                                    let user_gain = remote_speakers
+                                        .get(&ssrc)
+                                        .and_then(|user| self.media_state.user_volumes.lock().unwrap().get(user).copied())
+                                        .unwrap_or(1.0);
+                                    if user_gain != 1.0 {
+                                        for s in pcm.iter_mut() {
+                                            *s = (*s as f32 * user_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                                        }
+                                    }
                                     if decode_success_count == 1 || decode_success_count % 50 == 0 {
                                         let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                                        tracing::info!("voice: decoded {decode_success_count} audio frames so far, latest peak sample magnitude {peak}");
+                                        tracing::trace!("voice: decoded {decode_success_count} audio frames so far, latest peak sample magnitude {peak}");
                                     }
                                     if let Some(speaker) = speaker.as_ref() {
                                         speaker.push_frame(ssrc, pcm);
                                     } else {
-                                        tracing::warn!("voice: decoded audio but no speaker available");
+                                        tracing::debug!("voice: decoded audio but no speaker available");
                                     }
                                 }
                                 Err(e) => {
@@ -629,13 +683,13 @@ impl VoiceGateway {
                     if let Some(prev) = last_select_entry {
                         let gap = now.duration_since(prev);
                         if gap > Duration::from_millis(60) {
-                            tracing::warn!("voice: [mic_frame_rx] {gap:?} since previous select! iteration (queue depth now {}, DAVE enabled={dave_enabled})", mic_frame_rx.len());
+                            tracing::trace!("voice: [mic_frame_rx] {gap:?} since previous select! iteration (queue depth now {}, DAVE enabled={dave_enabled})", mic_frame_rx.len());
                         }
                     }
                     last_select_entry = Some(now);
                     mic_frame_count += 1;
                     if mic_frame_count % 50 == 0 {
-                        tracing::info!("voice: sent {mic_frame_count} mic frames so far");
+                        tracing::trace!("voice: sent {mic_frame_count} mic frames so far");
                     }
                     if speaking_activity.insert(self.user_id.clone(), Instant::now()).is_none() {
                         let local_ssrc = rtc.as_ref().map(|r| r.audio_ssrc()).unwrap_or_default();
@@ -647,7 +701,7 @@ impl VoiceGateway {
                                 match frame_crypto.encrypt(&opus_payload) {
                                     Some(encrypted) => encrypted,
                                     None => {
-                                        tracing::warn!("voice: DAVE encryption failed; dropping audio frame");
+                                        tracing::debug!("voice: DAVE encryption failed; dropping audio frame");
                                         continue;
                                     }
                                 }
@@ -656,17 +710,17 @@ impl VoiceGateway {
                             };
                             if let Some(active_rtc) = rtc.as_mut() {
                                 if mic_frame_count == 1 || mic_frame_count % 100 == 0 {
-                                    tracing::info!("voice: submitting {} byte Opus frame to RTC, DAVE enabled={dave_enabled}", outgoing_payload.len());
+                                    tracing::trace!("voice: submitting {} byte Opus frame to RTC, DAVE enabled={dave_enabled}", outgoing_payload.len());
                                 }
                                 bytes_sent += outgoing_payload.len() as u64;
                                 if let Err(e) = active_rtc.send_audio_frame(&outgoing_payload) {
-                                    tracing::warn!("voice: failed to send audio frame: {e}");
+                                    tracing::debug!("voice: failed to send audio frame: {e}");
                                 }
                             } else {
-                                tracing::warn!("voice: have mic frame but no active rtc");
+                                tracing::debug!("voice: have mic frame but no active rtc");
                             }
                         }
-                        Err(e) => tracing::warn!("voice: opus encode failed: {e}"),
+                        Err(e) => tracing::debug!("voice: opus encode failed: {e}"),
                     }
                 }
             }
@@ -754,17 +808,17 @@ fn handle_dave_frame(
             dave_session.set_external_sender(&frame.payload)?;
             if let Some(group_id) = pending_group_id.take() {
                 let package = dave_session.create_new_group(group_id)?;
-                tracing::info!("voice: sending DAVE MLS key package for group initialization");
+                tracing::debug!("voice: sending DAVE MLS key package for group initialization");
                 Ok(Some(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_KEY_PACKAGE, &package))))
             } else {
                 Ok(None)
             }
         }
         dave::OP_MLS_PROPOSALS => {
-            tracing::info!("voice: processing DAVE MLS proposals");
+            tracing::debug!("voice: processing DAVE MLS proposals");
             match dave_session.process_proposals(&frame.payload, recognized_users)? {
                 Some(commit_welcome) => {
-                    tracing::info!("voice: sending DAVE MLS commit and welcome ({} bytes)", commit_welcome.len());
+                    tracing::debug!("voice: sending DAVE MLS commit and welcome ({} bytes)", commit_welcome.len());
                     Ok(Some(WsMessage::Binary(dave::encode_client_frame(dave::OP_MLS_COMMIT_WELCOME, &commit_welcome))))
                 }
                 None => Ok(None),
@@ -774,16 +828,16 @@ fn handle_dave_frame(
             if frame.payload.len() < 2 { return Err(ClientError::GatewayClosed("dave commit frame missing transition ID".into())); }
             let transition_id = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
             dave_session.process_commit(&frame.payload[2..])?;
-            tracing::info!("voice: applied DAVE MLS commit for transition {transition_id}");
-            tracing::info!("voice: acknowledging DAVE transition {transition_id}");
+            tracing::debug!("voice: applied DAVE MLS commit for transition {transition_id}");
+            tracing::debug!("voice: acknowledging DAVE transition {transition_id}");
             Ok(Some(WsMessage::Text(json!({"op": 23, "d": {"transition_id": transition_id}}).to_string())))
         }
         dave::OP_MLS_WELCOME => {
             if frame.payload.len() < 2 { return Err(ClientError::GatewayClosed("dave welcome frame missing transition ID".into())); }
             let transition_id = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
             dave_session.process_welcome(&frame.payload[2..])?;
-            tracing::info!("voice: applied DAVE MLS welcome for transition {transition_id}");
-            tracing::info!("voice: acknowledging DAVE transition {transition_id}");
+            tracing::debug!("voice: applied DAVE MLS welcome for transition {transition_id}");
+            tracing::debug!("voice: acknowledging DAVE transition {transition_id}");
             Ok(Some(WsMessage::Text(json!({"op": 23, "d": {"transition_id": transition_id}}).to_string())))
         }
         dave::OP_EXECUTE_TRANSITION => {

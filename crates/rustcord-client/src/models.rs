@@ -160,14 +160,72 @@ pub struct Message {
     pub mentions: Vec<User>,
     #[serde(default)]
     pub referenced_message: Option<Box<Message>>,
-    #[serde(default)]
-    pub embeds: Vec<serde_json::Value>,
+    #[serde(default, deserialize_with = "lenient_embeds")]
+    pub embeds: Vec<Embed>,
     #[serde(rename = "type", default)]
     pub kind: u8,
     #[serde(default)]
     pub call: Option<CallInfo>,
 }
 
+/// Drops embeds that don't fit our model instead of failing the whole message.
+fn lenient_embeds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Embed>, D::Error> {
+    let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Embed {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub url: Option<String>,
+    pub color: Option<u32>,
+    pub timestamp: Option<String>,
+    pub footer: Option<EmbedText>,
+    pub image: Option<EmbedMedia>,
+    pub thumbnail: Option<EmbedMedia>,
+    pub video: Option<EmbedMedia>,
+    pub provider: Option<EmbedText>,
+    pub author: Option<EmbedText>,
+    #[serde(default)]
+    pub fields: Vec<EmbedField>,
+}
+
+/// Footer / provider / author: only the text and optional link matter to us.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct EmbedText {
+    #[serde(alias = "name", default)]
+    pub text: String,
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct EmbedMedia {
+    #[serde(default)]
+    pub url: String,
+    pub proxy_url: Option<String>,
+}
+
+impl EmbedMedia {
+    /// Prefer Discord's media proxy (no hotlink/privacy issues).
+    pub fn best_url(&self) -> &str {
+        self.proxy_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&self.url)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct EmbedField {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub inline: bool,
+}
+
+/// Payload of a type-3 (call) message.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CallInfo {
     #[serde(default)]

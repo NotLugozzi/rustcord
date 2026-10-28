@@ -280,6 +280,16 @@ impl DaveSession {
         Ok((commit_bytes, welcome_bytes))
     }
 
+    /// MLS epoch and the last 4 bytes of the epoch authenticator. The authenticator is not a key:
+    /// it is meant for out-of-band comparison and is identical for every member of the group.
+    pub fn epoch_info(&self) -> Option<(u64, [u8; 4])> {
+        let group = self.group.as_ref()?;
+        let auth = group.epoch_authenticator().as_slice();
+        let mut code = [0u8; 4];
+        code.copy_from_slice(auth.get(auth.len().checked_sub(4)?..)?);
+        Some((group.epoch().as_u64(), code))
+    }
+
     pub fn sender_base_secret(&self, user_id: &str) -> Result<[u8; 16], ClientError> {
         let Some(group) = self.group.as_ref() else {
             return Err(ClientError::GatewayClosed("dave: no active MLS group for media key export".into()));

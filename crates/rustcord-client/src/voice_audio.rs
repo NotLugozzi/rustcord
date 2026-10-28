@@ -25,6 +25,55 @@ fn audio_host() -> cpal::Host {
     cpal::default_host()
 }
 
+#[derive(Clone)]
+pub struct MicProcessing {
+    gain_bits: Arc<std::sync::atomic::AtomicU32>,
+    pub denoise: Arc<AtomicBool>,
+}
+
+impl Default for MicProcessing {
+    fn default() -> Self {
+        Self { gain_bits: Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits())), denoise: Arc::new(AtomicBool::new(false)) }
+    }
+}
+
+impl MicProcessing {
+    pub fn set_gain(&self, gain: f32) {
+        self.gain_bits.store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    fn gain(&self) -> f32 {
+        f32::from_bits(self.gain_bits.load(Ordering::Relaxed))
+    }
+}
+
+fn process_mic_frame(frame: &mut [i16], processing: &MicProcessing, denoiser: &mut Option<Box<nnnoiseless::DenoiseState<'static>>>) {
+    let gain = processing.gain();
+    let denoise = processing.denoise.load(Ordering::Relaxed);
+    if !denoise && gain == 1.0 {
+        return;
+    }
+    const RNN_FRAME: usize = nnnoiseless::DenoiseState::FRAME_SIZE;
+    if denoise {
+        let state = denoiser.get_or_insert_with(nnnoiseless::DenoiseState::new);
+        for chunk in frame.chunks_exact_mut(RNN_FRAME) {
+            let mut input = [0f32; RNN_FRAME];
+            let mut output = [0f32; RNN_FRAME];
+            for (dst, &s) in input.iter_mut().zip(chunk.iter()) {
+                *dst = s as f32;
+            }
+            state.process_frame(&mut output, &input);
+            for (dst, &s) in chunk.iter_mut().zip(output.iter()) {
+                *dst = (s * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            }
+        }
+    } else {
+        for s in frame.iter_mut() {
+            *s = (*s as f32 * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+}
+
 pub struct MicCapture {
     _stream: cpal::Stream,
     pub muted: Arc<AtomicBool>,
@@ -34,6 +83,7 @@ impl MicCapture {
     pub fn start(
         device_name: Option<&str>,
         muted: Arc<AtomicBool>,
+        processing: MicProcessing,
         mut on_frame: impl FnMut(Vec<i16>) + Send + 'static,
     ) -> Result<Self, ClientError> {
         let host = audio_host();
@@ -48,6 +98,7 @@ impl MicCapture {
         const GATE_THRESHOLD: i64 = 200;
         const GATE_HANG_FRAMES: u32 = 15;
         let mut gate_hang_remaining: u32 = 0;
+        let mut denoiser: Option<Box<nnnoiseless::DenoiseState<'static>>> = None;
 
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: input stream error: {e}");
         let stream = device
@@ -59,7 +110,8 @@ impl MicCapture {
                     }
                     pending.extend_from_slice(data);
                     while pending.len() >= FRAME_SAMPLES {
-                        let frame: Vec<i16> = pending.drain(..FRAME_SAMPLES).collect();
+                        let mut frame: Vec<i16> = pending.drain(..FRAME_SAMPLES).collect();
+                        process_mic_frame(&mut frame, &processing, &mut denoiser);
                         let sum_sq: i64 = frame.iter().map(|&s| (s as i64) * (s as i64)).sum();
                         let rms = ((sum_sq / frame.len() as i64) as f64).sqrt() as i64;
                         if rms >= GATE_THRESHOLD {
@@ -265,6 +317,36 @@ pub fn play_ringtone(stop: Arc<AtomicBool>) {
         }
         while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+}
+
+pub fn play_ding(join: bool, device_name: Option<String>) {
+    std::thread::spawn(move || {
+        let host = audio_host();
+        let Some(device) = find_device(&host, device_name.as_deref(), false) else { return };
+        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
+        let (first, second) = if join { (660.0f32, 880.0f32) } else { (880.0, 660.0) };
+        let note = SAMPLE_RATE as usize / 8;
+        let mut n: usize = 0;
+        let Ok(stream) = device.build_output_stream(
+            config,
+            move |out: &mut [i16], _| {
+                for s in out.iter_mut() {
+                    let i = n % (note * 2);
+                    let (freq, pos) = if n < note { (first, n) } else { (second, n - note) };
+                    let env = 1.0 - pos as f32 / note as f32;
+                    *s = if n < note * 2 { ((i as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 2500.0 * env) as i16 } else { 0 };
+                    n += 1;
+                }
+            },
+            |e: cpal::Error| tracing::warn!("ding stream error: {e}"),
+            None,
+        ) else {
+            return;
+        };
+        if stream.play().is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(400));
         }
     });
 }
