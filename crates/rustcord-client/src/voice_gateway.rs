@@ -23,14 +23,11 @@ pub struct VoiceMediaState {
     pub user_volumes: Arc<std::sync::Mutex<HashMap<String, f32>>>,
 }
 
-/// One-second snapshot of the call's health, for the connection-info panel.
 #[derive(Debug, Clone, Default)]
 pub struct VoiceStats {
     pub bitrate_up_bps: u32,
     pub bitrate_down_bps: u32,
-    /// Voice-gateway websocket heartbeat round trip.
     pub ws_rtt_ms: Option<u32>,
-    /// Media (RTCP) round trip from str0m.
     pub rtc_rtt_ms: Option<f32>,
     pub loss_up_pct: Option<f32>,
     pub loss_down_pct: Option<f32>,

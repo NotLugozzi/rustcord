@@ -1,9 +1,9 @@
-Emoji graphics in sheet.png are derived from Twemoji by Twitter, Inc. and other
-contributors, licensed under CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
+Emoji graphics are Twemoji by Twitter, Inc. and other contributors, licensed under
+CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
 
-Source: https://github.com/jdecked/twemoji (or the original twitter/twemoji project)
+Source: https://github.com/jdecked/twemoji (successor to twitter/twemoji), v15.1.0.
 
-Graphics were extracted from the Twemoji Color Emoji SVGinOT font and rasterized
-to a single spritesheet (see src/emoji_font_coverage.rs and index.json for the
-generation approach); no modifications were made to the artwork itself beyond
-cropping to each glyph's natural bounds and scaling to 64x64px.
+Most emoji are downloaded on demand (72x72 PNG) and cached on disk; the few in
+assets/emoji/ui/ are bundled copies used by the UI itself. index.json is only a
+list of the single codepoints we render as emoji. No modifications were made to
+the artwork.

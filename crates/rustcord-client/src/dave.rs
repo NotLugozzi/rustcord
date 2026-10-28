@@ -280,8 +280,6 @@ impl DaveSession {
         Ok((commit_bytes, welcome_bytes))
     }
 
-    /// MLS epoch and the last 4 bytes of the epoch authenticator. The authenticator is not a key:
-    /// it is meant for out-of-band comparison and is identical for every member of the group.
     pub fn epoch_info(&self) -> Option<(u64, [u8; 4])> {
         let group = self.group.as_ref()?;
         let auth = group.epoch_authenticator().as_slice();

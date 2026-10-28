@@ -50,6 +50,33 @@ async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+async fn save_attachment(url: &str, filename: &str) -> Result<std::path::PathBuf, String> {
+    use tokio::io::AsyncWriteExt;
+    let dir = directories::UserDirs::new()
+        .and_then(|d| d.download_dir().map(|p| p.to_path_buf()))
+        .ok_or("no Downloads folder")?;
+    let name = std::path::Path::new(filename).file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()).unwrap_or("attachment");
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (name.to_string(), String::new()),
+    };
+    let mut path = dir.join(name);
+    for n in 1.. {
+        if !path.exists() {
+            break;
+        }
+        path = dir.join(format!("{stem} ({n}){ext}"));
+    }
+    let client = HTTP.get_or_init(reqwest::Client::new);
+    let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+    let mut file = tokio::fs::File::create(&path).await.map_err(|e| e.to_string())?;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+    }
+    file.flush().await.map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
 pub(crate) static VOICE_MEDIA_STATE: std::sync::Mutex<Option<rustcord_client::voice_gateway::VoiceMediaState>> = std::sync::Mutex::new(None);
 
@@ -72,6 +99,7 @@ pub enum UiCommand {
         reply_to: Option<String>,
     },
     DownloadImage { url: String },
+    SaveAttachment { url: String, filename: String },
     OpenDmWithUser { user_id: String },
     RefreshDmChannels,
     StartTyping { channel_id: String },
@@ -86,6 +114,8 @@ pub enum UiCommand {
     LeaveVoiceChannel { guild_id: Option<String> },
     SetVoiceMuteDeaf { guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
     SetVoiceInputDevice { device: Option<String> },
+    SetMicProcessing { gain: f32, denoise: bool },
+    SetUserVolume { user_id: String, volume: f32 },
     SetVoiceOutputDevice { device: Option<String> },
     LoadVoiceDevices,
     Logout,
@@ -112,7 +142,8 @@ pub enum BackendEvent {
     VoiceConnected,
     VoiceDisconnected,
     VoiceSpeaking { user_id: String, speaking: bool },
-    VoiceStats { bitrate_up_bps: u32, bitrate_down_bps: u32 },
+    VoiceStats(rustcord_client::voice_gateway::VoiceStats),
+    Notice(String),
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
 }
 
@@ -265,6 +296,16 @@ pub fn spawn(
                         let _ = event_tx.send(BackendEvent::ImageDownloaded { url, image });
                     });
                 }
+                UiCommand::SaveAttachment { url, filename } => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let event = match save_attachment(&url, &filename).await {
+                            Ok(path) => BackendEvent::Notice(format!("Saved to {}", path.display())),
+                            Err(e) => BackendEvent::Error(format!("failed to save {filename}: {e}")),
+                        };
+                        let _ = event_tx.send(event);
+                    });
+                }
                 UiCommand::StartTyping { channel_id } => {
                     if let Some(client) = &rest {
                         if let Err(e) = client.trigger_typing(&channel_id).await {
@@ -395,6 +436,17 @@ pub fn spawn(
                         media_state.deafened.store(self_deaf, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                UiCommand::SetMicProcessing { gain, denoise } => {
+                    if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        media_state.mic.set_gain(gain);
+                        media_state.mic.denoise.store(denoise, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                UiCommand::SetUserVolume { user_id, volume } => {
+                    if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        media_state.user_volumes.lock().unwrap().insert(user_id, volume);
+                    }
+                }
                 UiCommand::SetVoiceInputDevice { device } => {
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
                         *media_state.input_device.lock().unwrap() = device;
@@ -454,8 +506,11 @@ fn try_spawn_voice_gateway(
     let media_state = rustcord_client::voice_gateway::VoiceMediaState {
         input_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.input_device)),
         output_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.output_device)),
+        user_volumes: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.user_volumes)),
         ..Default::default()
     };
+    media_state.mic.set_gain(saved_settings.mic_gain.unwrap_or(1.0));
+    media_state.mic.denoise.store(saved_settings.denoise, std::sync::atomic::Ordering::Relaxed);
     *VOICE_MEDIA_STATE.lock().unwrap() = Some(media_state.clone());
 
     let voice_gateway =
@@ -478,8 +533,8 @@ fn try_spawn_voice_gateway(
                 VoiceGatewayEvent::Speaking { user_id: Some(user_id), speaking, .. } => {
                     let _ = forward_tx.send(BackendEvent::VoiceSpeaking { user_id, speaking });
                 }
-                VoiceGatewayEvent::Stats { bitrate_up_bps, bitrate_down_bps } => {
-                    let _ = forward_tx.send(BackendEvent::VoiceStats { bitrate_up_bps, bitrate_down_bps });
+                VoiceGatewayEvent::Stats(stats) => {
+                    let _ = forward_tx.send(BackendEvent::VoiceStats(stats));
                 }
                 _ => {}
             }

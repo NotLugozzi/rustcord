@@ -68,9 +68,12 @@ enum Entry {
     Failed,
 }
 
+const MAX_EMOJI_IN_FLIGHT: usize = 16;
+
 #[derive(Default)]
 pub struct TextureCache {
     entries: HashMap<String, Entry>,
+    wanted: std::cell::RefCell<std::collections::HashSet<String>>,
     total_bytes: usize,
     pub animating: bool,
 }
@@ -82,6 +85,23 @@ impl TextureCache {
         }
         self.entries.insert(url.to_string(), Entry::Pending);
         let _ = cmd_tx.send(crate::backend::UiCommand::DownloadImage { url: url.to_string() });
+    }
+
+    pub fn want(&self, url: &str) {
+        if !self.entries.contains_key(url) {
+            self.wanted.borrow_mut().insert(url.to_string());
+        }
+    }
+
+    pub fn flush_wanted(&mut self, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let wanted = std::mem::take(&mut *self.wanted.borrow_mut());
+        if wanted.is_empty() {
+            return;
+        }
+        let in_flight = self.entries.iter().filter(|(url, e)| matches!(e, Entry::Pending) && url.starts_with(crate::emoji::BASE_URL)).count();
+        for url in wanted.into_iter().take(MAX_EMOJI_IN_FLIGHT.saturating_sub(in_flight)) {
+            self.request(&url, cmd_tx);
+        }
     }
 
     pub fn ingest(&mut self, url: String, decoded: Decoded, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut imgui_wgpu::Renderer) {

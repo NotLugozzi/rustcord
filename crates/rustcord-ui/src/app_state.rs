@@ -135,6 +135,9 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub last_seen_message_count: HashMap<String, usize>,
     pub loading_older_messages: bool,
+    pub mic_gain: f32,
+    pub denoise: bool,
+    pub user_volumes: HashMap<String, f32>,
     pub history_exhausted: std::collections::HashSet<String>,
     pub incoming_calls: Vec<String>,
     pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -162,8 +165,10 @@ pub struct AppState {
     pub self_deafened: bool,
     pub voice_input_devices: Vec<String>,
     pub voice_output_devices: Vec<String>,
-    pub voice_bitrate_up_bps: u32,
-    pub voice_bitrate_down_bps: u32,
+    pub voice_stats: rustcord_client::voice_gateway::VoiceStats,
+    pub voice_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
+    pub show_voice_info: bool,
+    pub voice_joined_at: Option<std::time::Instant>,
     pub selected_input_device: Option<String>,
     pub selected_output_device: Option<String>,
     pub show_voice_device_picker: bool,
@@ -556,6 +561,15 @@ impl AppState {
             .collect()
     }
 
+    pub fn audio_settings(&self) -> crate::settings::Settings {
+        crate::settings::Settings {
+            mic_gain: Some(self.mic_gain),
+            denoise: self.denoise,
+            user_volumes: self.user_volumes.clone(),
+            ..Default::default()
+        }
+    }
+
     pub fn sync_ringtone(&mut self) {
         use std::sync::atomic::{AtomicBool, Ordering};
         match (self.incoming_calls.is_empty(), self.ringtone_stop.is_some()) {
@@ -573,11 +587,35 @@ impl AppState {
         }
     }
 
+    pub fn ding_for_voice_state(&self, voice_state: &rustcord_client::models::VoiceState) {
+        let Some((_, my_channel)) = &self.connected_voice_channel else { return };
+        if self.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) || self.self_deafened {
+            return;
+        }
+        if self.voice_joined_at.is_none_or(|t| t.elapsed() < std::time::Duration::from_secs(2)) {
+            return;
+        }
+        let was_in = self
+            .voice_channel_states
+            .values()
+            .flatten()
+            .any(|s| s.user_id == voice_state.user_id && s.channel_id.as_ref() == Some(my_channel));
+        let is_in = voice_state.channel_id.as_ref() == Some(my_channel);
+        if was_in != is_in {
+            rustcord_client::voice_audio::play_ding(is_in, self.selected_output_device.clone());
+        }
+    }
+
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
         if let Some(user) = voice_state.member.as_ref().and_then(|m| m.user.clone()) {
             self.known_users.insert(voice_state.user_id.clone(), user);
         }
-        let Some(guild_id) = voice_state.guild_id.clone().or_else(|| voice_state.channel_id.clone()) else { return };
+        let Some(guild_id) = voice_state.guild_id.clone().or_else(|| voice_state.channel_id.clone()) else {
+            for states in self.voice_channel_states.values_mut() {
+                states.retain(|s| s.user_id != voice_state.user_id);
+            }
+            return;
+        };
         let states = self.voice_channel_states.entry(guild_id).or_default();
         states.retain(|s| s.user_id != voice_state.user_id);
         if voice_state.channel_id.is_some() {

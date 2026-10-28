@@ -107,7 +107,7 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
             i += consumed;
             continue;
         }
-        if crate::emoji_sprites::lookup(chars[i]).is_some() {
+        if crate::emoji::is_emoji(chars[i]) {
             flush!();
             spans.push(Span::UnicodeEmoji { ch: chars[i] });
             i += 1;

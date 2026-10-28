@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Settings {
     pub theme_file: Option<String>,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
+    pub mic_gain: Option<f32>,
+    pub denoise: bool,
+    pub user_volumes: std::collections::HashMap<String, f32>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {

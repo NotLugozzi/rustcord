@@ -168,7 +168,6 @@ pub struct Message {
     pub call: Option<CallInfo>,
 }
 
-/// Drops embeds that don't fit our model instead of failing the whole message.
 fn lenient_embeds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Embed>, D::Error> {
     let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
     Ok(raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
@@ -193,7 +192,6 @@ pub struct Embed {
     pub fields: Vec<EmbedField>,
 }
 
-/// Footer / provider / author: only the text and optional link matter to us.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EmbedText {
     #[serde(alias = "name", default)]
@@ -209,7 +207,6 @@ pub struct EmbedMedia {
 }
 
 impl EmbedMedia {
-    /// Prefer Discord's media proxy (no hotlink/privacy issues).
     pub fn best_url(&self) -> &str {
         self.proxy_url.as_deref().filter(|u| !u.is_empty()).unwrap_or(&self.url)
     }
@@ -225,7 +222,6 @@ pub struct EmbedField {
     pub inline: bool,
 }
 
-/// Payload of a type-3 (call) message.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CallInfo {
     #[serde(default)]

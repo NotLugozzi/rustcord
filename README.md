@@ -47,6 +47,11 @@ Use at your own risk.
 - [ ] Server users panel (low priority)
 - [ ] server admin actions (low priority)
 
+## Credits
+
+Emoji artwork is [Twemoji](https://github.com/jdecked/twemoji) © Twitter, Inc. and other contributors, licensed
+[CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Emoji are fetched on demand and cached locally.
+
 ## Build prerequisites (Linux)
 
 Captcha handling uses an embedded WebKitGTK webview (`wry`/`tao`). Install

@@ -1,7 +1,7 @@
 mod app_state;
 mod backend;
 mod clipboard;
-mod emoji_sprites;
+mod emoji;
 mod images;
 mod ipc;
 mod markdown;
@@ -34,6 +34,9 @@ fn main() {
         window_focused: true,
         groups: app_state::load_groups(),
         notes: app_state::load_notes(),
+        mic_gain: saved_settings.mic_gain.unwrap_or(1.0),
+        denoise: saved_settings.denoise,
+        user_volumes: saved_settings.user_volumes,
         selected_input_device: saved_settings.input_device,
         selected_output_device: saved_settings.output_device,
         rail_folders,
@@ -112,7 +115,7 @@ pub fn drain_backend_events(
             BackendEvent::RpcApps(apps) => {
                 state.rpc_apps = apps;
             }
-            BackendEvent::Error(err) => {
+            BackendEvent::Error(err) | BackendEvent::Notice(err) => {
                 state.status_message = Some(err);
             }
             BackendEvent::Gateway(GatewayEvent::Connecting) => {
@@ -185,8 +188,13 @@ pub fn drain_backend_events(
                 }
             }
             BackendEvent::Gateway(GatewayEvent::VoiceStateUpdate(voice_state)) => {
+                state.ding_for_voice_state(&voice_state);
                 if state.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) {
-                    state.connected_voice_channel = voice_state.channel_id.clone().map(|cid| (voice_state.guild_id.clone(), cid));
+                    let new_channel = voice_state.channel_id.clone().map(|cid| (voice_state.guild_id.clone(), cid));
+                    if new_channel != state.connected_voice_channel {
+                        state.voice_joined_at = new_channel.is_some().then(std::time::Instant::now);
+                    }
+                    state.connected_voice_channel = new_channel;
                     if let Some(cid) = &voice_state.channel_id {
                         state.incoming_calls.retain(|c| c != cid);
                         state.sync_ringtone();
@@ -226,15 +234,20 @@ pub fn drain_backend_events(
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
                 state.voice_speaking_users.clear();
-                state.voice_bitrate_up_bps = 0;
-                state.voice_bitrate_down_bps = 0;
+                state.voice_stats = Default::default();
+                state.voice_history.clear();
+                state.show_voice_info = false;
+                state.voice_joined_at = None;
             }
             BackendEvent::VoiceSpeaking { user_id, speaking } => {
                 state.set_voice_speaking(user_id, speaking);
             }
-            BackendEvent::VoiceStats { bitrate_up_bps, bitrate_down_bps } => {
-                state.voice_bitrate_up_bps = bitrate_up_bps;
-                state.voice_bitrate_down_bps = bitrate_down_bps;
+            BackendEvent::VoiceStats(stats) => {
+                if state.voice_history.len() >= 120 {
+                    state.voice_history.pop_front();
+                }
+                state.voice_history.push_back(stats.clone());
+                state.voice_stats = stats;
             }
             BackendEvent::VoiceDevicesLoaded { inputs, outputs } => {
                 state.voice_input_devices = inputs;

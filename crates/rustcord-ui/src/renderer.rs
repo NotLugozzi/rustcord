@@ -151,8 +151,9 @@ impl AppWindow {
         };
 
         let mut textures = TextureCache::default();
-        let emoji_sheet = crate::images::decode(crate::emoji_sprites::SHEET_BYTES);
-        textures.ingest(crate::emoji_sprites::SHEET_URL.to_string(), emoji_sheet, &device, &queue, &mut imgui.renderer);
+        for (ch, bytes) in crate::emoji::BUNDLED {
+            textures.ingest(crate::emoji::url(*ch), crate::images::decode(bytes), &device, &queue, &mut imgui.renderer);
+        }
 
         Self {
             device,
@@ -206,6 +207,7 @@ impl AppWindow {
         let fonts = imgui.fonts;
         let frame_ui = imgui.context.frame();
         ui::draw(frame_ui, state, cmd_tx, &mut self.textures, &fonts);
+        self.textures.flush_wanted(cmd_tx);
 
         if imgui.last_cursor != frame_ui.mouse_cursor() {
             imgui.last_cursor = frame_ui.mouse_cursor();
