@@ -162,6 +162,17 @@ pub struct Message {
     pub referenced_message: Option<Box<Message>>,
     #[serde(default)]
     pub embeds: Vec<serde_json::Value>,
+    #[serde(rename = "type", default)]
+    pub kind: u8,
+    #[serde(default)]
+    pub call: Option<CallInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CallInfo {
+    #[serde(default)]
+    pub participants: Vec<Snowflake>,
+    pub ended_timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize_repr, Serialize_repr)]

@@ -81,7 +81,8 @@ pub enum UiCommand {
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
-    JoinVoiceChannel { guild_id: Option<String>, channel_id: String },
+    JoinVoiceChannel { guild_id: Option<String>, channel_id: String, ring: bool },
+    DeclineCall { channel_id: String },
     LeaveVoiceChannel { guild_id: Option<String> },
     SetVoiceMuteDeaf { guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
     SetVoiceInputDevice { device: Option<String> },
@@ -341,12 +342,39 @@ pub fn spawn(
                     presence::set_enabled(conn_id, enabled);
                     presence::publish(&event_tx);
                 }
-                UiCommand::JoinVoiceChannel { guild_id, channel_id } => {
+                UiCommand::JoinVoiceChannel { guild_id, channel_id, ring } => {
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                         let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), false, false);
                         let _ = tx.send(frame);
                     }
+                    if guild_id.is_none() && ring {
+                        if let Some(client) = rest.clone() {
+                            let event_tx = event_tx.clone();
+                            let channel_id = channel_id.clone();
+                            tokio::spawn(async move {
+                                let mut last_err = None;
+                                for _ in 0..4 {
+                                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                                    match client.ring_call(&channel_id).await {
+                                        Ok(()) => return,
+                                        Err(e) => last_err = Some(e),
+                                    }
+                                }
+                                if let Some(e) = last_err {
+                                    tracing::warn!("ring call failed: {e}");
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to ring: {e}")));
+                                }
+                            });
+                        }
+                    }
                     let _ = event_tx.send(BackendEvent::VoiceConnecting);
+                }
+                UiCommand::DeclineCall { channel_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.stop_ringing(&channel_id).await {
+                            tracing::warn!("decline call failed: {e}");
+                        }
+                    }
                 }
                 UiCommand::LeaveVoiceChannel { guild_id } => {
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
@@ -584,7 +612,6 @@ async fn start_session(
                     if vs.channel_id.is_some() {
                         let pending = pending_session.get_or_insert_with(VoicePending::default);
                         pending.session_id = Some(vs.session_id.clone());
-                        pending.guild_id = vs.guild_id.clone();
                         pending.channel_id = vs.channel_id.clone();
                         try_spawn_voice_gateway(&mut pending_session, &my_user_id, &forward_tx);
                     } else {

@@ -165,9 +165,6 @@ impl SpeakerPlayback {
 
 pub struct AudioCodec {
     encoder: OpusEncoder,
-    // Opus decoders carry per-stream state (packet loss concealment,
-    // continuity); sharing one across multiple remote speakers corrupts
-    // that state and causes audible glitches when people talk at once.
     decoders: std::collections::HashMap<u32, OpusDecoder>,
 }
 
@@ -239,4 +236,35 @@ fn find_device(host: &cpal::Host, name: Option<&str>, input: bool) -> Option<cpa
         }
     }
     if input { host.default_input_device() } else { host.default_output_device() }
+}
+
+pub fn play_ringtone(stop: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let host = audio_host();
+        let Some(device) = find_device(&host, None, false) else { return };
+        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
+        let mut n: u64 = 0;
+        let cycle = SAMPLE_RATE as u64 * 2;
+        let Ok(stream) = device.build_output_stream(
+            config,
+            move |out: &mut [i16], _| {
+                for s in out.iter_mut() {
+                    let t = n % cycle;
+                    let freq = if t < 12_000 { 523.0 } else if (24_000..36_000).contains(&t) { 659.0 } else { 0.0 };
+                    *s = if freq > 0.0 { ((t as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 4000.0) as i16 } else { 0 };
+                    n += 1;
+                }
+            },
+            |e: cpal::Error| tracing::warn!("ringtone stream error: {e}"),
+            None,
+        ) else {
+            return;
+        };
+        if stream.play().is_err() {
+            return;
+        }
+        while !stop.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
 }

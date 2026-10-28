@@ -236,6 +236,36 @@ impl RestClient {
         Ok(())
     }
 
+    pub async fn ring_call(&self, channel_id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
+            .json(&serde_json::json!({ "recipients": null }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
+    pub async fn stop_ringing(&self, channel_id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
+            .json(&serde_json::json!({ "recipients": null }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ClientError> {
         let resp = self
             .http

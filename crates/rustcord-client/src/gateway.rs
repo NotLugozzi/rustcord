@@ -21,7 +21,7 @@ pub enum GatewayEvent {
     MessageCreate(Message),
     TypingStart { channel_id: String, user_id: String },
     PresenceUpdate(Presence),
-    MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String> },
+    MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String>, call: Option<crate::models::CallInfo> },
     MessageDelete { channel_id: String, id: String },
     VoiceStateUpdate(VoiceState),
     VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
@@ -318,6 +318,7 @@ impl Gateway {
                     id: text("id").unwrap_or_default(),
                     content: text("content"),
                     edited_timestamp: text("edited_timestamp"),
+                    call: serde_json::from_value(data["call"].clone()).ok(),
                 }
             }
             Some("MESSAGE_DELETE") => GatewayEvent::MessageDelete {
@@ -334,7 +335,7 @@ impl Gateway {
             }
             Some("VOICE_SERVER_UPDATE") => GatewayEvent::VoiceServerUpdate {
                 token: data["token"].as_str().unwrap_or_default().to_string(),
-                guild_id: data["guild_id"].as_str().unwrap_or_default().to_string(),
+                guild_id: data["guild_id"].as_str().or(data["channel_id"].as_str()).unwrap_or_default().to_string(),
                 endpoint: data["endpoint"].as_str().map(str::to_string),
             },
             Some(other) => GatewayEvent::Unknown { op_name: other.to_string(), raw: data },

@@ -1009,8 +1009,6 @@ fn mention_autocomplete_matches<'a>(state: &'a AppState, partial: &str) -> Vec<&
     matches
 }
 
-/// Mirrors `draw_emoji_autocomplete`'s mechanics (popup above the compose bar, arrow-key
-/// navigation, Tab/Enter/click to confirm) for `@mention` instead of `:emoji:`.
 fn draw_mention_autocomplete(
     ui: &Ui,
     state: &mut AppState,
@@ -1390,7 +1388,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         let is_connected = state.connected_voice_channel.as_ref() == Some(&(Some(guild_id.clone()), channel_id.clone()));
                         let label = if is_connected { format!("[voice] {name} (connected)") } else { format!("[voice] {name}") };
                         if ui.selectable(label) && !is_connected && !state.voice_connecting {
-                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone() });
+                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
                             state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
                         }
                         let member_ids: Vec<String> = state.members_in_voice_channel(&guild_id, channel_id).into_iter().map(|m| m.user_id.clone()).collect();
@@ -1483,9 +1481,13 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let has_new_messages = messages.len() > seen_count;
 
             let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
-            let header_height = if dm_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
+            let mut header_height = if dm_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
             if let Some(dm) = &dm_channel {
                 draw_dm_header(ui, state, cmd_tx, dm);
+                if state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == dm.id) {
+                    draw_dm_call_panel(ui, state, textures, cmd_tx, dm);
+                    header_height += CALL_PANEL_HEIGHT;
+                }
             }
 
             ui.child_window("history")
@@ -1502,6 +1504,21 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     let content_x_offset = AVATAR_SIZE[0] + 12.0;
 
                     for (idx, msg) in messages.iter().enumerate() {
+                        if msg.kind == 3 {
+                            let me = state.current_user.as_ref().map(|u| u.id.as_str()).unwrap_or_default();
+                            let (text, color) = call_message_text(msg, me);
+                            let missed = color.is_none();
+                            let mut pos = ui.cursor_pos();
+                            pos[0] += 24.0 + AVATAR_SIZE[0] + 12.0 - EMOJI_SIZE - 12.0;
+                            ui.set_cursor_pos(pos);
+                            if !draw_unicode_emoji(ui, textures, if missed { '\u{1F4F5}' } else { '\u{1F4DE}' }, [EMOJI_SIZE, EMOJI_SIZE]) {
+                                ui.dummy([EMOJI_SIZE, EMOJI_SIZE]);
+                            }
+                            ui.same_line();
+                            ui.text_colored(state.theme.text_muted, format!("{text}  {}", format_timestamp(&msg.timestamp)));
+                            ui.dummy([0.0, MESSAGE_GAP]);
+                            continue;
+                        }
                         let starts_group = msg.referenced_message.is_some()
                             || match messages.get(idx.wrapping_sub(1)) {
                                 Some(prev) if idx > 0 => {
@@ -1655,7 +1672,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         ui.set_scroll_here_y_with_ratio(1.0);
                     }
 
-                    if !snapping_to_bottom && scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages {
+                    if !snapping_to_bottom && scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages && !state.history_exhausted.contains(&channel_key) {
                         if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), messages.first()) {
                             state.loading_older_messages = true;
                             let _ = cmd_tx.send(UiCommand::LoadOlderMessages {
@@ -1868,6 +1885,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         });
 
     draw_image_lightbox(ui, state, textures);
+    draw_incoming_calls(ui, state, cmd_tx);
 }
 
 fn format_bitrate(bps: u32) -> String {
@@ -2027,6 +2045,59 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     });
 }
 
+fn call_message_text(msg: &rustcord_client::models::Message, me: &str) -> (String, Option<[f32; 4]>) {
+    let name = msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
+    let participated = msg.call.as_ref().is_some_and(|c| c.participants.iter().any(|p| p == me));
+    let duration = msg.call.as_ref().and_then(|c| c.ended_timestamp.as_deref()).and_then(|end| {
+        let start = chrono::DateTime::parse_from_rfc3339(&msg.timestamp).ok()?;
+        let secs = (chrono::DateTime::parse_from_rfc3339(end).ok()? - start).num_seconds();
+        let plural = |n: i64, unit: &str| if n == 1 { format!("a {unit}") } else { format!("{n} {unit}s") };
+        Some(match secs {
+            ..=59 => "a few seconds".to_string(),
+            60..=3599 => plural(secs / 60, "minute"),
+            _ => plural(secs / 3600, "hour"),
+        })
+    });
+    let tail = duration.map(|d| format!(" that lasted {d}")).unwrap_or_default();
+    if msg.author.id != me && !participated {
+        (format!("You missed a call from {name}{tail}."), None)
+    } else {
+        (format!("{name} started a call{tail}."), Some([0.35, 0.7, 0.4, 1.0]))
+    }
+}
+
+fn draw_incoming_calls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some(channel_id) = state.incoming_calls.first().cloned() else { return };
+    let who = state
+        .dm_channels
+        .iter()
+        .find(|c| c.id == channel_id)
+        .map(|dm| dm.recipients.iter().map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone())).collect::<Vec<_>>().join(", "))
+        .unwrap_or_else(|| "Someone".into());
+    let [w, _] = ui.io().display_size;
+    ui.window("incoming_call")
+        .position([w - 260.0, 16.0], imgui::Condition::Always)
+        .size([244.0, 0.0], imgui::Condition::Always)
+        .no_decoration()
+        .always_auto_resize(true)
+        .build(|| {
+            ui.text(format!("{who} is calling..."));
+            if ui.button("Accept") {
+                let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone(), ring: false });
+                state.selected_guild = None;
+                state.selected_channel = Some(channel_id.clone());
+                state.incoming_calls.retain(|c| *c != channel_id);
+                state.sync_ringtone();
+            }
+            ui.same_line();
+            if ui.button("Decline") {
+                let _ = cmd_tx.send(UiCommand::DeclineCall { channel_id: channel_id.clone() });
+                state.incoming_calls.retain(|c| *c != channel_id);
+                state.sync_ringtone();
+            }
+        });
+}
+
 fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCache) {
     let Some(url) = state.image_lightbox.clone() else { return };
     let Some((texture_id, natural_size)) = textures.get(&url) else { return };
@@ -2064,6 +2135,92 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
     }
 }
 
+const CALL_PANEL_HEIGHT: f32 = 130.0;
+
+fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
+    const SIZE: f32 = 56.0;
+    const GAP: f32 = 16.0;
+    let channel_id = dm.id.clone();
+    let members: Vec<(rustcord_client::models::User, bool)> = state
+        .members_in_voice_channel(&channel_id, &channel_id)
+        .into_iter()
+        .filter_map(|vs| {
+            let user = state
+                .known_users
+                .get(&vs.user_id)
+                .or_else(|| dm.recipients.iter().find(|u| u.id == vs.user_id))
+                .or_else(|| state.current_user.as_ref().filter(|u| u.id == vs.user_id))?;
+            Some((user.clone(), state.voice_speaking_users.contains(&vs.user_id)))
+        })
+        .collect();
+    let in_call = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+    ui.child_window("dm_call_panel").size([0.0, CALL_PANEL_HEIGHT]).build(|| {
+        let width = ui.window_size()[0];
+        let row_w = members.len() as f32 * SIZE + members.len().saturating_sub(1) as f32 * GAP;
+        ui.set_cursor_pos([(width - row_w) / 2.0, 12.0]);
+        for (user, speaking) in &members {
+            let p = ui.cursor_screen_pos();
+            let center = [p[0] + SIZE / 2.0, p[1] + SIZE / 2.0];
+            let url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+            match textures.get(&url) {
+                Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
+                None => {
+                    textures.request(&url, cmd_tx);
+                    ui.dummy([SIZE, SIZE]);
+                }
+            }
+            if *speaking {
+                ui.get_window_draw_list().add_circle(center, SIZE / 2.0 + 2.0, [0.25, 0.8, 0.4, 1.0]).thickness(3.0).num_segments(48).build();
+            }
+            if ui.is_item_hovered() {
+                ui.tooltip_text(user.global_name.clone().unwrap_or_else(|| user.username.clone()));
+            }
+            ui.same_line_with_spacing(0.0, GAP);
+        }
+        if in_call {
+            let style = ui.clone_style();
+            let labels = [if state.self_muted { "Unmute" } else { "Mute" }, if state.self_deafened { "Undeafen" } else { "Deafen" }, "Disconnect"];
+            let widths = labels.map(|l| ui.calc_text_size(l)[0] + style.frame_padding[0] * 2.0);
+            let gap = style.item_spacing[0];
+            let mut x = (width - widths.iter().sum::<f32>() - 2.0 * gap) / 2.0;
+            let y = 12.0 + SIZE + 18.0;
+            let mut clicked = [false; 3];
+            for i in 0..3 {
+                ui.set_cursor_pos([x, y]);
+                clicked[i] = ui.button(labels[i]);
+                x += widths[i] + gap;
+            }
+            let send = |state: &AppState| {
+                let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+                    guild_id: None,
+                    channel_id: channel_id.clone(),
+                    self_mute: state.self_muted,
+                    self_deaf: state.self_deafened,
+                });
+            };
+            if clicked[0] {
+                state.self_muted = !state.self_muted;
+                if state.self_muted {
+                    state.self_deafened = false;
+                }
+                send(state);
+            }
+            if clicked[1] {
+                state.self_deafened = !state.self_deafened;
+                if state.self_deafened {
+                    state.self_muted = true;
+                }
+                send(state);
+            }
+            if clicked[2] {
+                let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: None });
+                state.self_muted = false;
+                state.self_deafened = false;
+            }
+        }
+    });
+}
+
 fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
     let name = AppState::dm_display_name(dm);
     let channel_id = dm.id.clone();
@@ -2095,7 +2252,7 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
         } else if is_connecting {
             ui.text_disabled("Call");
         } else if ui.button("Call") {
-            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone() });
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone(), ring: true });
             state.pending_voice_channel = Some((None, channel_id.clone()));
         }
         if !is_connected && !is_connecting && ui.is_item_hovered() {

@@ -166,13 +166,16 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::PresenceUpdate(presence)) => {
                 state.presences.insert(presence.user.id.clone(), presence);
             }
-            BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp }) => {
+            BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call }) => {
                 if let Some(msg) = state.messages.get_mut(&channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) {
                     if let Some(content) = content {
                         msg.content = content;
                     }
                     if edited_timestamp.is_some() {
                         msg.edited_timestamp = edited_timestamp;
+                    }
+                    if call.is_some() {
+                        msg.call = call;
                     }
                 }
             }
@@ -184,11 +187,34 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::VoiceStateUpdate(voice_state)) => {
                 if state.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) {
                     state.connected_voice_channel = voice_state.channel_id.clone().map(|cid| (voice_state.guild_id.clone(), cid));
+                    if let Some(cid) = &voice_state.channel_id {
+                        state.incoming_calls.retain(|c| c != cid);
+                        state.sync_ringtone();
+                    }
                 }
                 state.apply_voice_state(voice_state);
             }
             BackendEvent::Gateway(GatewayEvent::VoiceServerUpdate { .. }) => {}
-            BackendEvent::Gateway(GatewayEvent::Unknown { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::Unknown { op_name, raw }) => {
+                let channel_id = raw["channel_id"].as_str().unwrap_or_default().to_string();
+                let me = state.current_user.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+                let ringing_me = raw["ringing"].as_array().is_some_and(|r| r.iter().any(|id| id.as_str() == Some(me.as_str())));
+                match op_name.as_str() {
+                    "CALL_CREATE" | "CALL_UPDATE" if ringing_me => {
+                        if !state.incoming_calls.contains(&channel_id) {
+                            if state.notifications_enabled {
+                                std::thread::spawn(|| {
+                                    let _ = notify_rust::Notification::new().summary("Incoming call").show();
+                                });
+                            }
+                            state.incoming_calls.push(channel_id);
+                        }
+                    }
+                    "CALL_CREATE" | "CALL_UPDATE" | "CALL_DELETE" => state.incoming_calls.retain(|c| *c != channel_id),
+                    _ => {}
+                }
+                state.sync_ringtone();
+            }
             BackendEvent::VoiceConnecting => {
                 state.voice_connecting = true;
             }
@@ -231,6 +257,9 @@ pub fn drain_backend_events(
             }
             BackendEvent::OlderMessagesLoaded { channel_id, messages } => {
                 state.loading_older_messages = false;
+                if messages.is_empty() {
+                    state.history_exhausted.insert(channel_id.clone());
+                }
                 state.prepend_message_history(channel_id, messages);
             }
             BackendEvent::RelationshipsLoaded(relationships) => {

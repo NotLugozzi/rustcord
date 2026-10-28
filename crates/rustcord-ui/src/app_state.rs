@@ -135,6 +135,9 @@ pub struct AppState {
     pub status_message: Option<String>,
     pub last_seen_message_count: HashMap<String, usize>,
     pub loading_older_messages: bool,
+    pub history_exhausted: std::collections::HashSet<String>,
+    pub incoming_calls: Vec<String>,
+    pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub pending_attachment: Option<std::path::PathBuf>,
     pub revealed_spoilers: std::collections::HashSet<usize>,
     pub typing_users: HashMap<String, HashMap<String, std::time::Instant>>,
@@ -553,11 +556,28 @@ impl AppState {
             .collect()
     }
 
+    pub fn sync_ringtone(&mut self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        match (self.incoming_calls.is_empty(), self.ringtone_stop.is_some()) {
+            (false, false) => {
+                let stop = std::sync::Arc::new(AtomicBool::new(false));
+                rustcord_client::voice_audio::play_ringtone(stop.clone());
+                self.ringtone_stop = Some(stop);
+            }
+            (true, true) => {
+                if let Some(stop) = self.ringtone_stop.take() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
         if let Some(user) = voice_state.member.as_ref().and_then(|m| m.user.clone()) {
             self.known_users.insert(voice_state.user_id.clone(), user);
         }
-        let Some(guild_id) = voice_state.guild_id.clone() else { return };
+        let Some(guild_id) = voice_state.guild_id.clone().or_else(|| voice_state.channel_id.clone()) else { return };
         let states = self.voice_channel_states.entry(guild_id).or_default();
         states.retain(|s| s.user_id != voice_state.user_id);
         if voice_state.channel_id.is_some() {
@@ -578,6 +598,10 @@ impl AppState {
 
     pub fn connected_voice_channel_name(&self) -> Option<String> {
         let (_, channel_id) = self.connected_voice_channel.as_ref()?;
+        if let Some(dm) = self.dm_channels.iter().find(|c| &c.id == channel_id) {
+            let names: Vec<String> = dm.recipients.iter().map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone())).collect();
+            return Some(dm.name.clone().unwrap_or_else(|| names.join(", ")));
+        }
         for channels in self.guild_channels.values() {
             if let Some(channel) = channels.iter().find(|c| &c.id == channel_id) {
                 return Some(channel.name.clone().unwrap_or_else(|| channel.id.clone()));
