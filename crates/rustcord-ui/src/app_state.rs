@@ -7,7 +7,7 @@ fn snowflake_value(id: &str) -> u64 {
 
 pub struct ChannelGroup<'a> {
     pub name: Option<&'a str>,
-    pub channels: Vec<&'a Channel>,
+    pub channels: Vec<(&'a Channel, bool)>,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -120,6 +120,11 @@ pub struct AppState {
     pub my_status: rustcord_client::models::PresenceStatus,
     pub custom_status_input: String,
     pub guild_channels: HashMap<String, Vec<Channel>>,
+    pub guild_roles: HashMap<String, Vec<rustcord_client::models::Role>>,
+    pub my_guild_roles: HashMap<String, Vec<String>>,
+    pub guild_members: HashMap<String, Vec<rustcord_client::models::GuildMember>>,
+    pub guild_members_requested: std::collections::HashSet<String>,
+    pub show_members_panel: bool,
     pub messages: HashMap<String, Vec<Message>>,
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
@@ -177,6 +182,9 @@ pub struct AppState {
     pub renaming_folder: Option<usize>,
     pub folder_rename_buf: String,
     pub last_read_message_id: HashMap<String, String>,
+    pub join_invite_input: String,
+    pub create_server_input: String,
+    pub show_hidden_channels: bool,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -371,7 +379,7 @@ impl AppState {
 
     pub fn activity_for(&self, user_id: &str) -> Option<String> {
         let acts = &self.presences.get(user_id)?.activities;
-        acts.iter().find(|a| a.kind != 4).or_else(|| acts.first()).map(|a| a.summary()).filter(|s| !s.is_empty())
+        acts.iter().find(|a| a.kind != 4).or_else(|| acts.first()).map(|a| a.summary_title()).filter(|s| !s.is_empty())
     }
 
     pub fn platform_for(&self, user_id: &str) -> Option<&'static str> {
@@ -448,7 +456,7 @@ impl AppState {
         }
     }
 
-    pub fn mark_channel_read(&mut self, channel_id: &str, message_id: &str) {
+    pub fn mark_channel_read(&mut self, channel_id: &str, message_id: &str) -> bool {
         let is_newer = self
             .last_read_message_id
             .get(channel_id)
@@ -457,6 +465,7 @@ impl AppState {
             self.last_read_message_id.insert(channel_id.to_string(), message_id.to_string());
             self.save_read_state();
         }
+        is_newer
     }
 
     pub fn channel_is_unread(&self, channel_id: &str, last_message_id: Option<&str>) -> bool {
@@ -672,23 +681,50 @@ impl AppState {
         }
     }
 
+    pub fn my_base_permissions(&self, guild_id: &str) -> u64 {
+        let Some(roles) = self.guild_roles.get(guild_id) else { return 0 };
+        let my_role_ids = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
+        rustcord_client::permissions::compute_base_permissions(my_role_ids, guild_id, roles)
+    }
+
+    pub fn can_view_channel(&self, guild_id: &str, channel: &Channel) -> bool {
+        let Some(me) = &self.current_user else { return true };
+        if self.guild_roles.get(guild_id).is_none() {
+            return true;
+        }
+        let my_role_ids = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
+        let base = self.my_base_permissions(guild_id);
+        let permissions = rustcord_client::permissions::compute_channel_permissions(
+            base,
+            &me.id,
+            my_role_ids,
+            guild_id,
+            &channel.permission_overwrites,
+        );
+        rustcord_client::permissions::has_permission(permissions, rustcord_client::permissions::VIEW_CHANNEL)
+    }
+
     pub fn grouped_channels_for_selected_guild(&self) -> Vec<ChannelGroup<'_>> {
         let Some(guild_id) = &self.selected_guild else { return Vec::new() };
         let Some(channels) = self.guild_channels.get(guild_id) else { return Vec::new() };
 
+        let include_hidden = self.show_hidden_channels;
         let mut categories: Vec<&Channel> = channels
             .iter()
             .filter(|c| c.kind == ChannelType::GuildCategory)
+            .filter(|c| include_hidden || self.can_view_channel(guild_id, c))
             .collect();
         categories.sort_by_key(|c| c.position.unwrap_or(i32::MAX));
 
-        let text_channels = |parent_id: Option<&str>| -> Vec<&Channel> {
-            let mut matching: Vec<&Channel> = channels
+        let text_channels = |parent_id: Option<&str>| -> Vec<(&Channel, bool)> {
+            let mut matching: Vec<(&Channel, bool)> = channels
                 .iter()
                 .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement))
                 .filter(|c| c.parent_id.as_deref() == parent_id)
+                .map(|c| (c, self.can_view_channel(guild_id, c)))
+                .filter(|(_, visible)| include_hidden || *visible)
                 .collect();
-            matching.sort_by_key(|c| c.position.unwrap_or(i32::MAX));
+            matching.sort_by_key(|(c, _)| c.position.unwrap_or(i32::MAX));
             matching
         };
 

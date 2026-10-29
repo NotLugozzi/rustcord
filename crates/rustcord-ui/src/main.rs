@@ -76,7 +76,12 @@ fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Messa
     let title = message.author.global_name.clone().unwrap_or_else(|| message.author.username.clone());
     let body = if message.content.is_empty() { "[attachment]".to_string() } else { message.content.chars().take(160).collect() };
     std::thread::spawn(move || {
-        if let Err(e) = notify_rust::Notification::new().summary(&title).body(&body).show() {
+        if let Err(e) = notify_rust::Notification::new()
+            .summary(&title)
+            .body(&body)
+            .sound_name("message-new-instant")
+            .show()
+        {
             tracing::warn!("notification failed: {e}");
         }
     });
@@ -158,8 +163,8 @@ pub fn drain_backend_events(
                     let _ = cmd_tx.send(UiCommand::RefreshDmChannels);
                 }
                 let is_actively_viewing = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
-                if is_actively_viewing {
-                    state.mark_channel_read(&message.channel_id, &message.id);
+                if is_actively_viewing && state.mark_channel_read(&message.channel_id, &message.id) {
+                    let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: message.channel_id.clone(), message_id: message.id.clone() });
                 }
                 state.push_message(message);
             }
@@ -203,6 +208,23 @@ pub fn drain_backend_events(
                 state.apply_voice_state(voice_state);
             }
             BackendEvent::Gateway(GatewayEvent::VoiceServerUpdate { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::GuildCreate { guild_id, roles, member_roles }) => {
+                state.guild_roles.insert(guild_id.clone(), roles);
+                if let Some(me) = &state.current_user {
+                    if let Some((_, my_roles)) = member_roles.into_iter().find(|(user_id, _)| user_id == &me.id) {
+                        state.my_guild_roles.insert(guild_id, my_roles);
+                    }
+                }
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildMembersChunk { guild_id, members, presences }) => {
+                for presence in presences {
+                    state.presences.insert(presence.user.id.clone(), presence);
+                }
+                for member in &members {
+                    state.known_users.insert(member.user.id.clone(), member.user.clone());
+                }
+                state.guild_members.entry(guild_id).or_default().extend(members);
+            }
             BackendEvent::Gateway(GatewayEvent::Unknown { op_name, raw }) => {
                 let channel_id = raw["channel_id"].as_str().unwrap_or_default().to_string();
                 let me = state.current_user.as_ref().map(|u| u.id.clone()).unwrap_or_default();
@@ -212,7 +234,10 @@ pub fn drain_backend_events(
                         if !state.incoming_calls.contains(&channel_id) {
                             if state.notifications_enabled {
                                 std::thread::spawn(|| {
-                                    let _ = notify_rust::Notification::new().summary("Incoming call").show();
+                                    let _ = notify_rust::Notification::new()
+                                        .summary("Incoming call")
+                                        .sound_name("phone-incoming-call")
+                                        .show();
                                 });
                             }
                             state.incoming_calls.push(channel_id);
@@ -253,8 +278,19 @@ pub fn drain_backend_events(
                 state.voice_input_devices = inputs;
                 state.voice_output_devices = outputs;
             }
+            BackendEvent::MemberRemoved { guild_id, user_id } => {
+                if let Some(members) = state.guild_members.get_mut(&guild_id) {
+                    members.retain(|m| m.user.id != user_id);
+                }
+            }
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
                 state.guild_channels.insert(guild_id, channels);
+            }
+            BackendEvent::GuildRolesLoaded { guild_id, roles } => {
+                state.guild_roles.insert(guild_id, roles);
+            }
+            BackendEvent::MyGuildMemberLoaded { guild_id, roles } => {
+                state.my_guild_roles.insert(guild_id, roles);
             }
             BackendEvent::GuildEmojisLoaded { guild_id, emojis } => {
                 state.guild_emojis.insert(guild_id, emojis);
@@ -264,7 +300,9 @@ pub fn drain_backend_events(
             }
             BackendEvent::MessagesLoaded { channel_id, messages } => {
                 if let Some(newest) = messages.iter().max_by_key(|m| m.id.parse::<u64>().unwrap_or(0)) {
-                    state.mark_channel_read(&channel_id, &newest.id);
+                    if state.mark_channel_read(&channel_id, &newest.id) {
+                        let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: newest.id.clone() });
+                    }
                 }
                 state.set_message_history(channel_id, messages);
             }

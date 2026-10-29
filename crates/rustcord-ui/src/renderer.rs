@@ -290,6 +290,20 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
+        if let WindowEvent::MouseWheel {
+            delta: winit::event::MouseScrollDelta::PixelDelta(pos),
+            phase: winit::event::TouchPhase::Moved,
+            ..
+        } = &event
+        {
+            let scale = window.window.scale_factor();
+            let lines_per_pixel = 1.0 / (53.0 * scale);
+            let h = (pos.x * lines_per_pixel) as f32;
+            let v = (pos.y * lines_per_pixel) as f32;
+            window.imgui.context.io_mut().add_mouse_wheel_event([h, v]);
+            return;
+        }
+
         window.imgui.platform.handle_event::<()>(
             window.imgui.context.io_mut(),
             &window.window,

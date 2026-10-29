@@ -4,6 +4,7 @@ pub mod dave;
 pub mod dave_frame_crypto;
 pub mod error;
 pub mod models;
+pub mod permissions;
 pub mod rest;
 pub mod gateway;
 pub mod voice_audio;

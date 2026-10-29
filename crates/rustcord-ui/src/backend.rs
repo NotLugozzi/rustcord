@@ -106,6 +106,12 @@ pub enum UiCommand {
     LoadProfile { user_id: String },
     EditMessage { channel_id: String, message_id: String, content: String },
     DeleteMessage { channel_id: String, message_id: String },
+    AckMessage { channel_id: String, message_id: String },
+    JoinGuildByInvite { invite_code: String },
+    CreateGuild { name: String },
+    RequestGuildMembers { guild_id: String },
+    KickMember { guild_id: String, user_id: String },
+    BanMember { guild_id: String, user_id: String },
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
@@ -131,6 +137,8 @@ pub enum BackendEvent {
     ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile, user: Option<rustcord_client::models::User> },
     Gateway(GatewayEvent),
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
+    GuildRolesLoaded { guild_id: String, roles: Vec<rustcord_client::models::Role> },
+    MyGuildMemberLoaded { guild_id: String, roles: Vec<String> },
     GuildEmojisLoaded { guild_id: String, emojis: Vec<rustcord_client::models::Emoji> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
     MessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
@@ -145,6 +153,7 @@ pub enum BackendEvent {
     VoiceStats(rustcord_client::voice_gateway::VoiceStats),
     Notice(String),
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
+    MemberRemoved { guild_id: String, user_id: String },
 }
 
 pub fn spawn(
@@ -192,6 +201,22 @@ pub fn spawn(
                             Err(e) => {
                                 tracing::error!("failed to load channels for guild {guild_id}: {e}");
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to load channels: {e}")));
+                            }
+                        }
+                        match client.guild_roles(&guild_id).await {
+                            Ok(roles) => {
+                                let _ = event_tx.send(BackendEvent::GuildRolesLoaded { guild_id: guild_id.clone(), roles });
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to load roles for guild {guild_id}: {e}");
+                            }
+                        }
+                        match client.my_guild_member(&guild_id).await {
+                            Ok(member) => {
+                                let _ = event_tx.send(BackendEvent::MyGuildMemberLoaded { guild_id: guild_id.clone(), roles: member.roles });
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to load own member for guild {guild_id}: {e}");
                             }
                         }
                         spawn_guild_emoji_loads(client, vec![guild_id], &event_tx);
@@ -347,6 +372,49 @@ pub fn spawn(
                     if let Some(client) = &rest {
                         if let Err(e) = client.delete_message(&channel_id, &message_id).await {
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to delete message: {e}")));
+                        }
+                    }
+                }
+                UiCommand::AckMessage { channel_id, message_id } => {
+                    if let Some(client) = &rest {
+                        let _ = client.ack_message(&channel_id, &message_id).await;
+                    }
+                }
+                UiCommand::JoinGuildByInvite { invite_code } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.join_guild_by_invite(&invite_code).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to join server: {e}")));
+                        }
+                    }
+                }
+                UiCommand::CreateGuild { name } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.create_guild(&name).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to create server: {e}")));
+                        }
+                    }
+                }
+                UiCommand::RequestGuildMembers { guild_id } => {
+                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                        let frame = rustcord_client::gateway::request_guild_members_frame(&guild_id);
+                        let _ = tx.send(frame);
+                    }
+                }
+                UiCommand::KickMember { guild_id, user_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.kick_member(&guild_id, &user_id).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to kick member: {e}")));
+                        } else {
+                            let _ = event_tx.send(BackendEvent::MemberRemoved { guild_id, user_id });
+                        }
+                    }
+                }
+                UiCommand::BanMember { guild_id, user_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.ban_member(&guild_id, &user_id).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to ban member: {e}")));
+                        } else {
+                            let _ = event_tx.send(BackendEvent::MemberRemoved { guild_id, user_id });
                         }
                     }
                 }

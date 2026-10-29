@@ -177,6 +177,22 @@ impl RestClient {
         self.get(&format!("/guilds/{guild_id}/channels")).await
     }
 
+    pub async fn guild_roles(&self, guild_id: &str) -> Result<Vec<crate::models::Role>, ClientError> {
+        self.get(&format!("/guilds/{guild_id}/roles")).await
+    }
+
+    pub async fn my_guild_member(&self, guild_id: &str) -> Result<crate::models::SelfGuildMember, ClientError> {
+        self.get(&format!("/users/@me/guilds/{guild_id}/member")).await
+    }
+
+    pub async fn join_guild_by_invite(&self, invite_code: &str) -> Result<Guild, ClientError> {
+        self.post(&format!("/invites/{invite_code}"), &serde_json::json!({})).await
+    }
+
+    pub async fn create_guild(&self, name: &str) -> Result<Guild, ClientError> {
+        self.post("/guilds", &serde_json::json!({ "name": name })).await
+    }
+
     pub async fn guild_emojis(&self, guild_id: &str) -> Result<Vec<Emoji>, ClientError> {
         self.get(&format!("/guilds/{guild_id}/emojis")).await
     }
@@ -228,6 +244,46 @@ impl RestClient {
 
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
         let resp = self.http.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}")).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
+    pub async fn kick_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
+        let resp = self.http.delete(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}")).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
+    pub async fn ban_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .put(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(())
+    }
+
+    pub async fn ack_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
+        let resp = self
+            .http
+            .post(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/ack"))
+            .json(&serde_json::json!({ "token": null }))
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let message = resp.text().await.unwrap_or_default();

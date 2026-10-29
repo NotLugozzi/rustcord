@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Guild, MergedPresences, Message, Presence, User, VoiceState};
+use crate::models::{Guild, GuildMember, MergedPresences, Message, Presence, Role, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +26,8 @@ pub enum GatewayEvent {
     VoiceStateUpdate(VoiceState),
     VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
     InitialVoiceStates(Vec<VoiceState>),
+    GuildCreate { guild_id: String, roles: Vec<Role>, member_roles: Vec<(String, Vec<String>)> },
+    GuildMembersChunk { guild_id: String, members: Vec<GuildMember>, presences: Vec<Presence> },
     Unknown { op_name: String, raw: Value },
 }
 
@@ -73,6 +75,19 @@ pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>
             "channel_id": channel_id,
             "self_mute": self_mute,
             "self_deaf": self_deaf,
+        }
+    })
+    .to_string()
+}
+
+pub fn request_guild_members_frame(guild_id: &str) -> String {
+    json!({
+        "op": 8,
+        "d": {
+            "guild_id": guild_id,
+            "query": "",
+            "limit": 0,
+            "presences": true,
         }
     })
     .to_string()
@@ -332,6 +347,27 @@ impl Gateway {
             Some("VOICE_STATE_UPDATE") => {
                 let voice_state: VoiceState = serde_json::from_value(data)?;
                 GatewayEvent::VoiceStateUpdate(voice_state)
+            }
+            Some("GUILD_CREATE") => {
+                let guild_id = data["id"].as_str().unwrap_or_default().to_string();
+                let roles: Vec<Role> = serde_json::from_value(data["roles"].clone()).unwrap_or_default();
+                let member_roles: Vec<(String, Vec<String>)> = data["members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|member| {
+                        let user_id = member["user"]["id"].as_str()?.to_string();
+                        let roles: Vec<String> = serde_json::from_value(member["roles"].clone()).unwrap_or_default();
+                        Some((user_id, roles))
+                    })
+                    .collect();
+                GatewayEvent::GuildCreate { guild_id, roles, member_roles }
+            }
+            Some("GUILD_MEMBERS_CHUNK") => {
+                let guild_id = data["guild_id"].as_str().unwrap_or_default().to_string();
+                let members: Vec<GuildMember> = serde_json::from_value(data["members"].clone()).unwrap_or_default();
+                let presences: Vec<Presence> = serde_json::from_value(data["presences"].clone()).unwrap_or_default();
+                GatewayEvent::GuildMembersChunk { guild_id, members, presences }
             }
             Some("VOICE_SERVER_UPDATE") => GatewayEvent::VoiceServerUpdate {
                 token: data["token"].as_str().unwrap_or_default().to_string(),

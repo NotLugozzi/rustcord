@@ -290,6 +290,7 @@ const HEADER_HEIGHT: f32 = 48.0;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const SPLITTER_WIDTH: f32 = 6.0;
+const MEMBERS_PANEL_WIDTH: f32 = 240.0;
 
 fn draw_rail_circle(ui: &Ui, color: [f32; 4], size: [f32; 2]) {
     let p_min = ui.cursor_screen_pos();
@@ -643,6 +644,39 @@ enum RailDropAction {
     CreateFolder(String, String),
 }
 
+fn extract_invite_code(input: &str) -> &str {
+    let trimmed = input.trim();
+    trimmed.rsplit('/').next().unwrap_or(trimmed)
+}
+
+fn draw_add_server_popup(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    ui.text("Join a Server");
+    ui.input_text("Invite link or code", &mut state.join_invite_input).build();
+    if ui.button("Join##join_server") {
+        let code = extract_invite_code(&state.join_invite_input).to_string();
+        if !code.is_empty() {
+            let _ = cmd_tx.send(UiCommand::JoinGuildByInvite { invite_code: code });
+            state.join_invite_input.clear();
+            ui.close_current_popup();
+        }
+    }
+
+    ui.spacing();
+    ui.separator();
+    ui.spacing();
+
+    ui.text("Create a Server");
+    ui.input_text("Server name", &mut state.create_server_input).build();
+    if ui.button("Create##create_server") {
+        let name = state.create_server_input.trim().to_string();
+        if !name.is_empty() {
+            let _ = cmd_tx.send(UiCommand::CreateGuild { name });
+            state.create_server_input.clear();
+            ui.close_current_popup();
+        }
+    }
+}
+
 fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, rail_center_x: f32) {
     let mut drop_action: Option<RailDropAction> = None;
     let mut toggle_folder: Option<usize> = None;
@@ -793,6 +827,17 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         let next_y = ui.cursor_pos()[1];
         ui.set_cursor_pos([rail_center_x, next_y]);
     }
+
+    draw_rail_circle(ui, [0.17, 0.52, 0.27, 1.0], RAIL_ICON_SIZE);
+    if draw_circular_image_button_placeholder(ui, "add_server_button", "+", RAIL_ICON_SIZE) {
+        ui.open_popup("add_server_popup");
+    }
+    if ui.is_item_hovered() {
+        ui.tooltip_text("Add a Server");
+    }
+    ui.popup("add_server_popup", || {
+        draw_add_server_popup(ui, state, cmd_tx);
+    });
 
     if let Some(guild_id) = select_guild {
         let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
@@ -1408,14 +1453,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             };
             ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - voice_bar_reserved - 36.0]).build(|| {
             if state.selected_guild.is_some() {
-                let groups: Vec<(Option<String>, Vec<(String, String, Option<String>)>)> = state
+                let groups: Vec<(Option<String>, Vec<(String, String, Option<String>, bool)>)> = state
                     .grouped_channels_for_selected_guild()
                     .into_iter()
                     .map(|g| {
                         let channels = g
                             .channels
                             .into_iter()
-                            .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone()), c.last_message_id.clone()))
+                            .map(|(c, visible)| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone()), c.last_message_id.clone(), visible))
                             .collect();
                         (g.name.map(str::to_string), channels)
                     })
@@ -1423,6 +1468,15 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 if groups.is_empty() {
                     ui.text_disabled("No text channels loaded yet.");
                 }
+                if ui.is_window_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right) {
+                    ui.open_popup("channel_list_ctx");
+                }
+                ui.popup("channel_list_ctx", || {
+                    let label = if state.show_hidden_channels { "Hide channels you can't access" } else { "Show channels you can't access" };
+                    if ui.selectable(label) {
+                        state.show_hidden_channels = !state.show_hidden_channels;
+                    }
+                });
                 for (category_name, channels) in &groups {
                     if let Some(name) = category_name {
                         ui.spacing();
@@ -1430,14 +1484,24 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         ui.text(name.to_uppercase());
                         token.pop();
                     }
-                    for (channel_id, name, last_message_id) in channels {
-                        let is_unread = state.channel_is_unread(channel_id, last_message_id.as_deref());
+                    for (channel_id, name, last_message_id, visible) in channels {
+                        let is_unread = *visible && state.channel_is_unread(channel_id, last_message_id.as_deref());
                         let row_start = ui.cursor_screen_pos();
-                        if ui.selectable(format!("# {name}")) {
-                            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
-                            state.selected_channel = Some(channel_id.clone());
-                            if let Some(last_id) = last_message_id {
-                                state.mark_channel_read(channel_id, last_id);
+                        let _dim = (!visible).then(|| ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted));
+                        if *visible {
+                            if ui.selectable(format!("# {name}")) {
+                                let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+                                state.selected_channel = Some(channel_id.clone());
+                                if let Some(last_id) = last_message_id {
+                                    if state.mark_channel_read(channel_id, last_id) {
+                                        let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.text(format!("# {name}"));
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("You don't have access to this channel");
                             }
                         }
                         if is_unread {
@@ -1570,9 +1634,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_settings_dialog(ui, state, cmd_tx, textures);
     draw_profile_popout(ui, state, cmd_tx, textures);
 
+    let members_panel_open = state.show_members_panel && state.selected_guild.is_some();
+    let members_panel_width = if members_panel_open { MEMBERS_PANEL_WIDTH } else { 0.0 };
+
     ui.window("chat")
         .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
-        .size([display_w - RAIL_WIDTH - sidebar_width, display_h], imgui::Condition::Always)
+        .size([display_w - RAIL_WIDTH - sidebar_width - members_panel_width, display_h], imgui::Condition::Always)
         .no_decoration()
         .scrollable(false)
         .draw_background(true)
@@ -1594,8 +1661,36 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 }
             }
 
+            if state.selected_guild.is_some() {
+                let button_label = if state.show_members_panel { "Members >" } else { "< Members" };
+                let button_width = ui.calc_text_size(button_label)[0] + 20.0;
+                ui.set_cursor_pos([ui.content_region_avail()[0] - button_width, 4.0]);
+                if ui.button(button_label) {
+                    state.show_members_panel = !state.show_members_panel;
+                    if state.show_members_panel {
+                        if let Some(guild_id) = state.selected_guild.clone() {
+                            if state.guild_members_requested.insert(guild_id.clone()) {
+                                let _ = cmd_tx.send(UiCommand::RequestGuildMembers { guild_id });
+                            }
+                        }
+                    }
+                }
+            }
+
+            let line_height = ui.text_line_height_with_spacing();
+            let typing_visible = !channel_key.is_empty()
+                && state
+                    .typing_users_for(&channel_key)
+                    .into_iter()
+                    .any(|id| state.current_user.as_ref().is_none_or(|u| u.id != *id));
+            let extra_banner_height = (typing_visible as u32 as f32
+                + state.reply_target.is_some() as u32 as f32
+                + state.pending_attachment.is_some() as u32 as f32
+                + state.editing.is_some() as u32 as f32)
+                * line_height;
+
             ui.child_window("history")
-                .size([0.0, display_h - 80.0 - status_height - header_height])
+                .size([0.0, display_h - 80.0 - status_height - header_height - extra_banner_height])
                 .build(|| {
                     if messages.is_empty() {
                         ui.text_disabled("No messages loaded yet.");
@@ -1789,7 +1884,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             state.last_seen_message_count.insert(channel_key.clone(), messages.len());
             if state.window_focused && !channel_key.is_empty() {
                 if let Some(newest) = messages.last() {
-                    state.mark_channel_read(&channel_key, &newest.id);
+                    if state.mark_channel_read(&channel_key, &newest.id) {
+                        let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_key.clone(), message_id: newest.id.clone() });
+                    }
                 }
             }
 
@@ -1987,6 +2084,19 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 }
             }
         });
+
+    if members_panel_open {
+        let _members_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
+        ui.window("members_panel")
+            .position([display_w - MEMBERS_PANEL_WIDTH, 0.0], imgui::Condition::Always)
+            .size([MEMBERS_PANEL_WIDTH, display_h], imgui::Condition::Always)
+            .no_decoration()
+            .draw_background(true)
+            .build(|| {
+                draw_members_panel(ui, state, cmd_tx, textures);
+            });
+        _members_bg.pop();
+    }
 
     draw_image_lightbox(ui, state, textures);
     draw_incoming_calls(ui, state, cmd_tx);
@@ -2607,6 +2717,116 @@ fn draw_dm_header(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComm
     ui.separator();
 }
 
+fn draw_members_panel(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
+    let Some(guild_id) = state.selected_guild.clone() else { return };
+    let Some(members) = state.guild_members.get(&guild_id).cloned() else {
+        ui.text_disabled("Loading members...");
+        return;
+    };
+
+    let roles = state.guild_roles.get(&guild_id).cloned().unwrap_or_default();
+    let mut roles_by_position = roles.clone();
+    roles_by_position.sort_by_key(|r| std::cmp::Reverse(r.position));
+
+    let highest_role_name = |member: &rustcord_client::models::GuildMember| -> String {
+        roles_by_position
+            .iter()
+            .find(|r| member.roles.contains(&r.id))
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "Members".to_string())
+    };
+
+    let mut groups: Vec<(String, Vec<&rustcord_client::models::GuildMember>)> = Vec::new();
+    for member in &members {
+        let group_name = highest_role_name(member);
+        match groups.iter_mut().find(|(name, _)| *name == group_name) {
+            Some((_, list)) => list.push(member),
+            None => groups.push((group_name, vec![member])),
+        }
+    }
+    groups.sort_by_key(|(name, _)| {
+        roles_by_position
+            .iter()
+            .position(|r| &r.name == name)
+            .map(|p| p as i32)
+            .unwrap_or(i32::MAX)
+    });
+
+    for (group_name, group_members) in &groups {
+        let online: Vec<&&rustcord_client::models::GuildMember> = group_members
+            .iter()
+            .filter(|m| state.presence_for(&m.user.id) != rustcord_client::models::PresenceStatus::Offline)
+            .collect();
+        let offline: Vec<&&rustcord_client::models::GuildMember> = group_members
+            .iter()
+            .filter(|m| state.presence_for(&m.user.id) == rustcord_client::models::PresenceStatus::Offline)
+            .collect();
+
+        let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+        ui.text(format!("{} — {}", group_name.to_uppercase(), online.len()));
+        token.pop();
+
+        for member in &online {
+            draw_member_row(ui, state, cmd_tx, textures, member);
+        }
+        for member in &offline {
+            draw_member_row(ui, state, cmd_tx, textures, member);
+        }
+        ui.spacing();
+    }
+}
+
+fn draw_member_row(
+    ui: &Ui,
+    state: &mut AppState,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    member: &rustcord_client::models::GuildMember,
+) {
+    let name = member.nick.clone().unwrap_or_else(|| member.user.global_name.clone().unwrap_or_else(|| member.user.username.clone()));
+    let status = state.presence_for(&member.user.id);
+    let platform = state.platform_for(&member.user.id).map(str::to_string);
+    let activity = state.activity_for(&member.user.id);
+    let offline = status == rustcord_client::models::PresenceStatus::Offline;
+    let _dim = offline.then(|| ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted));
+    let result = draw_user_row(ui, cmd_tx, textures, &member.user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel);
+    if result.avatar_clicked {
+        state.profile_popout = Some(member.user.clone());
+    } else if result.row_clicked {
+        let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: member.user.id.clone() });
+    } else if result.right_clicked {
+        state.context_vc_member = Some(member.user.id.clone());
+        ui.open_popup("member_panel_ctx");
+    }
+
+    ui.popup("member_panel_ctx", || {
+        let Some(member_id) = state.context_vc_member.clone() else { return };
+        let Some(guild_id) = state.selected_guild.clone() else { return };
+        if let Some(user) = state.known_users.get(&member_id).cloned() {
+            ui.text_disabled(user.global_name.clone().unwrap_or_else(|| user.username.clone()));
+            ui.separator();
+            if ui.selectable("Profile") {
+                state.profile_popout = Some(user);
+            }
+        }
+        if ui.selectable("Message") {
+            let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: member_id.clone() });
+        }
+        let permissions = state.my_base_permissions(&guild_id);
+        let can_kick = rustcord_client::permissions::has_permission(permissions, rustcord_client::permissions::KICK_MEMBERS);
+        let can_ban = rustcord_client::permissions::has_permission(permissions, rustcord_client::permissions::BAN_MEMBERS);
+        if can_kick || can_ban {
+            ui.separator();
+        }
+        if can_kick && ui.selectable("Kick") {
+            let _ = cmd_tx.send(UiCommand::KickMember { guild_id: guild_id.clone(), user_id: member_id.clone() });
+        }
+        if can_ban && ui.selectable("Ban") {
+            let _ = cmd_tx.send(UiCommand::BanMember { guild_id, user_id: member_id });
+        }
+    });
+}
+
 fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let plus_width = 28.0;
     ui.set_next_item_width(ui.content_region_avail()[0] - plus_width - ui.clone_style().item_spacing[0]);
@@ -2709,7 +2929,9 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
             state.selected_channel = Some(channel_id.clone());
             if let Some(last_id) = last_message_id {
-                state.mark_channel_read(channel_id, last_id);
+                if state.mark_channel_read(channel_id, last_id) {
+                    let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
+                }
             }
         }
     }

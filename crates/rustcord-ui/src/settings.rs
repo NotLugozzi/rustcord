@@ -9,6 +9,7 @@ pub struct Settings {
     pub mic_gain: Option<f32>,
     pub denoise: bool,
     pub user_volumes: std::collections::HashMap<String, f32>,
+    pub keybinds: std::collections::HashMap<String, String>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {

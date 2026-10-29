@@ -143,6 +143,81 @@ pub struct Channel {
     #[serde(default)]
     pub recipients: Vec<User>,
     pub last_message_id: Option<Snowflake>,
+    #[serde(default)]
+    pub permission_overwrites: Vec<PermissionOverwrite>,
+}
+
+fn deserialize_permissions_bits<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrInt {
+        String(String),
+        Int(u64),
+    }
+    match StringOrInt::deserialize(deserializer)? {
+        StringOrInt::String(s) => s.parse().map_err(serde::de::Error::custom),
+        StringOrInt::Int(n) => Ok(n),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverwriteKind {
+    Role,
+    Member,
+}
+
+impl<'de> Deserialize<'de> for OverwriteKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match u8::deserialize(deserializer)? {
+            0 => OverwriteKind::Role,
+            _ => OverwriteKind::Member,
+        })
+    }
+}
+
+impl Serialize for OverwriteKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value: u8 = match self {
+            OverwriteKind::Role => 0,
+            OverwriteKind::Member => 1,
+        };
+        value.serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PermissionOverwrite {
+    pub id: Snowflake,
+    #[serde(rename = "type")]
+    pub kind: OverwriteKind,
+    #[serde(deserialize_with = "deserialize_permissions_bits")]
+    pub allow: u64,
+    #[serde(deserialize_with = "deserialize_permissions_bits")]
+    pub deny: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Role {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(deserialize_with = "deserialize_permissions_bits")]
+    pub permissions: u64,
+    pub position: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GuildMember {
+    pub user: User,
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<Snowflake>,
+    pub joined_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SelfGuildMember {
+    #[serde(default)]
+    pub roles: Vec<Snowflake>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
