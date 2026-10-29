@@ -185,6 +185,8 @@ pub struct AppState {
     pub join_invite_input: String,
     pub create_server_input: String,
     pub show_hidden_channels: bool,
+    pub keybinds: crate::keybinds::Keybinds,
+    pub rebinding_action: Option<crate::keybinds::Action>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -575,6 +577,7 @@ impl AppState {
             mic_gain: Some(self.mic_gain),
             denoise: self.denoise,
             user_volumes: self.user_volumes.clone(),
+            keybinds: self.keybinds.to_map(),
             ..Default::default()
         }
     }

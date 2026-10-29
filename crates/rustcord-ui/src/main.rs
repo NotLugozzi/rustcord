@@ -4,6 +4,7 @@ mod clipboard;
 mod emoji;
 mod images;
 mod ipc;
+mod keybinds;
 mod markdown;
 mod presence;
 mod renderer;
@@ -39,6 +40,7 @@ fn main() {
         user_volumes: saved_settings.user_volumes,
         selected_input_device: saved_settings.input_device,
         selected_output_device: saved_settings.output_device,
+        keybinds: keybinds::Keybinds::from_map(&saved_settings.keybinds),
         rail_folders,
         rail_order,
         last_read_message_id: app_state::load_read_state(),

@@ -36,17 +36,17 @@ Use at your own risk.
 - [x] Fix hCaptcha handling and proper display
 - [x] Per-user volume/mute in server calls
 - [x] better statistics for voice chat (dropped frames, latency graph, something like this)
+- [x] Trackpad scroll acceleration
+- [x] Per-channel permission filtering (all guild channels show regardless of your actual access)
+- [x] UI Gliphs for buttons and states
+- [x] App Keybinds
+- [x] Server users panel (low priority)
+- [x] VC Leave/Join sound
 - [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
-- [ ] Trackpad scroll acceleration
-- [ ] Per-channel permission filtering (all guild channels show regardless of your actual access)
-- [ ] UI Gliphs for buttons and states
 - [ ] Message read status sync
 - [ ] performance improvements in voice calls (high cpu usage, memory usage reaching almost 1gb)
 - [ ] Fix notifications for guilds and messages (missing audio, probably some UI is missing)
-- [ ] VC Leave/Join indicators
 - [ ] Video Calls, screen sharing
-- [ ] programmable shortcut
-- [ ] Server users panel (low priority)
 - [ ] server admin actions (low priority)
 
 ## Credits

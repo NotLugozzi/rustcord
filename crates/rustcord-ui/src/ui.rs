@@ -1400,6 +1400,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         return;
     }
 
+    dispatch_keybinds(ui, state, cmd_tx);
+
     let [display_w, display_h] = ui.io().display_size;
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
@@ -2259,6 +2261,8 @@ fn draw_voice_info(ui: &Ui, state: &mut AppState) {
     let s = state.voice_stats.clone();
     let history = &state.voice_history;
     let series = |f: &dyn Fn(&rustcord_client::voice_gateway::VoiceStats) -> f32| -> Vec<f32> { history.iter().map(f).collect() };
+    let opaque_bg = [state.theme.background[0], state.theme.background[1], state.theme.background[2], 1.0];
+    let _bg_token = ui.push_style_color(imgui::StyleColor::WindowBg, opaque_bg);
     ui.window("Voice connection")
         .opened(&mut open)
         .size([380.0, 0.0], imgui::Condition::FirstUseEver)
@@ -2432,6 +2436,8 @@ fn draw_incoming_calls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
         .map(|dm| dm.recipients.iter().map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone())).collect::<Vec<_>>().join(", "))
         .unwrap_or_else(|| "Someone".into());
     let [w, _] = ui.io().display_size;
+    let opaque_bg = [state.theme.background[0], state.theme.background[1], state.theme.background[2], 1.0];
+    let _bg_token = ui.push_style_color(imgui::StyleColor::WindowBg, opaque_bg);
     ui.window("incoming_call")
         .position([w - 260.0, 16.0], imgui::Condition::Always)
         .size([244.0, 0.0], imgui::Condition::Always)
@@ -2514,6 +2520,51 @@ fn emoji_button(ui: &Ui, textures: &TextureCache, id: &str, ch: char, tooltip: &
         ui.tooltip_text(tooltip);
     }
     clicked
+}
+
+fn dispatch_keybinds(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    if ui.io().want_text_input {
+        return;
+    }
+    use crate::keybinds::Action;
+
+    let pressed = |action: Action| state.keybinds.get(action).is_some_and(|key| ui.is_key_pressed(key));
+
+    if pressed(Action::FocusCompose) {
+        state.focus_compose = true;
+    }
+
+    if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
+        if pressed(Action::ToggleMute) {
+            state.self_muted = !state.self_muted;
+            if state.self_muted {
+                state.self_deafened = false;
+            }
+            let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+                guild_id: guild_id.clone(),
+                channel_id: channel_id.clone(),
+                self_mute: state.self_muted,
+                self_deaf: state.self_deafened,
+            });
+        }
+        if pressed(Action::ToggleDeafen) {
+            state.self_deafened = !state.self_deafened;
+            if state.self_deafened {
+                state.self_muted = true;
+            }
+            let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+                guild_id: guild_id.clone(),
+                channel_id: channel_id.clone(),
+                self_mute: state.self_muted,
+                self_deaf: state.self_deafened,
+            });
+        }
+        if pressed(Action::LeaveVoiceChannel) {
+            let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
+            state.self_muted = false;
+            state.self_deafened = false;
+        }
+    }
 }
 
 fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str, center: bool) {
@@ -2973,6 +3024,8 @@ fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
     let [display_w, display_h] = ui.io().display_size;
     let mut open = true;
     let mut message_clicked = false;
+    let opaque_bg = [state.theme.background[0], state.theme.background[1], state.theme.background[2], 1.0];
+    let _bg_token = ui.push_style_color(imgui::StyleColor::WindowBg, opaque_bg);
     ui.window(format!("Profile##{}", user.id))
         .opened(&mut open)
         .position([display_w / 2.0 - 260.0, display_h / 2.0 - 260.0], imgui::Condition::Appearing)
@@ -3147,6 +3200,8 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
     }
     let [display_w, display_h] = ui.io().display_size;
     let mut open = state.show_settings;
+    let opaque_bg = [state.theme.background[0], state.theme.background[1], state.theme.background[2], 1.0];
+    let _bg_token = ui.push_style_color(imgui::StyleColor::WindowBg, opaque_bg);
     ui.window("Settings")
         .opened(&mut open)
         .position([display_w / 2.0 - 280.0, display_h / 2.0 - 260.0], imgui::Condition::Appearing)
@@ -3282,6 +3337,49 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                     ..state.audio_settings()
                 });
                 let _ = cmd_tx.send(UiCommand::SetMicProcessing { gain: state.mic_gain, denoise: state.denoise });
+            }
+
+            ui.spacing();
+            ui.separator();
+            ui.text("Keybinds");
+            ui.separator();
+            for action in crate::keybinds::Action::ALL {
+                ui.text(action.label());
+                ui.same_line();
+                let is_rebinding = state.rebinding_action == Some(action);
+                let button_label = if is_rebinding {
+                    "Press a key...".to_string()
+                } else {
+                    state.keybinds.get(action).map(crate::keybinds::key_name).unwrap_or_else(|| "Unbound".to_string())
+                };
+                if ui.button(format!("{button_label}##bind_{}", action.label())) {
+                    state.rebinding_action = Some(action);
+                }
+                if is_rebinding {
+                    if ui.is_key_pressed(imgui::Key::Escape) {
+                        state.rebinding_action = None;
+                    } else if let Some(key) = imgui::Key::VARIANTS.into_iter().find(|k| ui.is_key_pressed(*k)) {
+                        state.keybinds.set(action, Some(key));
+                        state.rebinding_action = None;
+                        crate::settings::save(&crate::settings::Settings {
+                            theme_file: current_theme_file(&state.theme),
+                            input_device: state.selected_input_device.clone(),
+                            output_device: state.selected_output_device.clone(),
+                            ..state.audio_settings()
+                        });
+                    }
+                }
+                ui.same_line();
+                if ui.small_button(format!("Clear##unbind_{}", action.label())) {
+                    state.keybinds.set(action, None);
+                    state.rebinding_action = None;
+                    crate::settings::save(&crate::settings::Settings {
+                        theme_file: current_theme_file(&state.theme),
+                        input_device: state.selected_input_device.clone(),
+                        output_device: state.selected_output_device.clone(),
+                        ..state.audio_settings()
+                    });
+                }
             }
 
             ui.spacing();
