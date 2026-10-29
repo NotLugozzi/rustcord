@@ -1,4 +1,4 @@
-use crate::app_state::{AppState, GuildFolder, RailItem};
+use crate::app_state::{AppState, GuildFolder, RailItem, SettingsCategory};
 use crate::backend::UiCommand;
 use crate::images::TextureCache;
 use crate::markdown::{self, Block, Span, Style};
@@ -3194,216 +3194,318 @@ fn draw_activity_card(
     });
 }
 
+const SETTINGS_SIDEBAR_WIDTH: f32 = 200.0;
+
 fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     if !state.show_settings {
         return;
     }
     let [display_w, display_h] = ui.io().display_size;
-    let mut open = state.show_settings;
     let opaque_bg = [state.theme.background[0], state.theme.background[1], state.theme.background[2], 1.0];
     let _bg_token = ui.push_style_color(imgui::StyleColor::WindowBg, opaque_bg);
+    let mut logged_out = false;
     ui.window("Settings")
-        .opened(&mut open)
-        .position([display_w / 2.0 - 280.0, display_h / 2.0 - 260.0], imgui::Condition::Appearing)
-        .size([560.0, 520.0], imgui::Condition::Appearing)
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([display_w, display_h], imgui::Condition::Always)
+        .no_decoration()
         .build(|| {
-            if let Some(user) = &state.current_user {
-                ui.text("Account");
+            let close_width = 32.0;
+            ui.set_cursor_pos([display_w - close_width - 16.0, 16.0]);
+            if ui.button("X##close_settings") {
+                state.show_settings = false;
+            }
+
+            ui.set_cursor_pos([0.0, 0.0]);
+            let _sidebar_bg = ui.push_style_color(imgui::StyleColor::ChildBg, state.theme.panel);
+            ui.child_window("settings_sidebar").size([SETTINGS_SIDEBAR_WIDTH, display_h]).build(|| {
+                ui.spacing();
+                for category in SettingsCategory::ALL {
+                    let y = ui.cursor_pos()[1];
+                    ui.set_cursor_pos([16.0, y]);
+                    if ui.selectable_config(category.label()).selected(state.settings_category == category).build() {
+                        state.settings_category = category;
+                    }
+                }
+            });
+            _sidebar_bg.pop();
+
+            ui.set_cursor_pos([SETTINGS_SIDEBAR_WIDTH + 32.0, 16.0]);
+            ui.child_window("settings_content").size([display_w - SETTINGS_SIDEBAR_WIDTH - 64.0, display_h - 32.0]).build(|| {
+                ui.text(state.settings_category.label());
                 ui.separator();
-                let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
-                ui.text(format!("Username: {display_name} (@{})", user.username));
-                ui.text(format!("User ID: {}", user.id));
                 ui.spacing();
-                if ui.button("Log out") {
-                    let _ = cmd_tx.send(UiCommand::Logout);
-                    let theme = state.theme.clone();
-                    *state = AppState { theme, ..Default::default() };
-                    return;
-                }
-            }
-
-            ui.spacing();
-            ui.separator();
-            ui.text("Notifications");
-            ui.separator();
-            ui.checkbox("Desktop notifications for DMs and mentions", &mut state.notifications_enabled);
-
-            ui.spacing();
-            ui.separator();
-            ui.text("Activity");
-            ui.separator();
-            let muted = state.theme.text_muted;
-            ui.text_colored(muted, "Forced activity (shown as Playing)");
-            let [name, details, st] = &mut state.manual_activity;
-            ui.set_next_item_width(-1.0);
-            ui.input_text("##act_name", name).hint("Name").build();
-            ui.set_next_item_width(-1.0);
-            ui.input_text("##act_details", details).hint("Details").build();
-            ui.set_next_item_width(-1.0);
-            ui.input_text("##act_state", st).hint("State").build();
-            if ui.button("Apply##activity") {
-                let _ = cmd_tx.send(UiCommand::SetManualActivity { name: name.clone(), details: details.clone(), state: st.clone() });
-            }
-            ui.same_line();
-            if ui.button("Remove##activity") {
-                name.clear();
-                details.clear();
-                st.clear();
-                let _ = cmd_tx.send(UiCommand::SetManualActivity { name: String::new(), details: String::new(), state: String::new() });
-            }
-
-            ui.spacing();
-            ui.text_colored(muted, "Apps sharing activity via RPC");
-            if state.rpc_apps.is_empty() {
-                ui.text_disabled("No apps connected. Quit the official client first so apps connect here.");
-            }
-            let apps = state.rpc_apps.clone();
-            for app in &apps {
-                let image = app.image_url.as_deref().or(app.icon_url.as_deref());
-                draw_activity_card(ui, cmd_tx, textures, image, &app.name, &[&app.detail], muted);
-                let mut enabled = app.enabled;
-                if ui.checkbox(format!("Share##rpc{}", app.conn_id), &mut enabled) {
-                    let _ = cmd_tx.send(UiCommand::SetRpcEnabled { conn_id: app.conn_id, enabled });
-                }
-                ui.spacing();
-            }
-
-            ui.spacing();
-            ui.separator();
-            ui.text("Voice & Video");
-            ui.separator();
-            if state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
-                if ui.button("Refresh device list") {
-                    let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
-                }
-            } else {
-                ui.text_colored(muted, "Input Device");
-                ui.set_next_item_width(-1.0);
-                let current_input = state.selected_input_device.clone().unwrap_or_else(|| "Default".to_string());
-                if let Some(_token) = ui.begin_combo("##input_device", &current_input) {
-                    if ui.selectable_config("Default").selected(state.selected_input_device.is_none()).build() {
-                        state.selected_input_device = None;
-                        crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: None, output_device: state.selected_output_device.clone(), ..state.audio_settings() });
-                        let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: None });
-                    }
-                    let devices = state.voice_input_devices.clone();
-                    for device in &devices {
-                        let is_selected = state.selected_input_device.as_deref() == Some(device.as_str());
-                        if ui.selectable_config(device).selected(is_selected).build() {
-                            state.selected_input_device = Some(device.clone());
-                            crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: Some(device.clone()), output_device: state.selected_output_device.clone(), ..state.audio_settings() });
-                            let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: Some(device.clone()) });
+                match state.settings_category {
+                    SettingsCategory::Account => {
+                        if draw_settings_account(ui, state, cmd_tx, textures) {
+                            logged_out = true;
                         }
                     }
+                    SettingsCategory::Notifications => draw_settings_notifications(ui, state),
+                    SettingsCategory::Activity => draw_settings_activity(ui, state, cmd_tx, textures),
+                    SettingsCategory::VoiceVideo => draw_settings_voice(ui, state, cmd_tx),
+                    SettingsCategory::Keybinds => draw_settings_keybinds(ui, state),
+                    SettingsCategory::Appearance => draw_settings_appearance(ui, state),
                 }
+            });
+        });
+    if logged_out {
+        let theme = state.theme.clone();
+        *state = AppState { theme, ..Default::default() };
+    }
+}
 
-                ui.spacing();
-                ui.text_colored(muted, "Output Device");
-                ui.set_next_item_width(-1.0);
-                let current_output = state.selected_output_device.clone().unwrap_or_else(|| "Default".to_string());
-                if let Some(_token) = ui.begin_combo("##output_device", &current_output) {
-                    if ui.selectable_config("Default").selected(state.selected_output_device.is_none()).build() {
-                        state.selected_output_device = None;
-                        crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: None, ..state.audio_settings() });
-                        let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: None });
-                    }
-                    let devices = state.voice_output_devices.clone();
-                    for device in &devices {
-                        let is_selected = state.selected_output_device.as_deref() == Some(device.as_str());
-                        if ui.selectable_config(device).selected(is_selected).build() {
-                            state.selected_output_device = Some(device.clone());
-                            crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: Some(device.clone()), ..state.audio_settings() });
-                            let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: Some(device.clone()) });
-                        }
-                    }
+fn draw_settings_account(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) -> bool {
+    let Some(user) = state.current_user.clone() else { return false };
+    if state.profiles_requested.insert(user.id.clone()) {
+        let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user.id.clone() });
+    }
+    let profile = state.profiles.get(&user.id).cloned().unwrap_or_default();
+
+    let width = ui.content_region_avail()[0].min(480.0);
+    let banner_size = [width, width * 0.3];
+    let banner_pos = ui.cursor_pos();
+    match profile.banner_url.as_deref().and_then(|u| textures.get(u).map(|t| (u, t))) {
+        Some((_, (texture_id, _))) => imgui::Image::new(texture_id, banner_size).build(ui),
+        None => {
+            if let Some(url) = &profile.banner_url {
+                textures.request(url, cmd_tx);
+            }
+            let p = ui.cursor_screen_pos();
+            ui.get_window_draw_list()
+                .add_rect(p, [p[0] + banner_size[0], p[1] + banner_size[1]], state.theme.accent)
+                .filled(true)
+                .build();
+            ui.dummy(banner_size);
+        }
+    }
+    ui.set_cursor_pos([banner_pos[0] + 12.0, banner_pos[1] + banner_size[1] - 36.0]);
+    let avatar_url = rustcord_client::cdn::avatar_url(&user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
+    let avatar_screen_pos = ui.cursor_screen_pos();
+    ui.get_window_draw_list()
+        .add_circle([avatar_screen_pos[0] + 40.0, avatar_screen_pos[1] + 40.0], 44.0, state.theme.panel)
+        .filled(true)
+        .build();
+    if let Some((texture_id, _)) = textures.get(&avatar_url) {
+        draw_circular_image(ui, texture_id, [80.0, 80.0]);
+    } else {
+        textures.request(&avatar_url, cmd_tx);
+        ui.dummy([80.0, 80.0]);
+    }
+    ui.set_cursor_pos([banner_pos[0], banner_pos[1] + banner_size[1] + 52.0]);
+
+    let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+    ui.text(format!("Username: {display_name} (@{})", user.username));
+    ui.text(format!("User ID: {}", user.id));
+    ui.spacing();
+    if ui.button("Log out") {
+        let _ = cmd_tx.send(UiCommand::Logout);
+        return true;
+    }
+    false
+}
+
+fn draw_settings_notifications(ui: &Ui, state: &mut AppState) {
+    ui.checkbox("Desktop notifications for DMs and mentions", &mut state.notifications_enabled);
+}
+
+fn draw_settings_activity(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
+    let muted = state.theme.text_muted;
+    ui.text_colored(muted, "Forced activity (shown as Playing)");
+    let [name, details, st] = &mut state.manual_activity;
+    ui.set_next_item_width(-1.0);
+    ui.input_text("##act_name", name).hint("Name").build();
+    ui.set_next_item_width(-1.0);
+    ui.input_text("##act_details", details).hint("Details").build();
+    ui.set_next_item_width(-1.0);
+    ui.input_text("##act_state", st).hint("State").build();
+    if ui.button("Apply##activity") {
+        let _ = cmd_tx.send(UiCommand::SetManualActivity { name: name.clone(), details: details.clone(), state: st.clone() });
+    }
+    ui.same_line();
+    if ui.button("Remove##activity") {
+        name.clear();
+        details.clear();
+        st.clear();
+        let _ = cmd_tx.send(UiCommand::SetManualActivity { name: String::new(), details: String::new(), state: String::new() });
+    }
+
+    ui.spacing();
+    ui.text_colored(muted, "Apps sharing activity via RPC");
+    if state.rpc_apps.is_empty() {
+        ui.text_disabled("No apps connected. Quit the official client first so apps connect here.");
+    }
+    let apps = state.rpc_apps.clone();
+    for app in &apps {
+        let image = app.image_url.as_deref().or(app.icon_url.as_deref());
+        draw_activity_card(ui, cmd_tx, textures, image, &app.name, &[&app.detail], muted);
+        let mut enabled = app.enabled;
+        if ui.checkbox(format!("Share##rpc{}", app.conn_id), &mut enabled) {
+            let _ = cmd_tx.send(UiCommand::SetRpcEnabled { conn_id: app.conn_id, enabled });
+        }
+        ui.spacing();
+    }
+}
+
+fn draw_settings_voice(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let muted = state.theme.text_muted;
+    if state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
+        if ui.button("Refresh device list") {
+            let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+        }
+    } else {
+        ui.text_colored(muted, "Input Device");
+        ui.set_next_item_width(-1.0);
+        let current_input = state.selected_input_device.clone().unwrap_or_else(|| "Default".to_string());
+        if let Some(_token) = ui.begin_combo("##input_device", &current_input) {
+            if ui.selectable_config("Default").selected(state.selected_input_device.is_none()).build() {
+                state.selected_input_device = None;
+                crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: None, output_device: state.selected_output_device.clone(), ..state.audio_settings() });
+                let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: None });
+            }
+            let devices = state.voice_input_devices.clone();
+            for device in &devices {
+                let is_selected = state.selected_input_device.as_deref() == Some(device.as_str());
+                if ui.selectable_config(device).selected(is_selected).build() {
+                    state.selected_input_device = Some(device.clone());
+                    crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: Some(device.clone()), output_device: state.selected_output_device.clone(), ..state.audio_settings() });
+                    let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device: Some(device.clone()) });
                 }
             }
+        }
 
-            ui.spacing();
-            ui.text_colored(muted, "Microphone");
-            let mut changed = false;
-            let mut gain_percent = state.mic_gain * 100.0;
-            ui.set_next_item_width(-1.0);
-            if ui.slider_config("##mic_gain", 0.0, 300.0).display_format("Gain %.0f%%").build(&mut gain_percent) {
-                state.mic_gain = gain_percent / 100.0;
-                changed = true;
+        ui.spacing();
+        ui.text_colored(muted, "Output Device");
+        ui.set_next_item_width(-1.0);
+        let current_output = state.selected_output_device.clone().unwrap_or_else(|| "Default".to_string());
+        if let Some(_token) = ui.begin_combo("##output_device", &current_output) {
+            if ui.selectable_config("Default").selected(state.selected_output_device.is_none()).build() {
+                state.selected_output_device = None;
+                crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: None, ..state.audio_settings() });
+                let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: None });
             }
-            changed |= ui.checkbox("Noise suppression (RNNoise)", &mut state.denoise);
-            if changed {
+            let devices = state.voice_output_devices.clone();
+            for device in &devices {
+                let is_selected = state.selected_output_device.as_deref() == Some(device.as_str());
+                if ui.selectable_config(device).selected(is_selected).build() {
+                    state.selected_output_device = Some(device.clone());
+                    crate::settings::save(&crate::settings::Settings { theme_file: current_theme_file(&state.theme), input_device: state.selected_input_device.clone(), output_device: Some(device.clone()), ..state.audio_settings() });
+                    let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device: Some(device.clone()) });
+                }
+            }
+        }
+
+        ui.spacing();
+        if state.mic_test_running {
+            ui.text_colored(state.theme.accent, "Recording... speak now (10s), then it will play back");
+        } else if ui.button("Mic Test") {
+            let _ = cmd_tx.send(UiCommand::RunMicTest {
+                input_device: state.selected_input_device.clone(),
+                output_device: state.selected_output_device.clone(),
+            });
+        }
+    }
+
+    ui.spacing();
+    ui.text_colored(muted, "Microphone");
+    let mut changed = false;
+    let mut gain_percent = state.mic_gain * 100.0;
+    ui.set_next_item_width(-1.0);
+    if ui.slider_config("##mic_gain", 0.0, 300.0).display_format("Gain %.0f%%").build(&mut gain_percent) {
+        state.mic_gain = gain_percent / 100.0;
+        changed = true;
+    }
+    changed |= ui.checkbox("Noise suppression (RNNoise)", &mut state.denoise);
+    if changed {
+        crate::settings::save(&crate::settings::Settings {
+            theme_file: current_theme_file(&state.theme),
+            input_device: state.selected_input_device.clone(),
+            output_device: state.selected_output_device.clone(),
+            ..state.audio_settings()
+        });
+        let _ = cmd_tx.send(UiCommand::SetMicProcessing { gain: state.mic_gain, denoise: state.denoise });
+    }
+}
+
+fn draw_settings_keybinds(ui: &Ui, state: &mut AppState) {
+    for action in crate::keybinds::Action::ALL {
+        ui.text(action.label());
+        ui.same_line();
+        let is_rebinding = state.rebinding_action == Some(action);
+        let button_label = if is_rebinding {
+            "Press a key...".to_string()
+        } else {
+            state.keybinds.get(action).map(crate::keybinds::key_name).unwrap_or_else(|| "Unbound".to_string())
+        };
+        if ui.button(format!("{button_label}##bind_{}", action.label())) {
+            state.rebinding_action = Some(action);
+        }
+        if is_rebinding {
+            if ui.is_key_pressed(imgui::Key::Escape) {
+                state.rebinding_action = None;
+            } else if let Some(key) = imgui::Key::VARIANTS.into_iter().find(|k| ui.is_key_pressed(*k)) {
+                state.keybinds.set(action, Some(key));
+                state.rebinding_action = None;
                 crate::settings::save(&crate::settings::Settings {
                     theme_file: current_theme_file(&state.theme),
                     input_device: state.selected_input_device.clone(),
                     output_device: state.selected_output_device.clone(),
                     ..state.audio_settings()
                 });
-                let _ = cmd_tx.send(UiCommand::SetMicProcessing { gain: state.mic_gain, denoise: state.denoise });
             }
+        }
+        ui.same_line();
+        if ui.small_button(format!("Clear##unbind_{}", action.label())) {
+            state.keybinds.set(action, None);
+            state.rebinding_action = None;
+            crate::settings::save(&crate::settings::Settings {
+                theme_file: current_theme_file(&state.theme),
+                input_device: state.selected_input_device.clone(),
+                output_device: state.selected_output_device.clone(),
+                ..state.audio_settings()
+            });
+        }
+    }
+}
 
-            ui.spacing();
-            ui.separator();
-            ui.text("Keybinds");
-            ui.separator();
-            for action in crate::keybinds::Action::ALL {
-                ui.text(action.label());
-                ui.same_line();
-                let is_rebinding = state.rebinding_action == Some(action);
-                let button_label = if is_rebinding {
-                    "Press a key...".to_string()
-                } else {
-                    state.keybinds.get(action).map(crate::keybinds::key_name).unwrap_or_else(|| "Unbound".to_string())
-                };
-                if ui.button(format!("{button_label}##bind_{}", action.label())) {
-                    state.rebinding_action = Some(action);
-                }
-                if is_rebinding {
-                    if ui.is_key_pressed(imgui::Key::Escape) {
-                        state.rebinding_action = None;
-                    } else if let Some(key) = imgui::Key::VARIANTS.into_iter().find(|k| ui.is_key_pressed(*k)) {
-                        state.keybinds.set(action, Some(key));
-                        state.rebinding_action = None;
-                        crate::settings::save(&crate::settings::Settings {
-                            theme_file: current_theme_file(&state.theme),
-                            input_device: state.selected_input_device.clone(),
-                            output_device: state.selected_output_device.clone(),
-                            ..state.audio_settings()
-                        });
-                    }
-                }
-                ui.same_line();
-                if ui.small_button(format!("Clear##unbind_{}", action.label())) {
-                    state.keybinds.set(action, None);
-                    state.rebinding_action = None;
-                    crate::settings::save(&crate::settings::Settings {
-                        theme_file: current_theme_file(&state.theme),
-                        input_device: state.selected_input_device.clone(),
-                        output_device: state.selected_output_device.clone(),
-                        ..state.audio_settings()
-                    });
-                }
-            }
+fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
+    let theme_paths = crate::theme::Theme::list_available();
+    if theme_paths.is_empty() {
+        ui.text_disabled("No themes are available.");
+    }
+    for path in &theme_paths {
+        let label = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let is_current = label == state.theme.name;
+        let Ok(theme) = crate::theme::Theme::load_from_file(path) else { continue };
 
-            ui.spacing();
-            ui.separator();
-            ui.text("Theme");
-            ui.separator();
+        let swatch_size = [28.0, 20.0];
+        let swatch_pos = ui.cursor_screen_pos();
+        match theme.gradient {
+            Some([left, right]) => {
+                ui.get_window_draw_list().add_rect_filled_multicolor(
+                    swatch_pos,
+                    [swatch_pos[0] + swatch_size[0], swatch_pos[1] + swatch_size[1]],
+                    left,
+                    right,
+                    right,
+                    left,
+                );
+            }
+            None => {
+                ui.get_window_draw_list()
+                    .add_rect(swatch_pos, [swatch_pos[0] + swatch_size[0], swatch_pos[1] + swatch_size[1]], theme.accent)
+                    .filled(true)
+                    .build();
+            }
+        }
+        ui.dummy(swatch_size);
+        ui.same_line();
 
-            let theme_paths = crate::theme::Theme::list_available();
-            if theme_paths.is_empty() {
-                ui.text_disabled("No themes are available.");
-            }
-            for path in &theme_paths {
-                let label = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                let is_current = label == state.theme.name;
-                if ui.selectable_config(&label).selected(is_current).build() {
-                    if let Ok(theme) = crate::theme::Theme::load_from_file(path) {
-                        state.theme = theme;
-                        let theme_file = path.file_name().map(|name| name.to_string_lossy().into_owned());
-                        crate::settings::save(&crate::settings::Settings { theme_file, input_device: state.selected_input_device.clone(), output_device: state.selected_output_device.clone(), ..state.audio_settings() });
-                    }
-                }
-            }
-        });
-    state.show_settings = open;
+        if ui.selectable_config(&label).selected(is_current).build() {
+            state.theme = theme;
+            let theme_file = path.file_name().map(|name| name.to_string_lossy().into_owned());
+            crate::settings::save(&crate::settings::Settings { theme_file, input_device: state.selected_input_device.clone(), output_device: state.selected_output_device.clone(), ..state.audio_settings() });
+        }
+    }
 }
 
 fn current_theme_file(theme: &crate::theme::Theme) -> Option<String> {

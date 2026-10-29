@@ -124,6 +124,7 @@ pub enum UiCommand {
     SetUserVolume { user_id: String, volume: f32 },
     SetVoiceOutputDevice { device: Option<String> },
     LoadVoiceDevices,
+    RunMicTest { input_device: Option<String>, output_device: Option<String> },
     Logout,
 }
 
@@ -154,6 +155,8 @@ pub enum BackendEvent {
     Notice(String),
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
     MemberRemoved { guild_id: String, user_id: String },
+    MicTestStarted,
+    MicTestFinished,
 }
 
 pub fn spawn(
@@ -531,6 +534,14 @@ pub fn spawn(
                         let inputs = rustcord_client::voice_audio::list_input_devices();
                         let outputs = rustcord_client::voice_audio::list_output_devices();
                         let _ = event_tx.send(BackendEvent::VoiceDevicesLoaded { inputs, outputs });
+                    });
+                }
+                UiCommand::RunMicTest { input_device, output_device } => {
+                    let event_tx = event_tx.clone();
+                    let _ = event_tx.send(BackendEvent::MicTestStarted);
+                    tokio::task::spawn_blocking(move || {
+                        rustcord_client::voice_audio::run_mic_test(input_device, output_device, std::time::Duration::from_secs(10));
+                        let _ = event_tx.send(BackendEvent::MicTestFinished);
                     });
                 }
                 UiCommand::Logout => {

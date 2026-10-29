@@ -10,6 +10,39 @@ pub struct ChannelGroup<'a> {
     pub channels: Vec<(&'a Channel, bool)>,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsCategory {
+    #[default]
+    Account,
+    Notifications,
+    Activity,
+    VoiceVideo,
+    Keybinds,
+    Appearance,
+}
+
+impl SettingsCategory {
+    pub const ALL: [SettingsCategory; 6] = [
+        SettingsCategory::Account,
+        SettingsCategory::Notifications,
+        SettingsCategory::Activity,
+        SettingsCategory::VoiceVideo,
+        SettingsCategory::Keybinds,
+        SettingsCategory::Appearance,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsCategory::Account => "Account",
+            SettingsCategory::Notifications => "Notifications",
+            SettingsCategory::Activity => "Activity",
+            SettingsCategory::VoiceVideo => "Voice & Video",
+            SettingsCategory::Keybinds => "Keybinds",
+            SettingsCategory::Appearance => "Appearance",
+        }
+    }
+}
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct DmGroup {
     pub name: String,
@@ -151,6 +184,7 @@ pub struct AppState {
     pub typing_users: HashMap<String, HashMap<String, std::time::Instant>>,
     pub last_typing_sent: Option<std::time::Instant>,
     pub show_settings: bool,
+    pub settings_category: SettingsCategory,
     pub profile_popout: Option<User>,
     pub image_lightbox: Option<String>,
     pub reply_target: Option<Message>,
@@ -187,6 +221,7 @@ pub struct AppState {
     pub show_hidden_channels: bool,
     pub keybinds: crate::keybinds::Keybinds,
     pub rebinding_action: Option<crate::keybinds::Action>,
+    pub mic_test_running: bool,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);

@@ -33,9 +33,8 @@ Use at your own risk.
 - [x] Embed Rendering
 - [x] Voice calls (DMs: ring/answer/decline, call messages, participant panel)
 - [x] Non-image attachments/embeds rendering
-- [x] Fix hCaptcha handling and proper display
 - [x] Per-user volume/mute in server calls
-- [x] better statistics for voice chat (dropped frames, latency graph, something like this)
+- [x] Better statistics for voice chat (dropped frames, latency graph, encryption epoch)
 - [x] Trackpad scroll acceleration
 - [x] Per-channel permission filtering (all guild channels show regardless of your actual access)
 - [x] UI Gliphs for buttons and states

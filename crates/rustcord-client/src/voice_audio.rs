@@ -3,7 +3,7 @@ use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
 use audiopus::{Application, Channels, SampleRate};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -319,6 +319,57 @@ pub fn play_ringtone(stop: Arc<AtomicBool>) {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
+}
+
+pub fn run_mic_test(input_device: Option<String>, output_device: Option<String>, duration: std::time::Duration) {
+    let host = audio_host();
+    let Some(in_device) = find_device(&host, input_device.as_deref(), true) else { return };
+    let Some(out_device) = find_device(&host, output_device.as_deref(), false) else { return };
+
+    let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
+    let recorded: Arc<std::sync::Mutex<Vec<i16>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded_cb = recorded.clone();
+    let Ok(input_stream) = in_device.build_input_stream(
+        config.clone(),
+        move |data: &[i16], _| {
+            recorded_cb.lock().unwrap().extend_from_slice(data);
+        },
+        |e: cpal::Error| tracing::warn!("mic test: input stream error: {e}"),
+        None,
+    ) else {
+        return;
+    };
+    if input_stream.play().is_err() {
+        return;
+    }
+    std::thread::sleep(duration);
+    drop(input_stream);
+
+    let samples = recorded.lock().unwrap().clone();
+    if samples.is_empty() {
+        return;
+    }
+    let position = Arc::new(AtomicU32::new(0));
+    let position_cb = position.clone();
+    let samples_cb = samples.clone();
+    let Ok(output_stream) = out_device.build_output_stream(
+        config,
+        move |out: &mut [i16], _| {
+            let pos = position_cb.load(Ordering::Relaxed) as usize;
+            for (i, sample) in out.iter_mut().enumerate() {
+                *sample = samples_cb.get(pos + i).copied().unwrap_or(0);
+            }
+            position_cb.fetch_add(out.len() as u32, Ordering::Relaxed);
+        },
+        |e: cpal::Error| tracing::warn!("mic test: output stream error: {e}"),
+        None,
+    ) else {
+        return;
+    };
+    if output_stream.play().is_ok() {
+        let playback_duration = std::time::Duration::from_secs_f64(samples.len() as f64 / SAMPLE_RATE as f64);
+        std::thread::sleep(playback_duration);
+    }
 }
 
 pub fn play_ding(join: bool, device_name: Option<String>) {

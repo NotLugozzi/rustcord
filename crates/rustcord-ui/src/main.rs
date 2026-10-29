@@ -285,6 +285,12 @@ pub fn drain_backend_events(
                     members.retain(|m| m.user.id != user_id);
                 }
             }
+            BackendEvent::MicTestStarted => {
+                state.mic_test_running = true;
+            }
+            BackendEvent::MicTestFinished => {
+                state.mic_test_running = false;
+            }
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
                 state.guild_channels.insert(guild_id, channels);
             }
