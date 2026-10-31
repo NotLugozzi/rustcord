@@ -12,6 +12,10 @@ mod session_store;
 mod settings;
 mod theme;
 mod ui;
+#[cfg(feature = "video")]
+mod video;
+#[cfg(feature = "video")]
+mod video_audio;
 
 use app_state::AppState;
 use backend::{BackendEvent, UiCommand};
@@ -93,8 +97,8 @@ pub fn drain_backend_events(
     state: &mut AppState,
     event_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
     cmd_tx: &mpsc::UnboundedSender<UiCommand>,
-) -> Vec<(String, images::Decoded)> {
-    let mut image_downloads = Vec::new();
+) -> DrainedMedia {
+    let mut media = DrainedMedia::default();
     while let Ok(event) = event_rx.try_recv() {
         match event {
             BackendEvent::LoggedIn => {
@@ -334,9 +338,20 @@ pub fn drain_backend_events(
                 state.sidebar_tab = 0;
             }
             BackendEvent::ImageDownloaded { url, image } => {
-                image_downloads.push((url, image));
+                media.images.push((url, image));
+            }
+            #[cfg(feature = "video")]
+            BackendEvent::VideoBatchReady(batch) => {
+                media.videos.push(batch);
             }
         }
     }
-    image_downloads
+    media
+}
+
+#[derive(Default)]
+pub struct DrainedMedia {
+    pub images: Vec<(String, images::Decoded)>,
+    #[cfg(feature = "video")]
+    pub videos: Vec<images::VideoBatch>,
 }

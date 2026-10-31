@@ -183,6 +183,17 @@ impl VoiceGateway {
                     });
                 }
                 _ = stats_check.tick() => {
+                    const SSRC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+                    for ssrc in codec.idle_ssrcs(SSRC_IDLE_TIMEOUT) {
+                        if remote_speakers.contains_key(&ssrc) {
+                            continue;
+                        }
+                        tracing::debug!("voice: pruning orphaned idle SSRC {ssrc}");
+                        codec.drop_ssrc(ssrc);
+                        if let Some(active_rtc) = rtc.as_mut() {
+                            active_rtc.forget_remote_audio(ssrc);
+                        }
+                    }
                     let up = (bytes_sent * 8) as u32;
                     let down = (bytes_received * 8) as u32;
                     bytes_sent = 0;
@@ -351,6 +362,7 @@ impl VoiceGateway {
                                                 }
                                             }
                                         }
+                                        codec.track_ssrc(ssrc);
                                         if let Some(active_rtc) = rtc.as_mut() {
                                             active_rtc.expect_remote_audio(ssrc);
                                         }
@@ -368,6 +380,18 @@ impl VoiceGateway {
                             } else if payload.op == 13 {
                                 if let Some(id) = payload.d.as_ref().and_then(|d| d["user_id"].as_str()) {
                                     recognized_users.retain(|known| known != id || known == &self.user_id);
+                                    let departed: Vec<u32> = remote_speakers
+                                        .iter()
+                                        .filter(|(_, user)| user.as_str() == id)
+                                        .map(|(ssrc, _)| *ssrc)
+                                        .collect();
+                                    for ssrc in departed {
+                                        remote_speakers.remove(&ssrc);
+                                        codec.drop_ssrc(ssrc);
+                                        if let Some(active_rtc) = rtc.as_mut() {
+                                            active_rtc.forget_remote_audio(ssrc);
+                                        }
+                                    }
                                 }
                             } else if payload.op == 24 {
                                 if let Some(data) = &payload.d {
@@ -438,6 +462,7 @@ impl VoiceGateway {
                                                 }
                                             }
                                         }
+                                        codec.track_ssrc(audio_ssrc);
                                         if let Some(active_rtc) = rtc.as_mut() {
                                             active_rtc.expect_remote_audio(audio_ssrc);
                                         }

@@ -176,11 +176,24 @@ impl AppWindow {
     }
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
-        let image_downloads = drain_backend_events(state, event_rx, cmd_tx);
-        for (url, image) in image_downloads {
+        let media = drain_backend_events(state, event_rx, cmd_tx);
+        for (url, image) in media.images {
             self.textures.ingest(url, image, &self.device, &self.queue, &mut self.imgui.renderer);
         }
+        #[cfg(feature = "video")]
+        {
+            for batch in media.videos {
+                self.textures.ingest_video_batch(batch, &mut self.imgui.renderer);
+            }
+            self.textures.upload_pending_video_frames(&self.device, &self.queue, &mut self.imgui.renderer);
+        }
+        #[cfg(feature = "video")]
+        self.textures.evict(&mut self.imgui.renderer, cmd_tx);
+        #[cfg(not(feature = "video"))]
         self.textures.evict(&mut self.imgui.renderer);
+        #[cfg(feature = "video")]
+        self.textures.tick(&mut self.imgui.renderer, cmd_tx);
+        #[cfg(not(feature = "video"))]
         self.textures.tick();
 
         let imgui = &mut self.imgui;

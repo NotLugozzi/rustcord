@@ -9,9 +9,10 @@ pub fn avatar_url(user: &User, size: u32) -> Option<String> {
 }
 
 pub fn default_avatar_url(user: &User) -> String {
-    let index: u64 = user.discriminator.parse().map(|d: u64| d % 5).unwrap_or_else(|_| {
-        user.id.parse::<u64>().map(|id| (id >> 22) % 6).unwrap_or(0)
-    });
+    let index = match user.discriminator.parse::<u64>() {
+        Ok(0) | Err(_) => user.id.parse::<u64>().map(|id| (id >> 22) % 6).unwrap_or(0),
+        Ok(d) => d % 5,
+    };
     format!("{CDN_BASE}/embed/avatars/{index}.png")
 }
 

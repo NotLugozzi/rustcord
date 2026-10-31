@@ -27,7 +27,7 @@ Use at your own risk.
 - [x] Real avatars (users) and guild icons
 - [x] User bar with settings dialog (account info, logout, theme switcher)
 - [x] Server Calls
-- [x] Message editing/deleting, reactions
+- [x] Message editing/deleting
 - [x] Custom emote rendering/sending
 - [x] Guild folders
 - [x] Embed Rendering
@@ -36,15 +36,16 @@ Use at your own risk.
 - [x] Per-user volume/mute in server calls
 - [x] Better statistics for voice chat (dropped frames, latency graph, encryption epoch)
 - [x] Trackpad scroll acceleration
-- [x] Per-channel permission filtering (all guild channels show regardless of your actual access)
+- [x] Per-channel permission filtering
 - [x] UI Gliphs for buttons and states
 - [x] App Keybinds
 - [x] Server users panel (low priority)
 - [x] VC Leave/Join sound
+- [x] Inline video attachment playback (optional `video` feature, needs ffmpeg)
+- [ ] Reactions
 - [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
 - [ ] Message read status sync
-- [ ] performance improvements in voice calls (high cpu usage, memory usage reaching almost 1gb)
-- [ ] Fix notifications for guilds and messages (missing audio, probably some UI is missing)
+- [ ] performance improvements in voice calls (SSRC decoder leak fixed; re-measure CPU)
 - [ ] Video Calls, screen sharing
 - [ ] server admin actions (low priority)
 

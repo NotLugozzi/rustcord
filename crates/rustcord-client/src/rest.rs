@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use crate::models::{Channel, Emoji, Guild, Message, User};
-use reqwest::{header, Client, Method};
+use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://discord.com/api/v10";
@@ -132,9 +132,10 @@ pub struct RestClient {
 
 impl RestClient {
     pub fn new(token: impl Into<String>) -> Result<Self, ClientError> {
-        let token = token.into();
+        let token = token.into().trim().to_string();
         let mut headers = header::HeaderMap::new();
-        headers.insert(header::AUTHORIZATION, header::HeaderValue::from_str(&token).unwrap());
+        let auth = header::HeaderValue::from_str(&token).map_err(|_| ClientError::MalformedToken)?;
+        headers.insert(header::AUTHORIZATION, auth);
         headers.insert(header::USER_AGENT, header::HeaderValue::from_static(USER_AGENT));
         headers.insert("X-Super-Properties", header::HeaderValue::from_static(SUPER_PROPERTIES_B64));
 
@@ -243,97 +244,49 @@ impl RestClient {
     }
 
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
-        let resp = self.http.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}")).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))).await
     }
 
     pub async fn kick_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
-        let resp = self.http.delete(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}")).send().await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}"))).await
     }
 
     pub async fn ban_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .put(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}"))
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| {
+            self.http.put(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}")).json(&serde_json::json!({}))
+        })
+        .await
     }
 
     pub async fn ack_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .post(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/ack"))
-            .json(&serde_json::json!({ "token": null }))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| {
+            self.http
+                .post(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/ack"))
+                .json(&serde_json::json!({ "token": null }))
+        })
+        .await
     }
 
     pub async fn ring_call(&self, channel_id: &str) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
-            .json(&serde_json::json!({ "recipients": null }))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| {
+            self.http
+                .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
+                .json(&serde_json::json!({ "recipients": null }))
+        })
+        .await
     }
 
     pub async fn stop_ringing(&self, channel_id: &str) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
-            .json(&serde_json::json!({ "recipients": null }))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| {
+            self.http
+                .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
+                .json(&serde_json::json!({ "recipients": null }))
+        })
+        .await
     }
 
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ClientError> {
-        let resp = self
-            .http
-            .post(format!("{API_BASE}/channels/{channel_id}/typing"))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
-        }
-        Ok(())
+        self.send_empty(|| self.http.post(format!("{API_BASE}/channels/{channel_id}/typing"))).await
     }
 
     pub async fn send_message_with_attachment(
@@ -431,18 +384,61 @@ impl RestClient {
         body: Option<&B>,
     ) -> Result<T, ClientError> {
         let url = format!("{API_BASE}{path}");
-        let mut req = self.http.request(method, &url);
-        if let Some(b) = body {
-            req = req.json(b);
-        }
-        let resp = req.send().await?;
-        let status = resp.status();
-        if !status.is_success() {
+        let resp = self
+            .send_retrying(|| {
+                let mut req = self.http.request(method.clone(), &url);
+                if let Some(b) = body {
+                    req = req.json(b);
+                }
+                req
+            })
+            .await?;
+        Ok(resp.json::<T>().await?)
+    }
+
+    async fn send_retrying<F>(&self, build: F) -> Result<Response, ClientError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        for attempt in 1..=MAX_RATE_LIMIT_ATTEMPTS {
+            let resp = build().send().await?;
+            let status = resp.status();
+            if status.is_success() {
+                return Ok(resp);
+            }
+            if status.as_u16() == 429 && attempt < MAX_RATE_LIMIT_ATTEMPTS {
+                if let Some(wait) = retry_after(&resp) {
+                    if wait <= MAX_RETRY_WAIT {
+                        tracing::debug!("rate limited, retrying in {wait:?} (attempt {attempt})");
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    tracing::warn!("rate limited for {wait:?}, longer than we will wait");
+                }
+            }
             let message = resp.text().await.unwrap_or_default();
             return Err(ClientError::Api { status: status.as_u16(), message });
         }
-        Ok(resp.json::<T>().await?)
+        Err(ClientError::Api { status: 429, message: "rate limited: retries exhausted".into() })
     }
+
+    async fn send_empty<F>(&self, build: F) -> Result<(), ClientError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        self.send_retrying(build).await.map(|_| ())
+    }
+}
+
+const MAX_RATE_LIMIT_ATTEMPTS: u32 = 4;
+const MAX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn retry_after(resp: &Response) -> Option<std::time::Duration> {
+    let secs: f64 = resp.headers().get("retry-after")?.to_str().ok()?.trim().parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(secs))
 }
 
 const SUPER_PROPERTIES_B64: &str = "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyOS4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTI5LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjMwMDAwMCwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=";

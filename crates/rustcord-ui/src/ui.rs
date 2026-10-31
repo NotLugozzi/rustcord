@@ -257,6 +257,16 @@ fn spoiler_key(id_seed: &str, block_idx: usize, span_idx: usize) -> usize {
     hasher.finish() as usize
 }
 
+fn is_video_attachment(content_type: Option<&str>, filename: &str) -> bool {
+    if let Some(ct) = content_type {
+        if ct.starts_with("video/") {
+            return true;
+        }
+    }
+    let ext = filename.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv")
+}
+
 fn is_image_attachment(content_type: Option<&str>, filename: &str) -> bool {
     if let Some(ct) = content_type {
         if ct.starts_with("image/") {
@@ -1314,7 +1324,7 @@ fn human_size(bytes: u64) -> String {
 fn draw_file_attachment(ui: &Ui, cmd_tx: &UnboundedSender<UiCommand>, textures: &TextureCache, attachment: &rustcord_client::models::Attachment) {
     let content_type = attachment.content_type.as_deref().unwrap_or_default();
     let ext = attachment.filename.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
-    let is_video = content_type.starts_with("video/") || matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv");
+    let is_video = is_video_attachment(attachment.content_type.as_deref(), &attachment.filename);
     let is_audio = content_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "ogg" | "wav" | "flac" | "m4a" | "opus");
     let (icon, open_label) = if is_video {
         ('\u{1F3AC}', "Play")
@@ -1349,6 +1359,135 @@ fn draw_file_attachment(ui: &Ui, cmd_tx: &UnboundedSender<UiCommand>, textures: 
     });
 }
 
+#[cfg(feature = "video")]
+fn format_timecode(secs: f64) -> String {
+    let secs = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+#[cfg(feature = "video")]
+fn draw_video_controls(
+    ui: &Ui,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    url: &str,
+    id: &str,
+    status: &crate::images::VideoStatus,
+    width: f32,
+) {
+    if status.buffering {
+        ui.text_disabled("Buffering...");
+        ui.same_line();
+    }
+    let play_label = if status.ended {
+        "\u{21BB}"
+    } else if status.playing {
+        "\u{23F8}"
+    } else {
+        "\u{25B6}"
+    };
+    if ui.button(format!("{play_label}##play_{id}")) {
+        if status.ended {
+            textures.request_video_seek(url, 0.0, cmd_tx);
+        } else {
+            textures.toggle_video_playback(url);
+        }
+    }
+    ui.same_line();
+    ui.text(format!("{} / {}", format_timecode(status.position_secs), format_timecode(status.duration_secs)));
+    ui.same_line();
+
+    let trailing = if status.has_audio { 150.0 } else { 70.0 };
+    let scrub_width = (width - ui.cursor_pos()[0] - trailing).max(60.0);
+    let mut position = status.position_secs as f32;
+    let duration = status.duration_secs.max(0.001) as f32;
+    ui.set_next_item_width(scrub_width);
+    if ui.slider_config(format!("##scrub_{id}"), 0.0f32, duration).display_format("").build(&mut position) {
+        textures.request_video_seek(url, position as f64, cmd_tx);
+    }
+
+    if status.has_audio {
+        ui.same_line();
+        let icon = if status.muted { "\u{1F507}" } else { "\u{1F50A}" };
+        if ui.button(format!("{icon}##mute_{id}")) {
+            textures.toggle_video_mute(url);
+        }
+        ui.same_line();
+        let mut volume = status.volume;
+        ui.set_next_item_width(60.0);
+        if ui.slider_config(format!("##vol_{id}"), 0.0f32, 1.0f32).display_format("").build(&mut volume) {
+            textures.set_video_volume(url, volume);
+        }
+    }
+
+    ui.same_line();
+    if ui.button(format!("\u{26F6}##fs_{id}")) {
+        textures.toggle_video_fullscreen(url);
+    }
+}
+
+#[cfg(feature = "video")]
+fn draw_video_attachment(
+    ui: &Ui,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    attachment: &rustcord_client::models::Attachment,
+) {
+    let url = &attachment.url;
+    if !textures.is_video(url) {
+        ui.group(|| {
+            ui.text(&attachment.filename);
+            ui.text_disabled(human_size(attachment.size));
+            if ui.small_button(format!("Play##play_{}", attachment.id)) {
+                let natural = match (attachment.width, attachment.height) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => [w as f32, h as f32],
+                    _ => [MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT],
+                };
+                textures.start_video(url, natural, cmd_tx);
+            }
+            ui.same_line();
+            if ui.small_button(format!("Save##save_{}", attachment.id)) {
+                let _ = cmd_tx.send(UiCommand::SaveAttachment { url: url.clone(), filename: attachment.filename.clone() });
+            }
+            ui.same_line();
+            if ui.small_button(format!("Open##open_{}", attachment.id)) {
+                let _ = open::that(url);
+            }
+        });
+        return;
+    }
+
+    let Some(status) = textures.video_status(url) else { return };
+    if status.fullscreen {
+        ui.text_disabled(format!("{} (fullscreen)", attachment.filename));
+        return;
+    }
+
+    ui.text(&attachment.filename);
+    let size = match textures.get(url) {
+        Some((texture_id, natural_size)) => {
+            let size = scaled_image_size(natural_size);
+            imgui::Image::new(texture_id, size).build(ui);
+            if ui.is_item_clicked() {
+                textures.toggle_video_playback(url);
+            }
+            size
+        }
+        None => {
+            let size = scaled_image_size([MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT]);
+            ui.dummy(size);
+            ui.text_disabled("Buffering...");
+            size
+        }
+    };
+    draw_video_controls(ui, cmd_tx, textures, url, &attachment.id, &status, size[0]);
+    if ui.small_button(format!("Close##stopvid_{}", attachment.id)) {
+        let _ = cmd_tx.send(UiCommand::CloseVideo { url: url.clone() });
+        textures.mark_video_stopped(url);
+    }
+}
+
 fn draw_attachment(
     ui: &Ui,
     cmd_tx: &UnboundedSender<UiCommand>,
@@ -1357,6 +1496,11 @@ fn draw_attachment(
     lightbox: &mut Option<String>,
 ) {
     if !is_image_attachment(attachment.content_type.as_deref(), &attachment.filename) {
+        #[cfg(feature = "video")]
+        if is_video_attachment(attachment.content_type.as_deref(), &attachment.filename) {
+            draw_video_attachment(ui, cmd_tx, textures, attachment);
+            return;
+        }
         draw_file_attachment(ui, cmd_tx, textures, attachment);
         return;
     }
@@ -2101,6 +2245,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     }
 
     draw_image_lightbox(ui, state, textures);
+    #[cfg(feature = "video")]
+    draw_video_fullscreen(ui, textures, cmd_tx);
     draw_incoming_calls(ui, state, cmd_tx);
     draw_voice_info(ui, state);
 }
@@ -2495,6 +2641,67 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
 
     if close_clicked || ui.is_key_pressed(imgui::Key::Escape) {
         state.image_lightbox = None;
+    }
+}
+
+#[cfg(feature = "video")]
+fn draw_video_fullscreen(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some(url) = textures.fullscreen_video() else { return };
+    let Some(status) = textures.video_status(&url) else { return };
+
+    let [display_w, display_h] = ui.io().display_size;
+    const CONTROL_HEIGHT: f32 = 44.0;
+    let max_h = display_h - CONTROL_HEIGHT;
+    let size = match textures.get(&url) {
+        Some((_, [nw, nh])) if nw > 0.0 && nh > 0.0 => {
+            let scale = (display_w / nw).min(max_h / nh);
+            [nw * scale, nh * scale]
+        }
+        _ => [display_w, max_h],
+    };
+
+    ui.window("##video_fs_backdrop")
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([display_w, display_h], imgui::Condition::Always)
+        .no_decoration()
+        .no_inputs()
+        .draw_background(true)
+        .bg_alpha(0.95)
+        .build(|| {});
+
+    let toggled = ui
+        .window("##video_fs")
+        .position([display_w / 2.0 - size[0] / 2.0, (max_h - size[1]) / 2.0], imgui::Condition::Always)
+        .size(size, imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(false)
+        .build(|| match textures.get(&url) {
+            Some((texture_id, _)) => {
+                imgui::Image::new(texture_id, size).build(ui);
+                ui.is_item_clicked()
+            }
+            None => {
+                ui.text_disabled("Buffering...");
+                false
+            }
+        })
+        .unwrap_or(false);
+
+    ui.window("##video_fs_controls")
+        .position([0.0, display_h - CONTROL_HEIGHT], imgui::Condition::Always)
+        .size([display_w, CONTROL_HEIGHT], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(true)
+        .bg_alpha(0.6)
+        .build(|| {
+            draw_video_controls(ui, cmd_tx, textures, &url, "fs", &status, display_w);
+        });
+
+    if toggled {
+        textures.toggle_video_playback(&url);
+    }
+    if ui.is_key_pressed(imgui::Key::Escape) {
+        textures.exit_video_fullscreen(&url);
     }
 }
 

@@ -92,6 +92,21 @@ impl VoiceRtc {
         self.remote_audio_mids.push((mid, ssrc));
     }
 
+    pub fn forget_remote_audio(&mut self, ssrc: u32) {
+        let Some(index) = self.remote_audio_mids.iter().position(|(_, existing)| *existing == ssrc) else {
+            return;
+        };
+        let (mid, _) = self.remote_audio_mids.remove(index);
+        {
+            let mut api = self.rtc.direct_api();
+            api.remove_stream_rx(Ssrc::from(ssrc));
+            api.remove_media(mid);
+        }
+        self.jitter_by_mid.remove(&mid);
+        let worst = self.jitter_by_mid.values().copied().max();
+        self.stats.jitter_ms = worst.map(|j| j as f32 / 48.0);
+    }
+
     pub fn send_audio_frame(&mut self, opus_payload: &[u8]) -> Result<(), ClientError> {
         let pt = Pt::from(OPUS_PT);
         let media_time = MediaTime::new(self.rtp_timestamp as u64, Frequency::FORTY_EIGHT_KHZ);

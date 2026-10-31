@@ -491,4 +491,8 @@ pub struct Attachment {
     pub url: String,
     pub size: u64,
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
 }

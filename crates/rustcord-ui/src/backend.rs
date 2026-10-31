@@ -99,6 +99,14 @@ pub enum UiCommand {
         reply_to: Option<String>,
     },
     DownloadImage { url: String },
+    #[cfg(feature = "video")]
+    OpenVideo { url: String },
+    #[cfg(feature = "video")]
+    DecodeVideoBatch { url: String },
+    #[cfg(feature = "video")]
+    CloseVideo { url: String },
+    #[cfg(feature = "video")]
+    SeekVideo { url: String, target_secs: f64 },
     SaveAttachment { url: String, filename: String },
     OpenDmWithUser { user_id: String },
     RefreshDmChannels,
@@ -147,6 +155,8 @@ pub enum BackendEvent {
     RelationshipsLoaded(Vec<rustcord_client::models::Relationship>),
     DmOpened(rustcord_client::models::Channel),
     ImageDownloaded { url: String, image: crate::images::Decoded },
+    #[cfg(feature = "video")]
+    VideoBatchReady(crate::images::VideoBatch),
     VoiceConnecting,
     VoiceConnected,
     VoiceDisconnected,
@@ -322,6 +332,44 @@ pub fn spawn(
                             None => crate::images::Decoded::Failed,
                         };
                         let _ = event_tx.send(BackendEvent::ImageDownloaded { url, image });
+                    });
+                }
+                #[cfg(feature = "video")]
+                UiCommand::OpenVideo { url } => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let batch = match video_cache_file(&url).await {
+                            Ok(path) => tokio::task::spawn_blocking(move || open_video(&url, &path)).await.ok().flatten(),
+                            Err(e) => {
+                                tracing::warn!("failed to fetch video: {e}");
+                                None
+                            }
+                        };
+                        if let Some(batch) = batch {
+                            let _ = event_tx.send(BackendEvent::VideoBatchReady(batch));
+                        }
+                    });
+                }
+                #[cfg(feature = "video")]
+                UiCommand::DecodeVideoBatch { url } => {
+                    let event_tx = event_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(batch) = next_video_batch(&url) {
+                            let _ = event_tx.send(BackendEvent::VideoBatchReady(batch));
+                        }
+                    });
+                }
+                #[cfg(feature = "video")]
+                UiCommand::CloseVideo { url } => {
+                    close_video(&url);
+                }
+                #[cfg(feature = "video")]
+                UiCommand::SeekVideo { url, target_secs } => {
+                    let event_tx = event_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Some(batch) = seek_video(&url, target_secs) {
+                            let _ = event_tx.send(BackendEvent::VideoBatchReady(batch));
+                        }
                     });
                 }
                 UiCommand::SaveAttachment { url, filename } => {
@@ -627,21 +675,11 @@ fn try_spawn_voice_gateway(
 }
 
 async fn load_guild_emojis(client: &RestClient, guild_id: String, event_tx: &mpsc::UnboundedSender<BackendEvent>) {
-    const MAX_ATTEMPTS: u32 = 3;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match client.guild_emojis(&guild_id).await {
-            Ok(emojis) => {
-                let _ = event_tx.send(BackendEvent::GuildEmojisLoaded { guild_id, emojis });
-                return;
-            }
-            Err(ClientError::Api { status: 429, .. }) if attempt < MAX_ATTEMPTS => {
-                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
-            }
-            Err(e) => {
-                tracing::warn!("failed to load emojis for guild {guild_id}: {e}");
-                return;
-            }
+    match client.guild_emojis(&guild_id).await {
+        Ok(emojis) => {
+            let _ = event_tx.send(BackendEvent::GuildEmojisLoaded { guild_id, emojis });
         }
+        Err(e) => tracing::warn!("failed to load emojis for guild {guild_id}: {e}"),
     }
 }
 
@@ -776,5 +814,111 @@ async fn start_session(
 
     if let Ok(relationships) = client.relationships().await {
         let _ = event_tx.send(BackendEvent::RelationshipsLoaded(relationships));
+    }
+}
+
+#[cfg(feature = "video")]
+struct ParkedDecoder(crate::video::VideoDecoder, u64);
+
+// SAFETY: the decoder's ffmpeg contexts hold raw pointers that are not Send,
+// but they are only unsafe to use from two threads at once, not to move. Every
+// access removes the decoder from the map, decodes on one blocking thread, and
+// puts it back, so no two threads ever hold the same decoder.
+#[cfg(feature = "video")]
+unsafe impl Send for ParkedDecoder {}
+
+#[cfg(feature = "video")]
+static OPEN_VIDEOS: std::sync::Mutex<Option<std::collections::HashMap<String, ParkedDecoder>>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "video")]
+const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(feature = "video")]
+async fn video_cache_file(url: &str) -> Result<std::path::PathBuf, String> {
+    use tokio::io::AsyncWriteExt;
+    let path = cache_file(url).ok_or("no cache directory")?.with_extension("video");
+    if path.exists() {
+        return Ok(path);
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let client = HTTP.get_or_init(reqwest::Client::new);
+    let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+    if resp.content_length().is_some_and(|len| len > MAX_VIDEO_BYTES) {
+        return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
+    }
+    let partial = path.with_extension("video.part");
+    let mut file = tokio::fs::File::create(&partial).await.map_err(|e| e.to_string())?;
+    let mut written = 0u64;
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        written += chunk.len() as u64;
+        if written > MAX_VIDEO_BYTES {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
+        }
+        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+    }
+    file.flush().await.map_err(|e| e.to_string())?;
+    drop(file);
+    tokio::fs::rename(&partial, &path).await.map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+#[cfg(feature = "video")]
+fn open_video(url: &str, path: &std::path::Path) -> Option<crate::images::VideoBatch> {
+    let mut decoder = match crate::video::VideoDecoder::open(path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("failed to open video {url}: {e}");
+            return None;
+        }
+    };
+    let batch = decoder.next_batch(crate::video::BATCH_FRAMES);
+    let meta = crate::images::VideoMeta {
+        duration_secs: decoder.duration_secs,
+        has_audio: decoder.has_audio(),
+        width: decoder.width,
+        height: decoder.height,
+    };
+    if !batch.finished {
+        let mut guard = OPEN_VIDEOS.lock().unwrap();
+        guard.get_or_insert_with(Default::default).insert(url.to_string(), ParkedDecoder(decoder, 0));
+    }
+    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: Some(meta), seek_generation: 0 })
+}
+
+#[cfg(feature = "video")]
+fn next_video_batch(url: &str) -> Option<crate::images::VideoBatch> {
+    let mut parked = OPEN_VIDEOS.lock().unwrap().as_mut()?.remove(url)?;
+    let batch = parked.0.next_batch(crate::video::BATCH_FRAMES);
+    let generation = parked.1;
+    if !batch.finished {
+        let mut guard = OPEN_VIDEOS.lock().unwrap();
+        guard.get_or_insert_with(Default::default).insert(url.to_string(), parked);
+    }
+    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: None, seek_generation: generation })
+}
+
+#[cfg(feature = "video")]
+fn seek_video(url: &str, target_secs: f64) -> Option<crate::images::VideoBatch> {
+    let mut parked = OPEN_VIDEOS.lock().unwrap().as_mut()?.remove(url)?;
+    if let Err(e) = parked.0.seek(target_secs) {
+        tracing::warn!("seek failed for {url}: {e}");
+    }
+    parked.1 += 1;
+    let batch = parked.0.next_batch(crate::video::BATCH_FRAMES);
+    let generation = parked.1;
+    if !batch.finished {
+        let mut guard = OPEN_VIDEOS.lock().unwrap();
+        guard.get_or_insert_with(Default::default).insert(url.to_string(), parked);
+    }
+    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: None, seek_generation: generation })
+}
+
+#[cfg(feature = "video")]
+fn close_video(url: &str) {
+    if let Some(decoders) = OPEN_VIDEOS.lock().unwrap().as_mut() {
+        decoders.remove(url);
     }
 }

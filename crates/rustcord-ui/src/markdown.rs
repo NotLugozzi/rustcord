@@ -119,6 +119,12 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
             i += consumed;
             continue;
         }
+        if let Some((url, consumed)) = try_parse_bare_url(&chars[i..]) {
+            flush!();
+            spans.push(Span::Link { label: url.clone(), url });
+            i += consumed;
+            continue;
+        }
         if chars[i] == '`' {
             if let Some(end) = find_matching(&chars, i + 1, '`') {
                 flush!();
@@ -302,4 +308,105 @@ fn try_parse_link(chars: &[char]) -> Option<(String, String, usize)> {
     let label: String = chars[1..close_bracket].iter().collect();
     let url: String = chars[close_bracket + 2..close_paren].iter().collect();
     Some((label, url, close_paren + 1))
+}
+
+const URL_SCHEMES: [&[char]; 2] = [&['h', 't', 't', 'p', ':', '/', '/'], &['h', 't', 't', 'p', 's', ':', '/', '/']];
+
+fn try_parse_bare_url(chars: &[char]) -> Option<(String, usize)> {
+    let suppressed = chars.first() == Some(&'<');
+    let start = if suppressed { 1 } else { 0 };
+    if !URL_SCHEMES.iter().any(|scheme| chars[start..].starts_with(scheme)) {
+        return None;
+    }
+
+    let mut end = start;
+    let mut depth = 0i32;
+    while let Some(&c) = chars.get(end) {
+        if c.is_whitespace() || c == '<' {
+            break;
+        }
+        if suppressed && c == '>' {
+            break;
+        }
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        end += 1;
+    }
+
+    while end > start && matches!(chars[end - 1], '.' | ',' | ':' | ';' | '!' | '?' | '\'' | '"') {
+        end -= 1;
+    }
+
+    if chars[start..end].iter().filter(|c| **c == '/').count() < 3 {
+        return None;
+    }
+
+    let url: String = chars[start..end].iter().collect();
+    let consumed = if suppressed && chars.get(end) == Some(&'>') { end + 1 } else { end };
+    Some((url, consumed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn links(text: &str) -> Vec<String> {
+        parse_spans(text)
+            .into_iter()
+            .filter_map(|span| match span {
+                Span::Link { url, .. } => Some(url),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text_of(text: &str) -> String {
+        parse_spans(text)
+            .into_iter()
+            .map(|span| match span {
+                Span::Text { text, .. } => text,
+                Span::Link { label, .. } => label,
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bare_url_becomes_a_link() {
+        assert_eq!(links("see https://example.com/x now"), ["https://example.com/x"]);
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_not_part_of_the_url() {
+        assert_eq!(links("go to https://example.com/page."), ["https://example.com/page"]);
+        assert_eq!(text_of("go to https://example.com/page."), "go to https://example.com/page.");
+    }
+
+    #[test]
+    fn wrapping_paren_is_not_swallowed_but_inner_ones_are() {
+        assert_eq!(links("(https://example.com/a)"), ["https://example.com/a"]);
+        assert_eq!(links("https://en.wikipedia.org/wiki/Rust_(language)"), ["https://en.wikipedia.org/wiki/Rust_(language)"]);
+    }
+
+    #[test]
+    fn angle_brackets_suppress_the_embed_without_entering_the_url() {
+        assert_eq!(links("<https://example.com/a>"), ["https://example.com/a"]);
+        assert_eq!(text_of("<https://example.com/a>"), "https://example.com/a");
+    }
+
+    #[test]
+    fn explicit_markdown_link_still_wins() {
+        assert_eq!(links("[label](https://example.com/a)"), ["https://example.com/a"]);
+    }
+
+    #[test]
+    fn scheme_without_a_host_is_not_a_link() {
+        assert!(links("https://").is_empty());
+    }
 }

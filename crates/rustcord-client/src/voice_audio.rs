@@ -218,6 +218,7 @@ impl SpeakerPlayback {
 pub struct AudioCodec {
     encoder: OpusEncoder,
     decoders: std::collections::HashMap<u32, OpusDecoder>,
+    last_decode: std::collections::HashMap<u32, std::time::Instant>,
 }
 
 impl AudioCodec {
@@ -225,7 +226,7 @@ impl AudioCodec {
         let channels = if CHANNELS == 2 { Channels::Stereo } else { Channels::Mono };
         let encoder = OpusEncoder::new(SampleRate::Hz48000, channels, Application::Voip)
             .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus encoder init failed: {e}")))?;
-        Ok(Self { encoder, decoders: std::collections::HashMap::new() })
+        Ok(Self { encoder, decoders: std::collections::HashMap::new(), last_decode: std::collections::HashMap::new() })
     }
 
     pub fn encode(&self, pcm: &[i16]) -> Result<Vec<u8>, ClientError> {
@@ -247,6 +248,7 @@ impl AudioCodec {
                 entry.insert(decoder)
             }
         };
+        self.last_decode.insert(ssrc, std::time::Instant::now());
         let mut out = vec![0i16; FRAME_SAMPLES * CHANNELS as usize];
         let packet: audiopus::packet::Packet =
             opus.try_into().map_err(|e| ClientError::GatewayClosed(format!("voice audio: invalid opus packet: {e}")))?;
@@ -257,6 +259,24 @@ impl AudioCodec {
             .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus decode failed: {e}")))?;
         out.truncate(samples * CHANNELS as usize);
         Ok(out)
+    }
+
+    pub fn track_ssrc(&mut self, ssrc: u32) {
+        self.last_decode.entry(ssrc).or_insert_with(std::time::Instant::now);
+    }
+
+    pub fn drop_ssrc(&mut self, ssrc: u32) {
+        self.decoders.remove(&ssrc);
+        self.last_decode.remove(&ssrc);
+    }
+
+    pub fn idle_ssrcs(&self, idle_for: std::time::Duration) -> Vec<u32> {
+        let now = std::time::Instant::now();
+        self.last_decode
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) > idle_for)
+            .map(|(ssrc, _)| *ssrc)
+            .collect()
     }
 }
 

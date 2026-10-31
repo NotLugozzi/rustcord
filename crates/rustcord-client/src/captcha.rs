@@ -68,7 +68,7 @@ fn solve_blocking(challenge: &CaptchaChallenge) -> Result<String, ClientError> {
     let rqdata_attr = challenge
         .captcha_rqdata
         .as_deref()
-        .map(|d| format!(r#"data-rqdata="{d}""#))
+        .map(|d| format!(r#"data-rqdata="{}""#, escape_attr(d)))
         .unwrap_or_default();
 
     let html = format!(
@@ -85,7 +85,7 @@ function onSolved(token) {{
 </script>
 </body>
 </html>"#,
-        sitekey = challenge.captcha_sitekey,
+        sitekey = escape_attr(&challenge.captcha_sitekey),
     );
 
     let _webview = WebViewBuilder::new()
@@ -115,4 +115,19 @@ function onSolved(token) {{
     });
 
     solved.ok_or_else(|| ClientError::CaptchaFailed("window closed before captcha solved".into()))
+}
+
+fn escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }

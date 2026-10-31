@@ -16,4 +16,6 @@ pub enum ClientError {
     CaptchaRequired(crate::rest::CaptchaChallenge),
     #[error("captcha solve failed: {0}")]
     CaptchaFailed(String),
+    #[error("malformed token")]
+    MalformedToken,
 }

@@ -44,8 +44,14 @@ directories = "5"
 keyring = "4"
 rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+ffmpeg-next = { version = "9", optional = true, default-features = false, features = ["codec", "format", "software-scaling", "software-resampling"] }
+cpal = { version = "0.18", optional = true, features = ["pulseaudio"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 open = "5"
 notify-rust = "4"
 chrono = "0.4"
 arboard = { version = "3", features = ["wayland-data-control"] }
+
+[features]
+default = []
+video = ["dep:ffmpeg-next", "dep:cpal"]

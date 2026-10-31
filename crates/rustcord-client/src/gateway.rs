@@ -43,7 +43,6 @@ struct Payload {
 struct Identify<'a> {
     token: &'a str,
     properties: IdentifyProperties,
-    intents: Option<u64>,
     capabilities: u64,
 }
 
@@ -167,7 +166,6 @@ impl Gateway {
                         browser: "Discord Client",
                         device: "Discord Client",
                     },
-                    intents: None,
                     capabilities: CAPABILITY_PRIORITIZED_READY_PAYLOAD,
                 };
                 let identify_payload = json!({ "op": 2, "d": identify });
