@@ -188,6 +188,7 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          RUST_MIN_STACK: "33554432"
         run: cargo build --release -p rustcord-ui ${{ matrix.features }}
 
       - name: Package .exe
