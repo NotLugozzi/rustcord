@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Guild, GuildMember, MergedPresences, Message, Presence, Role, User, VoiceState};
+use crate::models::{Channel, Guild, GuildMember, MergedPresences, Message, Presence, Role, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,7 +28,19 @@ pub enum GatewayEvent {
     InitialVoiceStates(Vec<VoiceState>),
     GuildCreate { guild_id: String, roles: Vec<Role>, member_roles: Vec<(String, Vec<String>)> },
     GuildMembersChunk { guild_id: String, members: Vec<GuildMember>, presences: Vec<Presence> },
+    ReadState(Vec<ChannelReadState>),
+    ChannelUpsert(Channel),
+    ChannelDelete { channel_id: String, guild_id: Option<String> },
+    GuildUpdate { guild_id: String, name: Option<String>, icon: Option<String> },
+    GuildDelete { guild_id: String },
+    MessageAck { channel_id: String, message_id: String },
     Unknown { op_name: String, raw: Value },
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelReadState {
+    pub channel_id: String,
+    pub last_message_id: String,
 }
 
 #[derive(Deserialize)]
@@ -297,6 +309,11 @@ impl Gateway {
                 }
                 deduplicate_presences(&mut friend_presences);
                 tracing::info!("READY supplied {} friend presences", friend_presences.len());
+                let read_state = parse_read_state(data.get("read_state"));
+                tracing::info!("READY supplied {} channel read states", read_state.len());
+                if !read_state.is_empty() {
+                    let _ = tx.send(GatewayEvent::ReadState(read_state));
+                }
                 GatewayEvent::Ready { user, guilds, friend_presences }
             }
             Some("RESUMED") => GatewayEvent::Resumed,
@@ -314,6 +331,11 @@ impl Gateway {
                 }
 
                 GatewayEvent::Presences(presences)
+            }
+            Some("MESSAGE_ACK") => {
+                let channel_id = data["channel_id"].as_str().unwrap_or_default().to_string();
+                let message_id = data["message_id"].as_str().unwrap_or_default().to_string();
+                GatewayEvent::MessageAck { channel_id, message_id }
             }
             Some("MESSAGE_CREATE") => {
                 let message: Message = serde_json::from_value(data)?;
@@ -361,6 +383,29 @@ impl Gateway {
                     .collect();
                 GatewayEvent::GuildCreate { guild_id, roles, member_roles }
             }
+            Some("CHANNEL_CREATE") | Some("CHANNEL_UPDATE") => {
+                let channel: Channel = serde_json::from_value(data)?;
+                GatewayEvent::ChannelUpsert(channel)
+            }
+            Some("CHANNEL_DELETE") => {
+                let channel_id = data["id"].as_str().unwrap_or_default().to_string();
+                let guild_id = data["guild_id"].as_str().map(str::to_string);
+                GatewayEvent::ChannelDelete { channel_id, guild_id }
+            }
+            Some("GUILD_UPDATE") => {
+                let guild_id = data["id"].as_str().unwrap_or_default().to_string();
+                let name = data["name"].as_str().map(str::to_string);
+                let icon = data["icon"].as_str().map(str::to_string);
+                GatewayEvent::GuildUpdate { guild_id, name, icon }
+            }
+            Some("GUILD_DELETE") => {
+                let guild_id = data["id"].as_str().unwrap_or_default().to_string();
+                if data["unavailable"].as_bool().unwrap_or(false) {
+                    tracing::debug!("guild {guild_id} is temporarily unavailable, not removing");
+                    return Ok(());
+                }
+                GatewayEvent::GuildDelete { guild_id }
+            }
             Some("GUILD_MEMBERS_CHUNK") => {
                 let guild_id = data["guild_id"].as_str().unwrap_or_default().to_string();
                 let members: Vec<GuildMember> = serde_json::from_value(data["members"].clone()).unwrap_or_default();
@@ -406,6 +451,32 @@ fn frame_is_resumable(reason: &str) -> bool {
     !reason.starts_with("1000") && !reason.starts_with("1001") && !reason.starts_with("4004")
 }
 
+fn parse_read_state(value: Option<&Value>) -> Vec<ChannelReadState> {
+    let items = match value {
+        Some(Value::Array(items)) => items,
+        Some(Value::Object(obj)) => match obj.get("entries") {
+            Some(Value::Array(items)) => items,
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let channel_id = item.get("id").and_then(Value::as_str)?;
+            let last_message_id = match item.get("last_message_id") {
+                Some(Value::String(id)) => id.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => return None,
+            };
+            if last_message_id.is_empty() || last_message_id == "0" {
+                return None;
+            }
+            Some(ChannelReadState { channel_id: channel_id.to_string(), last_message_id })
+        })
+        .collect()
+}
+
 fn parse_presence_list(value: Option<&Value>) -> Vec<Presence> {
     let Some(Value::Array(items)) = value else { return Vec::new() };
     items
@@ -431,4 +502,50 @@ fn parse_merged_presences(value: &Value) -> Vec<Presence> {
 fn deduplicate_presences(presences: &mut Vec<Presence>) {
     let mut seen = std::collections::HashSet::new();
     presences.retain(|presence| seen.insert(presence.user.id.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(states: &[ChannelReadState]) -> Vec<(&str, &str)> {
+        states.iter().map(|s| (s.channel_id.as_str(), s.last_message_id.as_str())).collect()
+    }
+
+    #[test]
+    fn parses_a_bare_read_state_array() {
+        let value = json!([{ "id": "1", "last_message_id": "100" }]);
+        assert_eq!(ids(&parse_read_state(Some(&value))), [("1", "100")]);
+    }
+
+    #[test]
+    fn parses_the_entries_wrapped_form() {
+        let value = json!({ "entries": [{ "id": "2", "last_message_id": "200" }] });
+        assert_eq!(ids(&parse_read_state(Some(&value))), [("2", "200")]);
+    }
+
+    #[test]
+    fn accepts_a_numeric_last_message_id() {
+        let value = json!([{ "id": "3", "last_message_id": 300 }]);
+        assert_eq!(ids(&parse_read_state(Some(&value))), [("3", "300")]);
+    }
+
+    #[test]
+    fn skips_entries_with_no_last_message() {
+        let value = json!([
+            { "id": "4" },
+            { "id": "5", "last_message_id": null },
+            { "id": "6", "last_message_id": "0" },
+            { "id": "7", "last_message_id": "" },
+            { "id": "8", "last_message_id": "800" },
+        ]);
+        assert_eq!(ids(&parse_read_state(Some(&value))), [("8", "800")]);
+    }
+
+    #[test]
+    fn a_missing_or_unexpected_field_yields_nothing() {
+        assert!(parse_read_state(None).is_empty());
+        assert!(parse_read_state(Some(&json!("nonsense"))).is_empty());
+        assert!(parse_read_state(Some(&json!({ "entries": 5 }))).is_empty());
+    }
 }

@@ -69,6 +69,13 @@ enum Kind {
 }
 
 #[cfg(feature = "video")]
+pub enum PosterState {
+    Ready { texture_id: imgui::TextureId, size: [f32; 2] },
+    Loading,
+    Unavailable,
+}
+
+#[cfg(feature = "video")]
 pub struct VideoStatus {
     pub playing: bool,
     pub ended: bool,
@@ -79,6 +86,11 @@ pub struct VideoStatus {
     pub position_secs: f64,
     pub duration_secs: f64,
     pub fullscreen: bool,
+}
+
+#[cfg(feature = "video")]
+pub fn poster_key(url: &str) -> String {
+    format!("video-poster::{url}")
 }
 
 #[cfg(feature = "video")]
@@ -117,6 +129,8 @@ struct VideoEntry {
     pending_clear: bool,
     last_visible: Instant,
     last_tick: Instant,
+    awaiting_data: bool,
+    retry_at: Option<Instant>,
     undecoded: std::collections::VecDeque<crate::video::VideoFrame>,
 }
 
@@ -139,6 +153,9 @@ const AUDIO_MIN_BUFFER_SECS: f64 = 0.8;
 
 #[cfg(feature = "video")]
 const HARD_BUFFER_CEILING_SECS: f64 = 6.0;
+
+#[cfg(feature = "video")]
+const AWAITING_DATA_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 pub struct TextureCache {
@@ -315,6 +332,8 @@ impl TextureCache {
                     pending_clear: false,
                     last_visible: Instant::now(),
                     last_tick: Instant::now(),
+                    awaiting_data: false,
+                    retry_at: None,
                     undecoded: std::collections::VecDeque::new(),
                 }),
                 size,
@@ -323,6 +342,24 @@ impl TextureCache {
             },
         );
         let _ = cmd_tx.send(crate::backend::UiCommand::OpenVideo { url: url.to_string() });
+    }
+
+    #[cfg(feature = "video")]
+    pub fn poster(&mut self, url: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) -> PosterState {
+        let key = poster_key(url);
+        match self.entries.get(&key) {
+            Some(Entry::Loaded { kind: Kind::Static { texture_id }, size, last_used, .. }) => {
+                last_used.set(Instant::now());
+                PosterState::Ready { texture_id: *texture_id, size: *size }
+            }
+            Some(Entry::Failed) => PosterState::Unavailable,
+            Some(_) => PosterState::Loading,
+            None => {
+                self.entries.insert(key, Entry::Pending);
+                let _ = cmd_tx.send(crate::backend::UiCommand::LoadVideoPoster { url: url.to_string() });
+                PosterState::Loading
+            }
+        }
     }
 
     #[cfg(feature = "video")]
@@ -450,6 +487,7 @@ impl TextureCache {
         }
         video.requesting = false;
         video.source_finished = batch.batch.finished;
+        video.awaiting_data = batch.batch.awaiting_data;
         if video.pending_clear {
             video.pending_clear = false;
             video.undecoded.clear();
@@ -581,7 +619,15 @@ impl TextureCache {
             let audio_buffered = video.audio.as_ref().map(|a| a.buffered_secs());
             let pending_secs: f64 = video.undecoded.iter().map(|f| f.delay.as_secs_f64()).sum();
             let video_secs = buffered_secs + pending_secs;
-            if !video.requesting && !video.source_finished && should_refill(video_secs, audio_buffered) {
+            if video.awaiting_data {
+                let ready = video.retry_at.is_none_or(|at| now >= at);
+                if !video.requesting && ready {
+                    video.requesting = true;
+                    video.retry_at = Some(now + AWAITING_DATA_RETRY);
+                    let _ = cmd_tx.send(crate::backend::UiCommand::DecodeVideoBatch { url: url.clone() });
+                }
+                self.animating = true;
+            } else if !video.requesting && !video.source_finished && should_refill(video_secs, audio_buffered) {
                 video.requesting = true;
                 let _ = cmd_tx.send(crate::backend::UiCommand::DecodeVideoBatch { url: url.clone() });
             }
@@ -694,6 +740,20 @@ fn upload_texture(
 #[cfg(all(test, feature = "video"))]
 mod video_tests {
     use super::*;
+
+    #[test]
+    fn a_poster_key_cannot_collide_with_a_real_url() {
+        let url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4";
+        let key = poster_key(url);
+        assert_ne!(key, url);
+        assert!(!key.starts_with("http"));
+    }
+
+    #[test]
+    fn poster_keys_are_distinct_per_video() {
+        assert_ne!(poster_key("https://a/1.mp4"), poster_key("https://a/2.mp4"));
+    }
+
 
     const FRAME: Duration = Duration::from_millis(40);
 

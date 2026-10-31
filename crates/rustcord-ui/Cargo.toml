@@ -52,6 +52,9 @@ notify-rust = "4"
 chrono = "0.4"
 arboard = { version = "3", features = ["wayland-data-control"] }
 
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+
 [features]
 default = []
 video = ["dep:ffmpeg-next", "dep:cpal"]

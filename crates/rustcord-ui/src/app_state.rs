@@ -1,6 +1,23 @@
 use rustcord_client::models::{Channel, ChannelType, Emoji, Guild, Message, Presence, Relationship, RelationshipType, User};
 use std::collections::HashMap;
 
+fn merge_read_state(
+    local: &mut HashMap<String, String>,
+    remote: &[rustcord_client::gateway::ChannelReadState],
+) -> usize {
+    let mut advanced = 0;
+    for state in remote {
+        let is_newer = local
+            .get(&state.channel_id)
+            .is_none_or(|seen| snowflake_value(&state.last_message_id) > snowflake_value(seen));
+        if is_newer {
+            local.insert(state.channel_id.clone(), state.last_message_id.clone());
+            advanced += 1;
+        }
+    }
+    advanced
+}
+
 fn snowflake_value(id: &str) -> u64 {
     id.parse().unwrap_or(0)
 }
@@ -19,16 +36,18 @@ pub enum SettingsCategory {
     VoiceVideo,
     Keybinds,
     Appearance,
+    About,
 }
 
 impl SettingsCategory {
-    pub const ALL: [SettingsCategory; 6] = [
+    pub const ALL: [SettingsCategory; 7] = [
         SettingsCategory::Account,
         SettingsCategory::Notifications,
         SettingsCategory::Activity,
         SettingsCategory::VoiceVideo,
         SettingsCategory::Keybinds,
         SettingsCategory::Appearance,
+        SettingsCategory::About,
     ];
 
     pub fn label(self) -> &'static str {
@@ -39,6 +58,7 @@ impl SettingsCategory {
             SettingsCategory::VoiceVideo => "Voice & Video",
             SettingsCategory::Keybinds => "Keybinds",
             SettingsCategory::Appearance => "Appearance",
+            SettingsCategory::About => "About",
         }
     }
 }
@@ -54,8 +74,15 @@ struct GroupsFile {
     groups: Vec<DmGroup>,
 }
 
+fn config_dir() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().to_path_buf())
+}
+
 fn groups_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("dm_groups.toml"))
+    config_dir().map(|d| d.join("dm_groups.toml"))
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -79,15 +106,15 @@ struct RailFile {
 }
 
 fn rail_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("server_rail.toml"))
+    config_dir().map(|d| d.join("server_rail.toml"))
 }
 
 fn notes_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("notes.toml"))
+    config_dir().map(|d| d.join("notes.toml"))
 }
 
 fn read_state_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().join("read_state.toml"))
+    config_dir().map(|d| d.join("read_state.toml"))
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -505,6 +532,79 @@ impl AppState {
         is_newer
     }
 
+    pub fn apply_remote_read_state(&mut self, states: &[rustcord_client::gateway::ChannelReadState]) -> usize {
+        let advanced = merge_read_state(&mut self.last_read_message_id, states);
+        if advanced > 0 {
+            self.save_read_state();
+        }
+        advanced
+    }
+
+    pub fn upsert_channel(&mut self, channel: Channel) {
+        match channel.guild_id.clone() {
+            Some(guild_id) => {
+                let channels = self.guild_channels.entry(guild_id).or_default();
+                match channels.iter_mut().find(|c| c.id == channel.id) {
+                    Some(existing) => *existing = channel,
+                    None => channels.push(channel),
+                }
+            }
+            None => match self.dm_channels.iter_mut().find(|c| c.id == channel.id) {
+                Some(existing) => *existing = channel,
+                None => self.dm_channels.insert(0, channel),
+            },
+        }
+    }
+
+    pub fn remove_channel(&mut self, channel_id: &str, guild_id: Option<&str>) {
+        match guild_id {
+            Some(guild_id) => {
+                if let Some(channels) = self.guild_channels.get_mut(guild_id) {
+                    channels.retain(|c| c.id != channel_id);
+                }
+            }
+            None => self.dm_channels.retain(|c| c.id != channel_id),
+        }
+        self.forget_channel(channel_id);
+    }
+
+    pub fn remove_guild(&mut self, guild_id: &str) {
+        self.guilds.retain(|g| g.id != guild_id);
+        if let Some(channels) = self.guild_channels.remove(guild_id) {
+            for channel in channels {
+                self.forget_channel(&channel.id);
+            }
+        }
+        self.guild_roles.remove(guild_id);
+        self.my_guild_roles.remove(guild_id);
+        self.guild_emojis.remove(guild_id);
+        self.guild_members.remove(guild_id);
+        if self.selected_guild.as_deref() == Some(guild_id) {
+            self.selected_guild = None;
+            self.selected_channel = None;
+        }
+        self.reconcile_rail_order();
+        self.save_rail();
+    }
+
+    fn forget_channel(&mut self, channel_id: &str) {
+        self.messages.remove(channel_id);
+        self.typing_users.remove(channel_id);
+        self.last_read_message_id.remove(channel_id);
+        if self.selected_channel.as_deref() == Some(channel_id) {
+            self.selected_channel = None;
+        }
+    }
+
+    pub fn update_guild(&mut self, guild_id: &str, name: Option<String>, icon: Option<String>) {
+        if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild_id) {
+            if let Some(name) = name {
+                guild.name = name;
+            }
+            guild.icon = icon;
+        }
+    }
+
     pub fn channel_is_unread(&self, channel_id: &str, last_message_id: Option<&str>) -> bool {
         let Some(last_message_id) = last_message_id else { return false };
         let seen = self.last_read_message_id.get(channel_id);
@@ -781,5 +881,144 @@ impl AppState {
             }
         }
         groups
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustcord_client::gateway::ChannelReadState;
+
+    fn remote(channel_id: &str, last_message_id: &str) -> ChannelReadState {
+        ChannelReadState { channel_id: channel_id.into(), last_message_id: last_message_id.into() }
+    }
+
+    fn guild_channel(id: &str, guild_id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            kind: ChannelType::GuildText,
+            guild_id: Some(guild_id.into()),
+            name: Some(name.into()),
+            topic: None,
+            position: Some(0),
+            parent_id: None,
+            recipients: Vec::new(),
+            last_message_id: None,
+            permission_overwrites: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn creating_a_channel_adds_it_to_its_guild() {
+        let mut state = AppState::default();
+        state.upsert_channel(guild_channel("c1", "g1", "general"));
+        assert_eq!(state.guild_channels["g1"].len(), 1);
+    }
+
+    #[test]
+    fn updating_a_channel_replaces_it_rather_than_duplicating() {
+        let mut state = AppState::default();
+        state.upsert_channel(guild_channel("c1", "g1", "general"));
+        state.upsert_channel(guild_channel("c1", "g1", "renamed"));
+        assert_eq!(state.guild_channels["g1"].len(), 1);
+        assert_eq!(state.guild_channels["g1"][0].name.as_deref(), Some("renamed"));
+    }
+
+    #[test]
+    fn deleting_a_channel_clears_its_selection_and_messages() {
+        let mut state = AppState::default();
+        state.upsert_channel(guild_channel("c1", "g1", "general"));
+        state.messages.insert("c1".into(), Vec::new());
+        state.selected_channel = Some("c1".into());
+        state.remove_channel("c1", Some("g1"));
+        assert!(state.guild_channels["g1"].is_empty());
+        assert!(!state.messages.contains_key("c1"));
+        assert_eq!(state.selected_channel, None);
+    }
+
+    #[test]
+    fn deleting_a_channel_leaves_an_unrelated_selection_alone() {
+        let mut state = AppState::default();
+        state.upsert_channel(guild_channel("c1", "g1", "general"));
+        state.upsert_channel(guild_channel("c2", "g1", "other"));
+        state.selected_channel = Some("c2".into());
+        state.remove_channel("c1", Some("g1"));
+        assert_eq!(state.selected_channel.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn leaving_a_guild_drops_its_channels_and_selection() {
+        let mut state = AppState::default();
+        state.guilds.push(Guild { id: "g1".into(), name: "Guild".into(), icon: None, unavailable: false });
+        state.upsert_channel(guild_channel("c1", "g1", "general"));
+        state.selected_guild = Some("g1".into());
+        state.selected_channel = Some("c1".into());
+        state.remove_guild("g1");
+        assert!(state.guilds.is_empty());
+        assert!(!state.guild_channels.contains_key("g1"));
+        assert_eq!(state.selected_guild, None);
+        assert_eq!(state.selected_channel, None);
+    }
+
+    #[test]
+    fn updating_a_guild_renames_it_in_place() {
+        let mut state = AppState::default();
+        state.guilds.push(Guild { id: "g1".into(), name: "Old".into(), icon: None, unavailable: false });
+        state.update_guild("g1", Some("New".into()), None);
+        assert_eq!(state.guilds[0].name, "New");
+    }
+
+    #[test]
+    fn updating_an_unknown_guild_is_a_no_op() {
+        let mut state = AppState::default();
+        state.update_guild("missing", Some("New".into()), None);
+        assert!(state.guilds.is_empty());
+    }
+
+    #[test]
+    fn a_dm_channel_upsert_does_not_need_a_guild() {
+        let mut state = AppState::default();
+        let mut dm = guild_channel("d1", "ignored", "dm");
+        dm.guild_id = None;
+        dm.kind = ChannelType::Dm;
+        state.upsert_channel(dm);
+        assert_eq!(state.dm_channels.len(), 1);
+        assert!(state.guild_channels.is_empty());
+    }
+
+    #[test]
+    fn a_newer_remote_read_advances_local() {
+        let mut local = HashMap::from([("c".to_string(), "100".to_string())]);
+        assert_eq!(merge_read_state(&mut local, &[remote("c", "200")]), 1);
+        assert_eq!(local["c"], "200");
+    }
+
+    #[test]
+    fn an_older_remote_read_does_not_regress_local() {
+        let mut local = HashMap::from([("c".to_string(), "200".to_string())]);
+        assert_eq!(merge_read_state(&mut local, &[remote("c", "100")]), 0);
+        assert_eq!(local["c"], "200");
+    }
+
+    #[test]
+    fn an_unknown_channel_is_adopted() {
+        let mut local = HashMap::new();
+        assert_eq!(merge_read_state(&mut local, &[remote("new", "100")]), 1);
+        assert_eq!(local["new"], "100");
+    }
+
+    #[test]
+    fn snowflakes_compare_numerically_not_lexically() {
+        let mut local = HashMap::from([("c".to_string(), "9".to_string())]);
+        assert_eq!(merge_read_state(&mut local, &[remote("c", "10")]), 1);
+        assert_eq!(local["c"], "10");
+    }
+
+    #[test]
+    fn merging_is_idempotent() {
+        let mut local = HashMap::new();
+        let states = [remote("c", "100")];
+        assert_eq!(merge_read_state(&mut local, &states), 1);
+        assert_eq!(merge_read_state(&mut local, &states), 0);
     }
 }

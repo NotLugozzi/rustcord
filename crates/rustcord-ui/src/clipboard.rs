@@ -19,3 +19,13 @@ pub fn read_image_as_png() -> Option<(String, Vec<u8>)> {
 
     Some(("pasted-image.png".to_string(), png_bytes))
 }
+
+pub fn write_text(text: &str) -> bool {
+    match arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string())) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("failed to copy to clipboard: {e}");
+            false
+        }
+    }
+}

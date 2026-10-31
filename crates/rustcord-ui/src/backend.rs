@@ -102,6 +102,8 @@ pub enum UiCommand {
     #[cfg(feature = "video")]
     OpenVideo { url: String },
     #[cfg(feature = "video")]
+    LoadVideoPoster { url: String },
+    #[cfg(feature = "video")]
     DecodeVideoBatch { url: String },
     #[cfg(feature = "video")]
     CloseVideo { url: String },
@@ -335,13 +337,33 @@ pub fn spawn(
                     });
                 }
                 #[cfg(feature = "video")]
+                UiCommand::LoadVideoPoster { url } => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let decoded = match poster_source(&url).await {
+                            Some(path) => tokio::task::spawn_blocking(move || match crate::video::first_frame(&path) {
+                                Some(image) => crate::images::Decoded::Still(image),
+                                None => crate::images::Decoded::Failed,
+                            })
+                            .await
+                            .unwrap_or(crate::images::Decoded::Failed),
+                            None => crate::images::Decoded::Failed,
+                        };
+                        let _ = event_tx.send(BackendEvent::ImageDownloaded { url: crate::images::poster_key(&url), image: decoded });
+                    });
+                }
+                #[cfg(feature = "video")]
                 UiCommand::OpenVideo { url } => {
                     let event_tx = event_tx.clone();
                     tokio::spawn(async move {
-                        let batch = match video_cache_file(&url).await {
-                            Ok(path) => tokio::task::spawn_blocking(move || open_video(&url, &path)).await.ok().flatten(),
+                        let batch = match start_video_download(&url).await {
+                            Ok((path, handle)) => {
+                                let open_url = url.clone();
+                                tokio::task::spawn_blocking(move || open_video(&open_url, &path, &handle)).await.ok().flatten()
+                            }
                             Err(e) => {
                                 tracing::warn!("failed to fetch video: {e}");
+                                forget_download(&url);
                                 None
                             }
                         };
@@ -834,47 +856,220 @@ static OPEN_VIDEOS: std::sync::Mutex<Option<std::collections::HashMap<String, Pa
 const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
 
 #[cfg(feature = "video")]
-async fn video_cache_file(url: &str) -> Result<std::path::PathBuf, String> {
-    use tokio::io::AsyncWriteExt;
-    let path = cache_file(url).ok_or("no cache directory")?.with_extension("video");
-    if path.exists() {
-        return Ok(path);
+const PLAYABLE_HEAD_BYTES: u64 = 512 * 1024;
+
+#[cfg(feature = "video")]
+#[derive(Clone)]
+struct DownloadHandle {
+    state: std::sync::Arc<DownloadState>,
+}
+
+#[cfg(feature = "video")]
+#[derive(Default)]
+struct DownloadState {
+    written: std::sync::atomic::AtomicU64,
+    complete: std::sync::atomic::AtomicBool,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "video")]
+impl DownloadHandle {
+    fn source_state(&self) -> crate::video::SourceState {
+        if self.state.complete.load(std::sync::atomic::Ordering::Relaxed) {
+            crate::video::SourceState::Complete
+        } else {
+            crate::video::SourceState::Growing
+        }
     }
-    if let Some(dir) = path.parent() {
+
+    fn failed(&self) -> bool {
+        self.state.failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn written(&self) -> u64 {
+        self.state.written.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "video")]
+static DOWNLOADS: std::sync::Mutex<Option<std::collections::HashMap<String, DownloadHandle>>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "video")]
+async fn start_video_download(url: &str) -> Result<(std::path::PathBuf, DownloadHandle), String> {
+    use std::sync::atomic::Ordering;
+    use tokio::io::AsyncWriteExt;
+
+    let final_path = cache_file(url).ok_or("no cache directory")?.with_extension("video");
+    if final_path.exists() {
+        let state = std::sync::Arc::new(DownloadState::default());
+        state.complete.store(true, Ordering::Relaxed);
+        let handle = DownloadHandle { state };
+        DOWNLOADS.lock().unwrap().get_or_insert_with(Default::default).insert(url.to_string(), handle.clone());
+        return Ok((final_path, handle));
+    }
+    if let Some(dir) = final_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+
     let client = HTTP.get_or_init(reqwest::Client::new);
     let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
     if resp.content_length().is_some_and(|len| len > MAX_VIDEO_BYTES) {
         return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
     }
-    let partial = path.with_extension("video.part");
+
+    let partial = final_path.with_extension("video.part");
     let mut file = tokio::fs::File::create(&partial).await.map_err(|e| e.to_string())?;
+    let state = std::sync::Arc::new(DownloadState::default());
+    let handle = DownloadHandle { state: state.clone() };
+    DOWNLOADS.lock().unwrap().get_or_insert_with(Default::default).insert(url.to_string(), handle.clone());
+
     let mut written = 0u64;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        written += chunk.len() as u64;
-        if written > MAX_VIDEO_BYTES {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
+    while written < PLAYABLE_HEAD_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                written += chunk.len() as u64;
+                file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                state.written.store(written, Ordering::Relaxed);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
         }
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
     }
     file.flush().await.map_err(|e| e.to_string())?;
-    drop(file);
-    tokio::fs::rename(&partial, &path).await.map_err(|e| e.to_string())?;
-    Ok(path)
+
+    let rest_url = url.to_string();
+    let rest_partial = partial.clone();
+    let rest_final = final_path.clone();
+    tokio::spawn(async move {
+        let result = async {
+            while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+                written += chunk.len() as u64;
+                if written > MAX_VIDEO_BYTES {
+                    return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
+                }
+                file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+                file.flush().await.map_err(|e| e.to_string())?;
+                state.written.store(written, Ordering::Relaxed);
+            }
+            file.flush().await.map_err(|e| e.to_string())?;
+            drop(file);
+            tokio::fs::rename(&rest_partial, &rest_final).await.map_err(|e| e.to_string())
+        }
+        .await;
+        match result {
+            Ok(()) => state.complete.store(true, Ordering::Relaxed),
+            Err(e) => {
+                tracing::warn!("video download failed for {rest_url}: {e}");
+                state.failed.store(true, Ordering::Relaxed);
+                state.complete.store(true, Ordering::Relaxed);
+                let _ = tokio::fs::remove_file(&rest_partial).await;
+            }
+        }
+    });
+
+    Ok((partial, handle))
 }
 
 #[cfg(feature = "video")]
-fn open_video(url: &str, path: &std::path::Path) -> Option<crate::images::VideoBatch> {
-    let mut decoder = match crate::video::VideoDecoder::open(path) {
+fn wait_for_complete_download(
+    url: &str,
+    partial: &std::path::Path,
+    handle: &DownloadHandle,
+) -> Option<crate::images::VideoBatch> {
+    while handle.source_state() == crate::video::SourceState::Growing {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if handle.failed() {
+        forget_download(url);
+        return None;
+    }
+    let final_path = partial.with_extension("");
+    let path = if final_path.exists() { final_path } else { partial.to_path_buf() };
+    let mut decoder = match crate::video::VideoDecoder::open(&path) {
         Ok(d) => d,
         Err(e) => {
-            tracing::warn!("failed to open video {url}: {e}");
+            tracing::warn!("failed to open video {url} after download: {e}");
+            forget_download(url);
             return None;
         }
     };
-    let batch = decoder.next_batch(crate::video::BATCH_FRAMES);
+    let batch = decoder.next_batch(crate::video::BATCH_FRAMES, crate::video::SourceState::Complete);
+    let meta = crate::images::VideoMeta {
+        duration_secs: decoder.duration_secs,
+        has_audio: decoder.has_audio(),
+        width: decoder.width,
+        height: decoder.height,
+    };
+    if !batch.finished {
+        let mut guard = OPEN_VIDEOS.lock().unwrap();
+        guard.get_or_insert_with(Default::default).insert(url.to_string(), ParkedDecoder(decoder, 0));
+    }
+    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: Some(meta), seek_generation: 0 })
+}
+
+#[cfg(feature = "video")]
+async fn poster_source(url: &str) -> Option<std::path::PathBuf> {
+    use tokio::io::AsyncWriteExt;
+    let final_path = cache_file(url)?.with_extension("video");
+    if final_path.exists() {
+        return Some(final_path);
+    }
+    let poster_path = final_path.with_extension("poster");
+    if poster_path.exists() {
+        return Some(poster_path);
+    }
+    if let Some(dir) = poster_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let client = HTTP.get_or_init(reqwest::Client::new);
+    let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).ok()?;
+    let partial = poster_path.with_extension("poster.part");
+    let mut file = tokio::fs::File::create(&partial).await.ok()?;
+    let mut written = 0u64;
+    while written < PLAYABLE_HEAD_BYTES {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                written += chunk.len() as u64;
+                file.write_all(&chunk).await.ok()?;
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    file.flush().await.ok()?;
+    drop(file);
+    tokio::fs::rename(&partial, &poster_path).await.ok()?;
+    Some(poster_path)
+}
+
+#[cfg(feature = "video")]
+fn download_handle(url: &str) -> Option<DownloadHandle> {
+    DOWNLOADS.lock().unwrap().as_ref()?.get(url).cloned()
+}
+
+#[cfg(feature = "video")]
+fn forget_download(url: &str) {
+    if let Some(map) = DOWNLOADS.lock().unwrap().as_mut() {
+        map.remove(url);
+    }
+}
+
+#[cfg(feature = "video")]
+fn open_video(url: &str, path: &std::path::Path, handle: &DownloadHandle) -> Option<crate::images::VideoBatch> {
+    let mut decoder = match crate::video::VideoDecoder::open(path) {
+        Ok(d) => d,
+        Err(e) => {
+            if handle.source_state() == crate::video::SourceState::Growing {
+                tracing::debug!("video {url} not yet playable ({e}); waiting for the full download");
+                return wait_for_complete_download(url, path, handle);
+            }
+            tracing::warn!("failed to open video {url}: {e}");
+            forget_download(url);
+            return None;
+        }
+    };
+    let batch = decoder.next_batch(crate::video::BATCH_FRAMES, handle.source_state());
     let meta = crate::images::VideoMeta {
         duration_secs: decoder.duration_secs,
         has_audio: decoder.has_audio(),
@@ -890,8 +1085,15 @@ fn open_video(url: &str, path: &std::path::Path) -> Option<crate::images::VideoB
 
 #[cfg(feature = "video")]
 fn next_video_batch(url: &str) -> Option<crate::images::VideoBatch> {
+    let handle = download_handle(url);
+    let source = handle.as_ref().map(|h| h.source_state()).unwrap_or(crate::video::SourceState::Complete);
     let mut parked = OPEN_VIDEOS.lock().unwrap().as_mut()?.remove(url)?;
-    let batch = parked.0.next_batch(crate::video::BATCH_FRAMES);
+    let mut batch = parked.0.next_batch(crate::video::BATCH_FRAMES, source);
+    if batch.awaiting_data && handle.as_ref().is_some_and(|h| h.failed()) {
+        tracing::warn!("video download for {url} failed; ending playback at {} bytes", handle.map(|h| h.written()).unwrap_or(0));
+        batch.awaiting_data = false;
+        batch.finished = true;
+    }
     let generation = parked.1;
     if !batch.finished {
         let mut guard = OPEN_VIDEOS.lock().unwrap();
@@ -907,7 +1109,7 @@ fn seek_video(url: &str, target_secs: f64) -> Option<crate::images::VideoBatch> 
         tracing::warn!("seek failed for {url}: {e}");
     }
     parked.1 += 1;
-    let batch = parked.0.next_batch(crate::video::BATCH_FRAMES);
+    let batch = parked.0.next_batch(crate::video::BATCH_FRAMES, crate::video::SourceState::Complete);
     let generation = parked.1;
     if !batch.finished {
         let mut guard = OPEN_VIDEOS.lock().unwrap();
@@ -921,4 +1123,5 @@ fn close_video(url: &str) {
     if let Some(decoders) = OPEN_VIDEOS.lock().unwrap().as_mut() {
         decoders.remove(url);
     }
+    forget_download(url);
 }

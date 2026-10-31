@@ -1367,6 +1367,33 @@ fn draw_file_attachment(ui: &Ui, cmd_tx: &UnboundedSender<UiCommand>, textures: 
 }
 
 #[cfg(feature = "video")]
+const VIDEO_CONTROL_ICONS: [char; 6] = ['\u{25B6}', '\u{23F8}', '\u{1F501}', '\u{1F50A}', '\u{1F507}', '\u{1F50D}'];
+
+const CHROME_ICONS: [char; 2] = ['\u{274C}', '\u{1F4AC}'];
+
+#[cfg(feature = "video")]
+fn draw_play_overlay(ui: &Ui, origin: [f32; 2], size: [f32; 2], hovered: bool) {
+    let center = [origin[0] + size[0] / 2.0, origin[1] + size[1] / 2.0];
+    let radius = (size[0].min(size[1]) * 0.12).clamp(18.0, 34.0);
+    let draw_list = ui.get_window_draw_list();
+    let shade = if hovered { 0.85 } else { 0.65 };
+    draw_list.add_circle(center, radius, [0.0, 0.0, 0.0, shade]).filled(true).build();
+    draw_list.add_circle(center, radius, [1.0, 1.0, 1.0, 0.9]).thickness(2.0).build();
+
+    let tip = radius * 0.55;
+    let half = radius * 0.45;
+    draw_list
+        .add_triangle(
+            [center[0] - half * 0.6, center[1] - half],
+            [center[0] - half * 0.6, center[1] + half],
+            [center[0] + tip, center[1]],
+            [1.0, 1.0, 1.0, 0.95],
+        )
+        .filled(true)
+        .build();
+}
+
+#[cfg(feature = "video")]
 fn format_timecode(secs: f64) -> String {
     let secs = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -1387,49 +1414,77 @@ fn draw_video_controls(
         ui.text_disabled("Buffering...");
         ui.same_line();
     }
-    let play_label = if status.ended {
-        "\u{21BB}"
-    } else if status.playing {
-        "\u{23F8}"
-    } else {
-        "\u{25B6}"
+    const CONTROL_GAP: f32 = 6.0;
+    const EMOJI_BUTTON_SIZE: f32 = 30.0;
+    const VOLUME_SLIDER_WIDTH: f32 = 60.0;
+    let row_top = ui.cursor_pos()[1];
+    let centre = |ui: &Ui, height: f32| {
+        let x = ui.cursor_pos()[0];
+        ui.set_cursor_pos([x, row_top + (EMOJI_BUTTON_SIZE - height) / 2.0]);
     };
-    if ui.button(format!("{play_label}##play_{id}")) {
+    let (play_icon, play_tip) = if status.ended {
+        (VIDEO_CONTROL_ICONS[2], "Replay")
+    } else if status.playing {
+        (VIDEO_CONTROL_ICONS[1], "Pause")
+    } else {
+        (VIDEO_CONTROL_ICONS[0], "Play")
+    };
+    if emoji_button(ui, textures, &format!("play_{id}"), play_icon, play_tip, None) {
         if status.ended {
             textures.request_video_seek(url, 0.0, cmd_tx);
         } else {
             textures.toggle_video_playback(url);
         }
     }
-    ui.same_line();
+    ui.same_line_with_spacing(0.0, CONTROL_GAP);
+    centre(ui, ui.text_line_height());
     ui.text(format!("{} / {}", format_timecode(status.position_secs), format_timecode(status.duration_secs)));
-    ui.same_line();
+    ui.same_line_with_spacing(0.0, CONTROL_GAP);
+    centre(ui, ui.frame_height());
 
-    let trailing = if status.has_audio { 150.0 } else { 70.0 };
+    let fullscreen_width = EMOJI_BUTTON_SIZE + CONTROL_GAP;
+    let audio_width = if status.has_audio {
+        EMOJI_BUTTON_SIZE + CONTROL_GAP + VOLUME_SLIDER_WIDTH + CONTROL_GAP
+    } else {
+        0.0
+    };
+    let trailing = fullscreen_width + audio_width + CONTROL_GAP;
     let scrub_width = (width - ui.cursor_pos()[0] - trailing).max(60.0);
     let mut position = status.position_secs as f32;
     let duration = status.duration_secs.max(0.001) as f32;
     ui.set_next_item_width(scrub_width);
+    let grab = ui.push_style_var(imgui::StyleVar::GrabMinSize(12.0));
+    let rounding = ui.push_style_var(imgui::StyleVar::GrabRounding(6.0));
     if ui.slider_config(format!("##scrub_{id}"), 0.0f32, duration).display_format("").build(&mut position) {
         textures.request_video_seek(url, position as f64, cmd_tx);
     }
+    rounding.pop();
+    grab.pop();
 
     if status.has_audio {
-        ui.same_line();
-        let icon = if status.muted { "\u{1F507}" } else { "\u{1F50A}" };
-        if ui.button(format!("{icon}##mute_{id}")) {
+        ui.same_line_with_spacing(0.0, CONTROL_GAP);
+        centre(ui, EMOJI_BUTTON_SIZE);
+        let (icon, tip) = if status.muted { (VIDEO_CONTROL_ICONS[4], "Unmute") } else { (VIDEO_CONTROL_ICONS[3], "Mute") };
+        if emoji_button(ui, textures, &format!("mute_{id}"), icon, tip, None) {
             textures.toggle_video_mute(url);
         }
-        ui.same_line();
+        ui.same_line_with_spacing(0.0, CONTROL_GAP);
+        centre(ui, ui.frame_height());
         let mut volume = status.volume;
-        ui.set_next_item_width(60.0);
+        ui.set_next_item_width(VOLUME_SLIDER_WIDTH);
+        let grab = ui.push_style_var(imgui::StyleVar::GrabMinSize(12.0));
+        let rounding = ui.push_style_var(imgui::StyleVar::GrabRounding(6.0));
         if ui.slider_config(format!("##vol_{id}"), 0.0f32, 1.0f32).display_format("").build(&mut volume) {
             textures.set_video_volume(url, volume);
         }
+        rounding.pop();
+        grab.pop();
     }
 
-    ui.same_line();
-    if ui.button(format!("\u{26F6}##fs_{id}")) {
+    ui.same_line_with_spacing(0.0, CONTROL_GAP);
+    centre(ui, EMOJI_BUTTON_SIZE);
+    let fs_tip = if status.fullscreen { "Exit fullscreen" } else { "Fullscreen" };
+    if emoji_button(ui, textures, &format!("fs_{id}"), VIDEO_CONTROL_ICONS[5], fs_tip, None) {
         textures.toggle_video_fullscreen(url);
     }
 }
@@ -1443,16 +1498,41 @@ fn draw_video_attachment(
 ) {
     let url = &attachment.url;
     if !textures.is_video(url) {
+        let natural = match (attachment.width, attachment.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => [w as f32, h as f32],
+            _ => [MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT],
+        };
+        let poster = textures.poster(url, cmd_tx);
         ui.group(|| {
-            ui.text(&attachment.filename);
-            ui.text_disabled(human_size(attachment.size));
-            if ui.small_button(format!("Play##play_{}", attachment.id)) {
-                let natural = match (attachment.width, attachment.height) {
-                    (Some(w), Some(h)) if w > 0 && h > 0 => [w as f32, h as f32],
-                    _ => [MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT],
-                };
-                textures.start_video(url, natural, cmd_tx);
+            match poster {
+                crate::images::PosterState::Ready { texture_id, size } => {
+                    let draw_size = scaled_image_size(size);
+                    let origin = ui.cursor_screen_pos();
+                    imgui::Image::new(texture_id, draw_size).build(ui);
+                    let hovered = ui.is_item_hovered();
+                    draw_play_overlay(ui, origin, draw_size, hovered);
+                    if ui.is_item_clicked() {
+                        textures.start_video(url, size, cmd_tx);
+                    }
+                }
+                crate::images::PosterState::Loading => {
+                    let draw_size = scaled_image_size(natural);
+                    let origin = ui.cursor_screen_pos();
+                    ui.dummy(draw_size);
+                    ui.get_window_draw_list()
+                        .add_rect(origin, [origin[0] + draw_size[0], origin[1] + draw_size[1]], [1.0, 1.0, 1.0, 0.04])
+                        .filled(true)
+                        .rounding(4.0)
+                        .build();
+                }
+                crate::images::PosterState::Unavailable => {
+                    ui.text(&attachment.filename);
+                    if ui.small_button(format!("Play##play_{}", attachment.id)) {
+                        textures.start_video(url, natural, cmd_tx);
+                    }
+                }
             }
+            ui.text_disabled(human_size(attachment.size));
             ui.same_line();
             if ui.small_button(format!("Save##save_{}", attachment.id)) {
                 let _ = cmd_tx.send(UiCommand::SaveAttachment { url: url.clone(), filename: attachment.filename.clone() });
@@ -2657,7 +2737,7 @@ fn draw_video_fullscreen(ui: &Ui, textures: &mut TextureCache, cmd_tx: &Unbounde
     let Some(status) = textures.video_status(&url) else { return };
 
     let [display_w, display_h] = ui.io().display_size;
-    const CONTROL_HEIGHT: f32 = 44.0;
+    const CONTROL_HEIGHT: f32 = 52.0;
     let max_h = display_h - CONTROL_HEIGHT;
     let size = match textures.get(&url) {
         Some((_, [nw, nh])) if nw > 0.0 && nh > 0.0 => {
@@ -3423,11 +3503,10 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
         .size([display_w, display_h], imgui::Condition::Always)
         .no_decoration()
         .build(|| {
-            let close_width = 32.0;
-            ui.set_cursor_pos([display_w - close_width - 16.0, 16.0]);
-            if ui.button("X##close_settings") {
-                state.show_settings = false;
-            }
+            const CLOSE_SIZE: f32 = 30.0;
+            const CONTENT_PAD: f32 = 32.0;
+            let content_x = SETTINGS_SIDEBAR_WIDTH + CONTENT_PAD;
+            let content_w = (display_w - content_x - CONTENT_PAD).max(120.0);
 
             ui.set_cursor_pos([0.0, 0.0]);
             let _sidebar_bg = ui.push_style_color(imgui::StyleColor::ChildBg, state.theme.panel);
@@ -3443,9 +3522,17 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
             });
             _sidebar_bg.pop();
 
-            ui.set_cursor_pos([SETTINGS_SIDEBAR_WIDTH + 32.0, 16.0]);
-            ui.child_window("settings_content").size([display_w - SETTINGS_SIDEBAR_WIDTH - 64.0, display_h - 32.0]).build(|| {
+            ui.set_cursor_pos([content_x, CONTENT_PAD]);
+            ui.child_window("settings_content").size([content_w, display_h - CONTENT_PAD * 2.0]).build(|| {
+                let heading_w = (content_w - CLOSE_SIZE - 12.0).max(40.0);
+                ui.set_window_font_scale(1.25);
                 ui.text(state.settings_category.label());
+                ui.set_window_font_scale(1.0);
+                ui.same_line_with_spacing(heading_w, 0.0);
+                if emoji_button(ui, textures, "close_settings", CHROME_ICONS[0], "Close settings", None) {
+                    state.show_settings = false;
+                }
+                ui.spacing();
                 ui.separator();
                 ui.spacing();
                 match state.settings_category {
@@ -3459,6 +3546,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                     SettingsCategory::VoiceVideo => draw_settings_voice(ui, state, cmd_tx),
                     SettingsCategory::Keybinds => draw_settings_keybinds(ui, state),
                     SettingsCategory::Appearance => draw_settings_appearance(ui, state),
+                    SettingsCategory::About => draw_settings_about(ui, textures),
                 }
             });
         });
@@ -3681,6 +3769,61 @@ fn draw_settings_keybinds(ui: &Ui, state: &mut AppState) {
     }
 }
 
+fn draw_settings_about(ui: &Ui, textures: &TextureCache) {
+    use crate::build_info;
+
+    const LOGO_SIZE: f32 = 44.0;
+    const LABEL_COLUMN: f32 = 130.0;
+
+    let row_top = ui.cursor_pos()[1];
+    let logo_drawn = draw_unicode_emoji(ui, textures, CHROME_ICONS[1], [LOGO_SIZE, LOGO_SIZE]);
+    if logo_drawn {
+        ui.same_line_with_spacing(0.0, 14.0);
+    }
+    let text_block = ui.text_line_height() * 2.0 + ui.clone_style().item_spacing[1];
+    ui.set_cursor_pos([ui.cursor_pos()[0], row_top + (LOGO_SIZE - text_block) / 2.0]);
+    ui.group(|| {
+        ui.set_window_font_scale(1.3);
+        ui.text(build_info::NAME);
+        ui.set_window_font_scale(1.0);
+        ui.text_disabled(build_info::version_line());
+    });
+    ui.set_cursor_pos([ui.cursor_pos()[0], row_top + LOGO_SIZE]);
+
+    ui.dummy([0.0, 10.0]);
+    ui.text_wrapped(build_info::DESCRIPTION);
+    ui.dummy([0.0, 10.0]);
+    ui.separator();
+    ui.dummy([0.0, 6.0]);
+
+    let row = |label: &str, value: &str, copyable: bool| {
+        let y = ui.cursor_pos()[1];
+        ui.text_disabled(label);
+        ui.set_cursor_pos([LABEL_COLUMN, y]);
+        ui.text(value);
+        if copyable {
+            ui.same_line_with_spacing(0.0, 8.0);
+            if ui.small_button(format!("Copy##copy_{label}")) {
+                crate::clipboard::write_text(value);
+            }
+        }
+    };
+
+    row("Version", &format!("v{}", build_info::VERSION), false);
+    match build_info::tag() {
+        Some(tag) => row("Tag", tag, false),
+        None => row("Tag", "untagged build", false),
+    }
+    match build_info::commit() {
+        Some(commit) => row("Commit", commit, true),
+        None => row("Commit", "unknown", false),
+    }
+    if let Some(date) = build_info::commit_date() {
+        row("Committed", date, false);
+    }
+    row("Video playback", if cfg!(feature = "video") { "enabled" } else { "not built in" }, false);
+}
+
 fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
     let theme_paths = crate::theme::Theme::list_available();
     if theme_paths.is_empty() {
@@ -3769,4 +3912,61 @@ fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>
                 token.pop();
             }
         });
+}
+
+#[cfg(test)]
+mod chrome_icon_tests {
+    use super::*;
+
+    #[test]
+    fn every_chrome_icon_exists_in_twemoji() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("http client");
+
+        let mut missing = Vec::new();
+        for icon in CHROME_ICONS {
+            let url = crate::emoji::url(icon);
+            match client.get(&url).send() {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => missing.push(format!("U+{:04X} -> {} ({})", icon as u32, resp.status(), url)),
+                Err(e) if e.is_connect() || e.is_timeout() => return,
+                Err(e) => missing.push(format!("U+{:04X} -> {e}", icon as u32)),
+            }
+        }
+        assert!(missing.is_empty(), "chrome icons absent from Twemoji, they will render as ? boxes:\n  {}", missing.join("\n  "));
+    }
+}
+
+#[cfg(all(test, feature = "video"))]
+mod video_control_tests {
+    use super::*;
+
+    #[test]
+    fn every_control_icon_exists_in_twemoji() {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("http client");
+
+        let mut missing = Vec::new();
+        let mut checked = 0;
+        for icon in VIDEO_CONTROL_ICONS {
+            let url = crate::emoji::url(icon);
+            match client.get(&url).send() {
+                Ok(resp) if resp.status().is_success() => checked += 1,
+                Ok(resp) => missing.push(format!("U+{:04X} -> {} ({})", icon as u32, resp.status(), url)),
+                Err(e) if e.is_connect() || e.is_timeout() => return,
+                Err(e) => missing.push(format!("U+{:04X} -> {e}", icon as u32)),
+            }
+        }
+        assert!(missing.is_empty(), "control icons absent from Twemoji, they will render as ? boxes:\n  {}", missing.join("\n  "));
+        eprintln!("verified {checked} control icons against {}", crate::emoji::BASE_URL);
+    }
+
+    #[test]
+    fn control_icons_are_not_plain_ascii() {
+        assert!(VIDEO_CONTROL_ICONS.iter().all(|c| !c.is_ascii()));
+    }
 }

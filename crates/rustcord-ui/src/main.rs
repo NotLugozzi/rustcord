@@ -1,4 +1,5 @@
 mod app_state;
+mod build_info;
 mod backend;
 mod clipboard;
 mod emoji;
@@ -173,6 +174,25 @@ pub fn drain_backend_events(
                     let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: message.channel_id.clone(), message_id: message.id.clone() });
                 }
                 state.push_message(message);
+            }
+            BackendEvent::Gateway(GatewayEvent::ReadState(states)) => {
+                let advanced = state.apply_remote_read_state(&states);
+                tracing::info!("adopted {advanced} of {} remote read states", states.len());
+            }
+            BackendEvent::Gateway(GatewayEvent::MessageAck { channel_id, message_id }) => {
+                state.mark_channel_read(&channel_id, &message_id);
+            }
+            BackendEvent::Gateway(GatewayEvent::ChannelUpsert(channel)) => {
+                state.upsert_channel(channel);
+            }
+            BackendEvent::Gateway(GatewayEvent::ChannelDelete { channel_id, guild_id }) => {
+                state.remove_channel(&channel_id, guild_id.as_deref());
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildUpdate { guild_id, name, icon }) => {
+                state.update_guild(&guild_id, name, icon);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildDelete { guild_id }) => {
+                state.remove_guild(&guild_id);
             }
             BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
                 state.note_typing(channel_id, user_id);
