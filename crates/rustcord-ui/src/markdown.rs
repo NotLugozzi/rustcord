@@ -14,6 +14,7 @@ pub enum Block {
     CodeBlock { language: Option<String>, code: String },
     Blockquote(Vec<Span>),
     Heading { level: u8, spans: Vec<Span> },
+    Subtext(Vec<Span>),
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +53,11 @@ pub fn parse(input: &str) -> Vec<Block> {
             continue;
         }
 
+        if let Some(rest) = subtext_body(line) {
+            blocks.push(Block::Subtext(parse_spans(rest)));
+            continue;
+        }
+
         if let Some(level) = heading_level(line) {
             let text = line[level as usize..].trim_start();
             blocks.push(Block::Heading { level, spans: parse_spans(text) });
@@ -66,6 +72,20 @@ pub fn parse(input: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+fn subtext_body(line: &str) -> Option<&str> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = line[indent..].strip_prefix("-#")?;
+    let body = rest.strip_prefix(' ')?;
+    let trimmed = body.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed)
 }
 
 fn heading_level(line: &str) -> Option<u8> {
@@ -375,6 +395,85 @@ mod tests {
                 _ => String::new(),
             })
             .collect()
+    }
+
+    fn blocks_of(text: &str) -> Vec<Block> {
+        parse(text)
+    }
+
+    fn subtext_text(text: &str) -> Option<String> {
+        blocks_of(text).into_iter().find_map(|b| match b {
+            Block::Subtext(spans) => Some(
+                spans
+                    .into_iter()
+                    .map(|s| match s {
+                        Span::Text { text, .. } => text,
+                        Span::Link { label, .. } => label,
+                        _ => String::new(),
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn dash_hash_marks_a_line_as_subtext() {
+        assert_eq!(subtext_text("-# small print").as_deref(), Some("small print"));
+    }
+
+    #[test]
+    fn subtext_requires_a_space_after_the_marker() {
+        assert!(subtext_text("-#nospace").is_none());
+    }
+
+    #[test]
+    fn an_empty_subtext_marker_is_not_subtext() {
+        assert!(subtext_text("-# ").is_none());
+        assert!(subtext_text("-#").is_none());
+    }
+
+    #[test]
+    fn a_list_item_starting_with_a_heading_is_not_subtext() {
+        assert!(subtext_text("- # heading in a list").is_none());
+    }
+
+    #[test]
+    fn subtext_still_parses_inline_spans() {
+        let spans = blocks_of("-# see https://example.com/x")
+            .into_iter()
+            .find_map(|b| match b {
+                Block::Subtext(spans) => Some(spans),
+                _ => None,
+            })
+            .expect("subtext block");
+        assert!(spans.iter().any(|s| matches!(s, Span::Link { .. })));
+    }
+
+    #[test]
+    fn a_small_indent_before_the_marker_is_allowed() {
+        assert_eq!(subtext_text("   -# indented").as_deref(), Some("indented"));
+    }
+
+    #[test]
+    fn a_deep_indent_is_not_subtext() {
+        assert!(subtext_text("     -# too far").is_none());
+    }
+
+    #[test]
+    fn the_marker_only_applies_at_the_start_of_a_line() {
+        assert!(subtext_text("so it's like `-# this is a tiny message`").is_none());
+        assert!(subtext_text("text then -# not a marker").is_none());
+    }
+
+    #[test]
+    fn only_the_marked_line_becomes_subtext() {
+        let blocks = blocks_of("normal line
+-# tiny line
+normal again");
+        assert!(matches!(blocks[0], Block::Paragraph(_)));
+        assert!(matches!(blocks[1], Block::Subtext(_)));
+        assert!(matches!(blocks[2], Block::Paragraph(_)));
     }
 
     #[test]

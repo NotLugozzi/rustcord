@@ -29,6 +29,7 @@ Use at your own risk.
 - [x] Server Calls
 - [x] Message editing/deleting
 - [x] Custom emote rendering/sending
+- [x] Subtext (`-# tiny text`)
 - [x] Guild folders
 - [x] Embed Rendering
 - [x] Voice calls (DMs: ring/answer/decline, call messages, participant panel)

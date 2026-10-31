@@ -73,6 +73,13 @@ fn draw_markdown(
                 ui.set_window_font_scale(1.0);
                 token.pop();
             }
+            Block::Subtext(spans) => {
+                let color = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
+                ui.set_window_font_scale(0.85);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested);
+                ui.set_window_font_scale(1.0);
+                color.pop();
+            }
             Block::Blockquote(spans) => {
                 let token = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
                 ui.text("| ");
