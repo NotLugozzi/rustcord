@@ -3,6 +3,8 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   check-skip:
@@ -12,6 +14,10 @@ jobs:
     steps:
       - id: check
         run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           msg=$(echo "${{ github.event.head_commit.message }}" | tr '[:upper:]' '[:lower:]')
           if [[ "$msg" == *"[skip-ci]"* ]]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -23,6 +29,16 @@ jobs:
     needs: check-skip
     if: needs.check-skip.outputs.skip == 'false'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: video
+            features: --features video
+            suffix: ""
+          - variant: novideo
+            features: ""
+            suffix: "-novideo"
     steps:
       - uses: actions/checkout@v5
 
@@ -40,6 +56,17 @@ jobs:
             libssl-dev \
             cmake
 
+      - name: Install ffmpeg development libraries
+        if: matrix.variant == 'video'
+        run: |
+          sudo apt-get install -y \
+            libavcodec-dev \
+            libavformat-dev \
+            libavutil-dev \
+            libswscale-dev \
+            libswresample-dev \
+            libclang-dev
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -52,36 +79,54 @@ jobs:
           cargo install cargo-generate-rpm --locked
 
       - name: Build release binary
-        run: cargo build --release -p rustcord-ui
+        run: cargo build --release -p rustcord-ui ${{ matrix.features }}
 
       - name: Package tar.gz
         run: |
           mkdir -p dist
-          tar -czf dist/rustcord-linux-x86_64.tar.gz -C target/release rustcord
+          tar -czf dist/rustcord-linux-x86_64${{ matrix.suffix }}.tar.gz -C target/release rustcord
 
       - name: Package .deb
         run: |
           cargo deb -p rustcord-ui --no-build
           mkdir -p dist
-          cp target/debian/*.deb dist/
+          for f in target/debian/*.deb; do
+            cp "$f" "dist/$(basename "${f%.deb}")${{ matrix.suffix }}.deb"
+          done
 
       - name: Package .rpm
         run: |
           cargo generate-rpm -p crates/rustcord-ui
           mkdir -p dist
-          cp target/generate-rpm/*.rpm dist/
+          for f in target/generate-rpm/*.rpm; do
+            cp "$f" "dist/$(basename "${f%.rpm}")${{ matrix.suffix }}.rpm"
+          done
 
       - uses: actions/upload-artifact@v5
         with:
-          name: rustcord-linux
+          name: rustcord-linux${{ matrix.suffix }}
           path: dist/*
 
   build-macos:
     needs: check-skip
     if: needs.check-skip.outputs.skip == 'false'
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: video
+            features: --features video
+            suffix: ""
+          - variant: novideo
+            features: ""
+            suffix: "-novideo"
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install ffmpeg development libraries
+        if: matrix.variant == 'video'
+        run: brew install ffmpeg pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -92,25 +137,46 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --release -p rustcord-ui
+        run: cargo build --release -p rustcord-ui ${{ matrix.features }}
 
       - name: Package .dmg
         run: |
           mkdir -p dist dmg-root
           cp target/release/rustcord dmg-root/
-          hdiutil create -volname "RustCord" -srcfolder dmg-root -ov -format UDZO dist/rustcord-macos.dmg
+          hdiutil create -volname "RustCord" -srcfolder dmg-root -ov -format UDZO dist/rustcord-macos${{ matrix.suffix }}.dmg
 
       - uses: actions/upload-artifact@v5
         with:
-          name: rustcord-macos
+          name: rustcord-macos${{ matrix.suffix }}
           path: dist/*
 
   build-windows:
     needs: check-skip
     if: needs.check-skip.outputs.skip == 'false'
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: video
+            features: --features video
+            suffix: ""
+          - variant: novideo
+            features: ""
+            suffix: "-novideo"
     steps:
       - uses: actions/checkout@v5
+
+      - name: Fetch prebuilt ffmpeg
+        if: matrix.variant == 'video'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-dist
+          $dir = (Get-ChildItem ffmpeg-dist -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -121,15 +187,20 @@ jobs:
       - name: Build release binary
         env:
           CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: cargo build --release -p rustcord-ui
+        run: cargo build --release -p rustcord-ui ${{ matrix.features }}
 
       - name: Package .exe
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path target/release/rustcord.exe -DestinationPath dist/rustcord-windows-x86_64.zip
+          New-Item -ItemType Directory -Force -Path dist/payload | Out-Null
+          Copy-Item target/release/rustcord.exe dist/payload/
+          if ("${{ matrix.variant }}" -eq "video") {
+            Copy-Item "$env:FFMPEG_DIR/bin/*.dll" dist/payload/
+          }
+          Compress-Archive -Path dist/payload/* -DestinationPath dist/rustcord-windows-x86_64${{ matrix.suffix }}.zip
+          Remove-Item -Recurse -Force dist/payload
 
       - uses: actions/upload-artifact@v5
         with:
-          name: rustcord-windows
+          name: rustcord-windows${{ matrix.suffix }}
           path: dist/*

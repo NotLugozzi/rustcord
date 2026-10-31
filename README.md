@@ -1,9 +1,9 @@
 # rustcord
-
+[![Build](https://github.com/NotLugozzi/rustcord/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/NotLugozzi/rustcord/actions/workflows/build.yml)
 A native Discord client written in Rust, using Dear ImGui (via `imgui-rs`) for
 the UI, targeting Windows, macOS, and Linux.
 
-## ⚠️ Important
+## Important
 
 This talks to Discord's **undocumented client API and gateway** as a regular
 user account (no bot token). Discord's Terms of Service prohibit third-party
@@ -26,6 +26,7 @@ Use at your own risk.
 - [x] Typing indicators (send + receive)
 - [x] Real avatars (users) and guild icons
 - [x] User bar with settings dialog (account info, logout, theme switcher)
+- [x] About panel (version, tag, commit hash)
 - [x] Server Calls
 - [x] Message editing/deleting
 - [x] Custom emote rendering/sending
@@ -45,7 +46,7 @@ Use at your own risk.
 - [x] Inline video attachment playback (optional `video` feature, needs ffmpeg)
 - [ ] Reactions
 - [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
-- [ ] Message read status sync
+- [x] Message read status sync
 - [ ] performance improvements in voice calls (SSRC decoder leak fixed; re-measure CPU)
 - [ ] Video Calls, screen sharing
 - [ ] server admin actions (low priority)
