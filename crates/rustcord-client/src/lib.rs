@@ -6,6 +6,10 @@ pub mod error;
 pub mod models;
 pub mod permissions;
 pub mod rest;
+#[cfg(feature = "screenshare")]
+pub mod screen_capture;
+#[cfg(feature = "screenshare")]
+pub mod screen_encode;
 pub mod gateway;
 pub mod voice_audio;
 pub mod voice_gateway;
