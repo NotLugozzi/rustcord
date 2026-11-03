@@ -47,6 +47,100 @@ pub struct MentionCtx<'a> {
     pub role_names: &'a HashMap<String, (String, Option<[f32; 4]>)>,
 }
 
+const QUOTE_BAR_INDENT: f32 = 10.0;
+const LIST_INDENT: f32 = 14.0;
+
+fn bullet_glyph(depth: u8) -> char {
+    match depth % 3 {
+        0 => '\u{2022}',
+        1 => '\u{25E6}',
+        _ => '\u{25AA}',
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_markdown_table(
+    ui: &Ui,
+    fonts: &Fonts,
+    theme: &crate::theme::Theme,
+    table: &markdown::Table,
+    revealed_spoilers: &mut std::collections::HashSet<usize>,
+    id_seed: &str,
+    block_idx: usize,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    mentions: &mut MentionCtx,
+) {
+    use imgui::{TableColumnSetup, TableFlags};
+
+    let columns = table.header.len();
+    if columns == 0 {
+        return;
+    }
+    let flags = TableFlags::BORDERS | TableFlags::ROW_BG | TableFlags::SIZING_STRETCH_PROP;
+    let setup: Vec<TableColumnSetup<String>> =
+        (0..columns).map(|i| TableColumnSetup::new(format!("##col_{id_seed}_{block_idx}_{i}"))).collect();
+    let Some(_token) = ui.begin_table_with_flags(format!("table_{id_seed}_{block_idx}"), columns, flags) else {
+        return;
+    };
+    for column in setup {
+        ui.table_setup_column(column.name);
+    }
+
+    ui.table_next_row();
+    for (col, cell) in table.header.iter().enumerate() {
+        ui.table_set_column_index(col);
+        let bold = ui.push_font(fonts.bold);
+        align_table_cell(ui, table, col, cell, fonts, theme);
+        draw_spans(ui, fonts, theme, cell, revealed_spoilers, id_seed, block_idx * 100 + col, textures, cmd_tx, mentions);
+        bold.pop();
+    }
+
+    for (row_idx, row) in table.rows.iter().enumerate() {
+        ui.table_next_row();
+        for (col, cell) in row.iter().enumerate() {
+            ui.table_set_column_index(col);
+            align_table_cell(ui, table, col, cell, fonts, theme);
+            let seed = block_idx * 10_000 + (row_idx + 1) * 100 + col;
+            draw_spans(ui, fonts, theme, cell, revealed_spoilers, id_seed, seed, textures, cmd_tx, mentions);
+        }
+    }
+}
+
+fn align_table_cell(
+    ui: &Ui,
+    table: &markdown::Table,
+    col: usize,
+    cell: &[markdown::Span],
+    _fonts: &Fonts,
+    _theme: &crate::theme::Theme,
+) {
+    let Some(alignment) = table.alignments.get(col).copied() else { return };
+    if alignment == markdown::Alignment::Left {
+        return;
+    }
+    let text: String = cell
+        .iter()
+        .map(|span| match span {
+            markdown::Span::Text { text, .. } => text.as_str(),
+            markdown::Span::Link { label, .. } => label.as_str(),
+            _ => "",
+        })
+        .collect();
+    let width = ui.calc_text_size(&text)[0];
+    let available = ui.content_region_avail()[0];
+    if width >= available {
+        return;
+    }
+    let shift = match alignment {
+        markdown::Alignment::Center => (available - width) / 2.0,
+        markdown::Alignment::Right => available - width,
+        markdown::Alignment::Left => 0.0,
+    };
+    let pos = ui.cursor_pos();
+    ui.set_cursor_pos([pos[0] + shift, pos[1]]);
+}
+
 fn draw_markdown(
     ui: &Ui,
     fonts: &Fonts,
@@ -86,12 +180,39 @@ fn draw_markdown(
                 ui.set_window_font_scale(1.0);
                 color.pop();
             }
-            Block::Blockquote(spans) => {
+            Block::Blockquote { depth, spans } => {
+                let start = ui.cursor_screen_pos();
+                let indent = QUOTE_BAR_INDENT * *depth as f32;
+                ui.set_cursor_screen_pos([start[0] + indent, start[1]]);
                 let token = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
-                ui.text("| ");
-                ui.same_line();
                 draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
                 token.pop();
+                let bottom = ui.item_rect_max()[1].max(start[1] + ui.text_line_height());
+                for level in 0..*depth {
+                    let x = start[0] + QUOTE_BAR_INDENT * level as f32 + 2.0;
+                    ui.get_window_draw_list()
+                        .add_rect([x, start[1]], [x + 3.0, bottom], theme.border)
+                        .filled(true)
+                        .rounding(1.5)
+                        .build();
+                }
+            }
+            Block::ListItem { depth, marker, spans } => {
+                let start = ui.cursor_screen_pos();
+                let indent = LIST_INDENT * (*depth as f32 + 1.0);
+                ui.set_cursor_screen_pos([start[0] + indent, start[1]]);
+                let bullet = match marker {
+                    markdown::ListMarker::Ordered(n) => format!("{n}."),
+                    markdown::ListMarker::Bullet => bullet_glyph(*depth).to_string(),
+                };
+                let token = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
+                ui.text(&bullet);
+                token.pop();
+                ui.same_line_with_spacing(0.0, 6.0);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
+            }
+            Block::Table(table) => {
+                draw_markdown_table(ui, fonts, theme, table, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
             }
             Block::CodeBlock { code, language } => {
                 if let Some(lang) = language {
@@ -4667,6 +4788,68 @@ fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>
 mod link_tests {
     use super::*;
 
+    fn people() -> Vec<(String, String)> {
+        vec![
+            ("1".into(), "Ada Lovelace".into()),
+            ("2".into(), "Grace Hopper".into()),
+            ("3".into(), "ada_fan".into()),
+        ]
+    }
+
+    #[test]
+    fn an_empty_author_filter_lists_everyone() {
+        assert_eq!(super::author_filter_matches(&people(), "").len(), 3);
+    }
+
+    #[test]
+    fn the_author_filter_matches_anywhere_in_the_name() {
+        let hits = super::author_filter_matches(&people(), "lovelace");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "1");
+    }
+
+    #[test]
+    fn the_author_filter_ignores_case_and_spans_entries() {
+        let hits = super::author_filter_matches(&people(), "ADA");
+        assert_eq!(hits.len(), 2, "{hits:?}");
+    }
+
+    #[test]
+    fn the_author_filter_trims_surrounding_whitespace() {
+        assert_eq!(super::author_filter_matches(&people(), "  grace  ").len(), 1);
+    }
+
+    #[test]
+    fn an_author_filter_matching_no_one_is_empty_rather_than_everyone() {
+        assert!(super::author_filter_matches(&people(), "zzz").is_empty());
+    }
+
+    #[test]
+    fn the_author_list_is_capped() {
+        let many: Vec<(String, String)> =
+            (0..200).map(|i| (i.to_string(), format!("user{i}"))).collect();
+        assert_eq!(super::author_filter_matches(&many, "").len(), super::AUTHOR_PICKER_MAX_RESULTS);
+    }
+
+    #[test]
+    fn the_first_has_option_means_no_filter() {
+        assert_eq!(super::SEARCH_HAS_OPTIONS[0].1, None);
+    }
+
+    #[test]
+    fn every_has_option_after_the_first_sends_a_value() {
+        for (label, value) in &super::SEARCH_HAS_OPTIONS[1..] {
+            assert!(value.is_some(), "{label} has no query value");
+        }
+    }
+
+    #[test]
+    fn has_option_values_are_lowercase_api_tokens() {
+        for (_, value) in super::SEARCH_HAS_OPTIONS.iter().filter_map(|(l, v)| v.map(|v| (l, v))) {
+            assert_eq!(value, value.to_lowercase(), "{value} must be lowercase for the API");
+        }
+    }
+
     #[test]
     fn the_jump_highlight_is_translucent_so_text_stays_readable() {
         let highlight = super::jump_highlight([0.35, 0.40, 0.95, 1.0]);
@@ -4889,23 +5072,58 @@ fn search_scope_for(state: &AppState) -> Option<(crate::backend::SearchScope, St
     Some((SearchScope::Channel { channel_id }, name))
 }
 
+const AUTHOR_PICKER_MAX_RESULTS: usize = 50;
+
+const SEARCH_HAS_OPTIONS: [(&str, Option<&str>); 6] = [
+    ("Anything", None),
+    ("Image", Some("image")),
+    ("Video", Some("video")),
+    ("File", Some("file")),
+    ("Link", Some("link")),
+    ("Embed", Some("embed")),
+];
+
+fn current_search_filters(state: &AppState) -> crate::backend::SearchFilters {
+    crate::backend::SearchFilters {
+        author_id: state.search_author.clone(),
+        has: SEARCH_HAS_OPTIONS.get(state.search_has).and_then(|(_, v)| v.map(str::to_string)),
+    }
+}
+
+fn author_filter_matches(authors: &[(String, String)], needle: &str) -> Vec<(String, String)> {
+    let needle = needle.trim().to_lowercase();
+    authors
+        .iter()
+        .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+        .take(AUTHOR_PICKER_MAX_RESULTS)
+        .cloned()
+        .collect()
+}
+
 fn submit_search(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, offset: u32) {
     let query = state.search_input.trim().to_string();
-    if query.is_empty() {
+    let filters = current_search_filters(state);
+    if query.is_empty() && filters == Default::default() {
         state.search = None;
         return;
     }
     let Some((scope, _)) = search_scope_for(state) else { return };
-    let _ = cmd_tx.send(UiCommand::SearchMessages { scope: scope.clone(), query: query.clone(), offset });
+    let _ = cmd_tx.send(UiCommand::SearchMessages {
+        scope: scope.clone(),
+        query: query.clone(),
+        filters: filters.clone(),
+        offset,
+    });
     let carried_total = state
         .search
         .as_ref()
-        .filter(|s| s.query == query && s.scope == scope)
+        .filter(|s| s.query == query && s.scope == scope && s.filters == filters)
         .map(|s| s.total)
         .unwrap_or(0);
     state.search = Some(crate::app_state::SearchState {
         scope,
         query,
+        filters,
         offset,
         total: carried_total,
         results: Vec::new(),
@@ -4935,6 +5153,69 @@ fn draw_search_panel(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiC
         .enter_returns_true(true)
         .build();
     if submitted {
+        submit_search(state, cmd_tx, 0);
+    }
+
+    let scope_guild_id = match search_scope_for(state) {
+        Some((crate::backend::SearchScope::Guild { guild_id }, _)) => Some(guild_id),
+        _ => None,
+    };
+    let authors = state.searchable_authors(scope_guild_id.as_deref());
+    let selected_author_name = state
+        .search_author
+        .as_ref()
+        .and_then(|id| authors.iter().find(|(aid, _)| aid == id).map(|(_, name)| name.clone()));
+
+    let half = (ui.content_region_avail()[0] - 8.0) / 2.0;
+    let mut filters_changed = false;
+
+    ui.set_next_item_width(half);
+    let author_label = selected_author_name.clone().unwrap_or_else(|| "Anyone".to_string());
+    if let Some(_combo) = ui.begin_combo("##search_author", &author_label) {
+        ui.set_next_item_width(-1.0);
+        ui.input_text("##search_author_filter", &mut state.search_author_input)
+            .hint("Filter people...")
+            .build();
+        if ui.selectable_config("Anyone").selected(state.search_author.is_none()).build() {
+            state.search_author = None;
+            state.search_author_input.clear();
+            filters_changed = true;
+        }
+        let matches = author_filter_matches(&authors, &state.search_author_input);
+        if matches.is_empty() {
+            ui.text_disabled("No one matches");
+        }
+        for (id, name) in &matches {
+            let selected = state.search_author.as_deref() == Some(id.as_str());
+            if ui.selectable_config(format!("{name}##author_{id}")).selected(selected).build() {
+                state.search_author = Some(id.clone());
+                state.search_author_input.clear();
+                filters_changed = true;
+            }
+        }
+    }
+
+    ui.same_line();
+    ui.set_next_item_width(half);
+    let current = SEARCH_HAS_OPTIONS[state.search_has.min(SEARCH_HAS_OPTIONS.len() - 1)].0;
+    if let Some(_combo) = ui.begin_combo("##search_has", current) {
+        for (idx, (label, _)) in SEARCH_HAS_OPTIONS.iter().enumerate() {
+            if ui.selectable_config(label).selected(idx == state.search_has).build() {
+                state.search_has = idx;
+                filters_changed = true;
+            }
+        }
+    }
+
+    if scope_guild_id.is_some() && authors.len() <= 1 {
+        if let Some(guild_id) = scope_guild_id.clone() {
+            if state.guild_members_requested.insert(guild_id.clone()) {
+                let _ = cmd_tx.send(UiCommand::RequestGuildMembers { guild_id });
+            }
+        }
+    }
+
+    if filters_changed {
         submit_search(state, cmd_tx, 0);
     }
 

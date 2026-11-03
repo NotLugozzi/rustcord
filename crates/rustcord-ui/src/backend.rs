@@ -80,6 +80,12 @@ async fn save_attachment(url: &str, filename: &str) -> Result<std::path::PathBuf
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
 pub(crate) static VOICE_MEDIA_STATE: std::sync::Mutex<Option<rustcord_client::voice_gateway::VoiceMediaState>> = std::sync::Mutex::new(None);
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub author_id: Option<String>,
+    pub has: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Guild { guild_id: String },
@@ -124,7 +130,7 @@ pub enum UiCommand {
     DeleteMessage { channel_id: String, message_id: String },
     ToggleReaction { channel_id: String, message_id: String, emoji: String, add: bool },
     AckMessage { channel_id: String, message_id: String },
-    SearchMessages { scope: SearchScope, query: String, offset: u32 },
+    SearchMessages { scope: SearchScope, query: String, filters: SearchFilters, offset: u32 },
     JumpToMessage { channel_id: String, message_id: String },
     JoinGuildByInvite { invite_code: String },
     CreateGuild { name: String },
@@ -165,6 +171,7 @@ pub enum BackendEvent {
     OlderMessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
     SearchResults {
         query: String,
+        filters: SearchFilters,
         offset: u32,
         total: u32,
         messages: Vec<rustcord_client::models::Message>,
@@ -303,12 +310,12 @@ pub fn spawn(
                         }
                     }
                 }
-                UiCommand::SearchMessages { scope, query, offset } => {
+                UiCommand::SearchMessages { scope, query, filters, offset } => {
                     if let Some(client) = &rest {
                         let client = client.clone();
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            run_search(&client, scope, query, offset, &event_tx).await;
+                            run_search(&client, scope, query, filters, offset, &event_tx).await;
                         });
                     }
                 }
@@ -765,10 +772,17 @@ async fn run_search(
     client: &RestClient,
     scope: SearchScope,
     query: String,
+    filters: SearchFilters,
     offset: u32,
     event_tx: &mpsc::UnboundedSender<BackendEvent>,
 ) {
-    let params = rustcord_client::rest::SearchQuery { content: &query, offset, ..Default::default() };
+    let params = rustcord_client::rest::SearchQuery {
+        content: &query,
+        author_id: filters.author_id.as_deref(),
+        has: filters.has.as_deref(),
+        offset,
+        ..Default::default()
+    };
     let result = match &scope {
         SearchScope::Guild { guild_id } => client.search_guild_messages(guild_id, &params).await,
         SearchScope::Channel { channel_id } => client.search_channel_messages(channel_id, &params).await,
@@ -776,6 +790,7 @@ async fn run_search(
     let event = match result {
         Ok(results) => BackendEvent::SearchResults {
             query,
+            filters,
             offset,
             total: results.total,
             messages: results.messages,

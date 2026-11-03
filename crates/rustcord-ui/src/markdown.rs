@@ -12,9 +12,31 @@ pub struct Style {
 pub enum Block {
     Paragraph(Vec<Span>),
     CodeBlock { language: Option<String>, code: String },
-    Blockquote(Vec<Span>),
+    Blockquote { depth: u8, spans: Vec<Span> },
     Heading { level: u8, spans: Vec<Span> },
     Subtext(Vec<Span>),
+    ListItem { depth: u8, marker: ListMarker, spans: Vec<Span> },
+    Table(Table),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListMarker {
+    Bullet,
+    Ordered(u32),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Table {
+    pub header: Vec<Vec<Span>>,
+    pub alignments: Vec<Alignment>,
+    pub rows: Vec<Vec<Vec<Span>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Alignment {
+    Left,
+    Center,
+    Right,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +78,10 @@ impl TimestampStyle {
     }
 }
 
+const MAX_QUOTE_DEPTH: u8 = 3;
+const MAX_LIST_DEPTH: u8 = 4;
+const MAX_LIST_INDENT: usize = 16;
+
 pub fn parse(input: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut lines = input.lines().peekable();
@@ -77,14 +103,23 @@ pub fn parse(input: &str) -> Vec<Block> {
             continue;
         }
 
-        if let Some(rest) = line.strip_prefix('>') {
-            let text = rest.strip_prefix(' ').unwrap_or(rest);
-            blocks.push(Block::Blockquote(parse_spans(text)));
+        if let Some((depth, text)) = blockquote_body(line) {
+            blocks.push(Block::Blockquote { depth, spans: parse_spans(text) });
             continue;
         }
 
         if let Some(rest) = subtext_body(line) {
             blocks.push(Block::Subtext(parse_spans(rest)));
+            continue;
+        }
+
+        if let Some(table) = try_parse_table(line, &mut lines) {
+            blocks.push(Block::Table(table));
+            continue;
+        }
+
+        if let Some((depth, marker, text)) = list_item(line) {
+            blocks.push(Block::ListItem { depth, marker, spans: parse_spans(text) });
             continue;
         }
 
@@ -102,6 +137,113 @@ pub fn parse(input: &str) -> Vec<Block> {
     }
 
     blocks
+}
+
+fn blockquote_body(line: &str) -> Option<(u8, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let mut rest = &line[indent..];
+    let mut depth = 0u8;
+    while let Some(stripped) = rest.strip_prefix('>') {
+        depth = depth.saturating_add(1);
+        rest = stripped.strip_prefix(' ').unwrap_or(stripped);
+        if depth == MAX_QUOTE_DEPTH {
+            break;
+        }
+    }
+    if depth == 0 {
+        return None;
+    }
+    Some((depth, rest))
+}
+
+fn list_item(line: &str) -> Option<(u8, ListMarker, &str)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > MAX_LIST_INDENT {
+        return None;
+    }
+    let depth = (indent / 2).min(MAX_LIST_DEPTH as usize) as u8;
+    let rest = &line[indent..];
+
+    if let Some(body) = rest.strip_prefix("- ").or_else(|| rest.strip_prefix("* ")) {
+        let body = body.trim_start();
+        if body.is_empty() {
+            return None;
+        }
+        return Some((depth, ListMarker::Bullet, body));
+    }
+
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let after = &rest[digits..];
+    let body = after.strip_prefix(". ").or_else(|| after.strip_prefix(") "))?;
+    let body = body.trim_start();
+    if body.is_empty() {
+        return None;
+    }
+    let number: u32 = rest[..digits].parse().ok()?;
+    Some((depth, ListMarker::Ordered(number), body))
+}
+
+fn split_table_row(line: &str) -> Option<Vec<&str>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') {
+        return None;
+    }
+    let inner = trimmed.strip_prefix('|')?;
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    Some(inner.split('|').map(str::trim).collect())
+}
+
+fn alignment_of(cell: &str) -> Option<Alignment> {
+    let cell = cell.trim();
+    let left = cell.starts_with(':');
+    let right = cell.ends_with(':');
+    let dashes = cell.trim_matches(':');
+    if dashes.len() < 3 || !dashes.chars().all(|c| c == '-') {
+        return None;
+    }
+    Some(match (left, right) {
+        (true, true) => Alignment::Center,
+        (false, true) => Alignment::Right,
+        _ => Alignment::Left,
+    })
+}
+
+fn try_parse_table<'a, I>(line: &str, lines: &mut std::iter::Peekable<I>) -> Option<Table>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let header = split_table_row(line)?;
+    if header.len() < 2 {
+        return None;
+    }
+    let divider = split_table_row(lines.peek()?)?;
+    if divider.len() != header.len() {
+        return None;
+    }
+    let alignments: Option<Vec<Alignment>> = divider.iter().map(|c| alignment_of(c)).collect();
+    let alignments = alignments?;
+    lines.next();
+
+    let mut rows = Vec::new();
+    while let Some(next) = lines.peek() {
+        let Some(cells) = split_table_row(next) else { break };
+        lines.next();
+        let mut row: Vec<Vec<Span>> = cells.iter().take(header.len()).map(|c| parse_spans(c)).collect();
+        row.resize_with(header.len(), Vec::new);
+        rows.push(row);
+    }
+
+    Some(Table {
+        header: header.iter().map(|c| parse_spans(c)).collect(),
+        alignments,
+        rows,
+    })
 }
 
 fn subtext_body(line: &str) -> Option<&str> {
@@ -763,5 +905,201 @@ normal again");
             })
             .collect();
         assert_eq!(kinds, ["text", "user", "text", "channel", "text", "role"], "{spans:?}");
+    }
+
+    fn blocks(input: &str) -> Vec<Block> {
+        parse(input)
+    }
+
+    fn plain(spans: &[Span]) -> String {
+        spans
+            .iter()
+            .map(|s| match s {
+                Span::Text { text, .. } => text.clone(),
+                Span::Link { label, .. } => label.clone(),
+                _ => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dash_starts_a_bullet_item() {
+        let out = blocks("- milk");
+        match &out[0] {
+            Block::ListItem { depth, marker, spans } => {
+                assert_eq!(*depth, 0);
+                assert_eq!(*marker, ListMarker::Bullet);
+                assert_eq!(plain(spans), "milk");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_asterisk_also_starts_a_bullet_item() {
+        assert!(matches!(blocks("* milk")[0], Block::ListItem { marker: ListMarker::Bullet, .. }));
+    }
+
+    #[test]
+    fn a_number_starts_an_ordered_item_and_keeps_its_value() {
+        match &blocks("3. third")[0] {
+            Block::ListItem { marker: ListMarker::Ordered(n), .. } => assert_eq!(*n, 3),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_spaces_of_indent_is_one_nesting_level() {
+        match &blocks("  - nested")[0] {
+            Block::ListItem { depth, .. } => assert_eq!(*depth, 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_nesting_is_capped() {
+        match &blocks("                - deep")[0] {
+            Block::ListItem { depth, .. } => assert!(*depth <= MAX_LIST_DEPTH, "{depth}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dash_without_a_space_is_not_a_list() {
+        assert!(matches!(blocks("-nope")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_bare_marker_with_no_body_is_not_a_list() {
+        assert!(matches!(blocks("- ")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn subtext_still_wins_over_the_list_parser() {
+        assert!(matches!(blocks("-# quiet")[0], Block::Subtext(_)));
+    }
+
+    #[test]
+    fn a_negative_number_is_not_an_ordered_item() {
+        assert!(matches!(blocks("-1. nope")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn inline_spans_parse_inside_a_list_item() {
+        match &blocks("- **bold** item")[0] {
+            Block::ListItem { spans, .. } => {
+                assert!(spans.iter().any(|s| matches!(s, Span::Text { style, .. } if style.bold)), "{spans:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_chevron_is_depth_one() {
+        match &blocks("> quoted")[0] {
+            Block::Blockquote { depth, spans } => {
+                assert_eq!(*depth, 1);
+                assert_eq!(plain(spans), "quoted");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn stacked_chevrons_nest_the_quote() {
+        match &blocks(">>> deep")[0] {
+            Block::Blockquote { depth, spans } => {
+                assert_eq!(*depth, 3);
+                assert_eq!(plain(spans), "deep");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn quote_depth_is_capped_and_the_rest_stays_text() {
+        match &blocks(">>>>> very deep")[0] {
+            Block::Blockquote { depth, spans } => {
+                assert_eq!(*depth, MAX_QUOTE_DEPTH);
+                assert_eq!(plain(spans), ">> very deep");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_simple_table_parses_its_header_and_rows() {
+        let input = "| a | b |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |";
+        match &blocks(input)[0] {
+            Block::Table(table) => {
+                assert_eq!(table.header.len(), 2);
+                assert_eq!(plain(&table.header[0]), "a");
+                assert_eq!(table.rows.len(), 2);
+                assert_eq!(plain(&table.rows[1][1]), "4");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn table_alignment_markers_are_read() {
+        let input = "| l | c | r |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |";
+        match &blocks(input)[0] {
+            Block::Table(table) => {
+                assert_eq!(table.alignments, [Alignment::Left, Alignment::Center, Alignment::Right]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_short_row_is_padded_to_the_header_width() {
+        let input = "| a | b | c |\n| --- | --- | --- |\n| 1 |";
+        match &blocks(input)[0] {
+            Block::Table(table) => {
+                assert_eq!(table.rows[0].len(), 3);
+                assert_eq!(plain(&table.rows[0][2]), "");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_long_row_is_truncated_to_the_header_width() {
+        let input = "| a | b |\n| --- | --- |\n| 1 | 2 | 3 |";
+        match &blocks(input)[0] {
+            Block::Table(table) => assert_eq!(table.rows[0].len(), 2),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pipe_line_without_a_divider_stays_a_paragraph() {
+        assert!(matches!(blocks("| a | b |\njust text")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_divider_with_too_few_dashes_is_not_a_table() {
+        assert!(matches!(blocks("| a | b |\n| -- | -- |")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_table_needs_at_least_two_columns() {
+        assert!(matches!(blocks("| a |\n| --- |")[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_table_with_no_body_rows_is_still_a_table() {
+        match &blocks("| a | b |\n| --- | --- |")[0] {
+            Block::Table(table) => assert!(table.rows.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_table_does_not_swallow_the_text_after_it() {
+        let out = blocks("| a | b |\n| --- | --- |\n| 1 | 2 |\nafter");
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[1], Block::Paragraph(_)));
     }
 }

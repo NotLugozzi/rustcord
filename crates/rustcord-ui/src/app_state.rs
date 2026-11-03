@@ -156,6 +156,7 @@ pub fn load_rail() -> (Vec<GuildFolder>, Vec<RailItem>) {
 pub struct SearchState {
     pub scope: crate::backend::SearchScope,
     pub query: String,
+    pub filters: crate::backend::SearchFilters,
     pub offset: u32,
     pub total: u32,
     pub results: Vec<Message>,
@@ -260,6 +261,9 @@ pub struct AppState {
     pub search_follows_selection: bool,
     pub search_focus_input: bool,
     pub search_input: String,
+    pub search_author_input: String,
+    pub search_author: Option<String>,
+    pub search_has: usize,
     pub search: Option<SearchState>,
     pub emoji_picker_filter: String,
     pub emoji_picker_target: Option<(String, String)>,
@@ -831,6 +835,62 @@ impl AppState {
             .unwrap_or(&[])
     }
 
+    pub fn searchable_authors(&self, guild_id: Option<&str>) -> Vec<(String, String)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut users: Vec<(String, String)> = Vec::new();
+        let push = |id: &str, name: String, seen: &mut std::collections::HashSet<String>, out: &mut Vec<(String, String)>| {
+            if seen.insert(id.to_string()) {
+                out.push((id.to_string(), name));
+            }
+        };
+
+        if let Some(me) = &self.current_user {
+            let name = me.global_name.clone().unwrap_or_else(|| me.username.clone());
+            push(&me.id, name, &mut seen, &mut users);
+        }
+
+        match guild_id {
+            Some(guild_id) => {
+                if let Some(members) = self.guild_members.get(guild_id) {
+                    for member in members {
+                        let name = member
+                            .nick
+                            .clone()
+                            .or_else(|| member.user.global_name.clone())
+                            .unwrap_or_else(|| member.user.username.clone());
+                        push(&member.user.id, name, &mut seen, &mut users);
+                    }
+                }
+            }
+            None => {
+                if let Some(channel_id) = &self.selected_channel {
+                    if let Some(dm) = self.dm_channels.iter().find(|c| &c.id == channel_id) {
+                        for user in &dm.recipients {
+                            let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+                            push(&user.id, name, &mut seen, &mut users);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(channel_id) = &self.selected_channel {
+            if let Some(messages) = self.messages.get(channel_id) {
+                for message in messages {
+                    let name = message
+                        .author
+                        .global_name
+                        .clone()
+                        .unwrap_or_else(|| message.author.username.clone());
+                    push(&message.author.id, name, &mut seen, &mut users);
+                }
+            }
+        }
+
+        users.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        users
+    }
+
     pub fn mentionable_users_for_active_channel(&self) -> Vec<&User> {
         let Some(channel_id) = &self.selected_channel else { return Vec::new() };
         let mut seen = std::collections::HashSet::new();
@@ -1104,6 +1164,7 @@ mod tests {
         SearchState {
             scope: crate::backend::SearchScope::Guild { guild_id: "g".into() },
             query: "q".into(),
+            filters: Default::default(),
             offset,
             total,
             results: Vec::new(),
@@ -1153,6 +1214,82 @@ mod tests {
             last_message_id: last_message_id.into(),
             mention_count,
         }
+    }
+
+    fn test_user(id: &str, username: &str, global: Option<&str>) -> User {
+        User {
+            id: id.into(),
+            username: username.into(),
+            global_name: global.map(str::to_string),
+            discriminator: "0".into(),
+            avatar: None,
+            bot: false,
+        }
+    }
+
+    fn test_member(id: &str, username: &str, nick: Option<&str>) -> rustcord_client::models::GuildMember {
+        rustcord_client::models::GuildMember {
+            user: test_user(id, username, None),
+            nick: nick.map(str::to_string),
+            roles: Vec::new(),
+            joined_at: "2026-01-01T00:00:00+00:00".into(),
+        }
+    }
+
+    #[test]
+    fn guild_authors_come_from_the_member_list() {
+        let mut state = AppState::default();
+        state.guild_members.insert("g".into(), vec![test_member("1", "ada", None)]);
+        let authors = state.searchable_authors(Some("g"));
+        assert!(authors.iter().any(|(id, name)| id == "1" && name == "ada"), "{authors:?}");
+    }
+
+    #[test]
+    fn a_guild_nickname_wins_over_the_username() {
+        let mut state = AppState::default();
+        state.guild_members.insert("g".into(), vec![test_member("1", "ada", Some("Countess"))]);
+        let authors = state.searchable_authors(Some("g"));
+        assert_eq!(authors.iter().find(|(id, _)| id == "1").unwrap().1, "Countess");
+    }
+
+    #[test]
+    fn an_author_is_never_listed_twice() {
+        let mut state = AppState::default();
+        state.current_user = Some(test_user("1", "me", None));
+        state.guild_members.insert("g".into(), vec![test_member("1", "me", None)]);
+        let authors = state.searchable_authors(Some("g"));
+        assert_eq!(authors.iter().filter(|(id, _)| id == "1").count(), 1, "{authors:?}");
+    }
+
+    #[test]
+    fn authors_are_sorted_case_insensitively_by_name() {
+        let mut state = AppState::default();
+        state.guild_members.insert(
+            "g".into(),
+            vec![test_member("1", "zoe", None), test_member("2", "Ada", None), test_member("3", "mike", None)],
+        );
+        let names: Vec<String> = state.searchable_authors(Some("g")).into_iter().map(|(_, n)| n).collect();
+        assert_eq!(names, ["Ada", "mike", "zoe"]);
+    }
+
+    #[test]
+    fn the_signed_in_user_is_always_offered_as_an_author() {
+        let mut state = AppState::default();
+        state.current_user = Some(test_user("me", "luna", Some("Luna")));
+        let authors = state.searchable_authors(None);
+        assert!(authors.iter().any(|(id, name)| id == "me" && name == "Luna"), "{authors:?}");
+    }
+
+    #[test]
+    fn a_dm_offers_its_recipients() {
+        let mut state = AppState::default();
+        let mut dm = test_channel("dm", "dm");
+        dm.kind = ChannelType::Dm;
+        dm.recipients = vec![test_user("2", "friend", None)];
+        state.dm_channels.push(dm);
+        state.selected_channel = Some("dm".into());
+        let authors = state.searchable_authors(None);
+        assert!(authors.iter().any(|(id, _)| id == "2"), "{authors:?}");
     }
 
     #[test]

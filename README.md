@@ -22,7 +22,7 @@ Use at your own risk.
 - [x] DM list sorted by most recent activity
 - [x] TOML-based theming (switchable live from Settings)
 - [x] Persisted login (OS keychain)
-- [x] Markdown: bold, italic, strikethrough, underline, spoilers, blockquotes, headers, inline/block code, links
+- [x] Markdown: bold, italic, strikethrough, underline, spoilers, blockquotes (nested), headers, inline/block code, links, lists, tables
 - [x] Mentions: users, channels, roles, `@everyone`/`@here`, and `<t:>` timestamps
 - [x] Typing indicators (send + receive)
 - [x] Real avatars (users) and guild icons
@@ -47,11 +47,10 @@ Use at your own risk.
 - [x] Inline video attachment playback (optional `video` feature, needs ffmpeg)
 - [x] Reactions
 - [x] Quick switcher (Ctrl-K, with avatars)
-- [x] Message search (per-server and per-DM, jump to message)
+- [x] Message search (per-server and per-DM, author picker and attachment filters, jump to message)
 - [x] Per-channel unread indicators and mention badges
 - [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
 - [x] Message read status sync
-- [ ] performance improvements in voice calls (SSRC decoder leak fixed; re-measure CPU)
 - [ ] Video Calls, screen sharing
 - [ ] server admin actions (low priority)
 

@@ -366,9 +366,9 @@ pub fn drain_backend_events(
                 }
                 state.prepend_message_history(channel_id, messages);
             }
-            BackendEvent::SearchResults { query, offset, total, messages } => {
+            BackendEvent::SearchResults { query, filters, offset, total, messages } => {
                 if let Some(search) = &mut state.search {
-                    if search.query == query && search.offset == offset {
+                    if search.query == query && search.offset == offset && search.filters == filters {
                         search.total = total;
                         search.results = messages;
                         search.status = app_state::SearchStatus::Ready;
