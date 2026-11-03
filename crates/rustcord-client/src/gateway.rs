@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Channel, Guild, GuildMember, MergedPresences, Message, Presence, Role, User, VoiceState};
+use crate::models::{Channel, Guild, GuildMember, MergedPresences, Message, Presence, ReactionEmoji, Role, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,6 +23,9 @@ pub enum GatewayEvent {
     PresenceUpdate(Presence),
     MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String>, call: Option<crate::models::CallInfo> },
     MessageDelete { channel_id: String, id: String },
+    ReactionAdd { channel_id: String, message_id: String, user_id: String, emoji: ReactionEmoji },
+    ReactionRemove { channel_id: String, message_id: String, user_id: String, emoji: ReactionEmoji },
+    ReactionRemoveAll { channel_id: String, message_id: String },
     VoiceStateUpdate(VoiceState),
     VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
     InitialVoiceStates(Vec<VoiceState>),
@@ -359,6 +362,22 @@ impl Gateway {
             Some("MESSAGE_DELETE") => GatewayEvent::MessageDelete {
                 channel_id: data["channel_id"].as_str().unwrap_or_default().to_string(),
                 id: data["id"].as_str().unwrap_or_default().to_string(),
+            },
+            Some("MESSAGE_REACTION_ADD") | Some("MESSAGE_REACTION_REMOVE") => {
+                let text = |k: &str| data[k].as_str().unwrap_or_default().to_string();
+                let emoji: ReactionEmoji = serde_json::from_value(data["emoji"].clone())?;
+                let channel_id = text("channel_id");
+                let message_id = text("message_id");
+                let user_id = text("user_id");
+                if payload.t.as_deref() == Some("MESSAGE_REACTION_ADD") {
+                    GatewayEvent::ReactionAdd { channel_id, message_id, user_id, emoji }
+                } else {
+                    GatewayEvent::ReactionRemove { channel_id, message_id, user_id, emoji }
+                }
+            }
+            Some("MESSAGE_REACTION_REMOVE_ALL") => GatewayEvent::ReactionRemoveAll {
+                channel_id: data["channel_id"].as_str().unwrap_or_default().to_string(),
+                message_id: data["message_id"].as_str().unwrap_or_default().to_string(),
             },
             Some("PRESENCE_UPDATE") => {
                 let presence: Presence = serde_json::from_value(data)?;

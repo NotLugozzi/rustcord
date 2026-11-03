@@ -11,6 +11,7 @@ mod presence;
 mod renderer;
 mod session_store;
 mod settings;
+mod switcher;
 mod theme;
 mod ui;
 #[cfg(feature = "video")]
@@ -217,6 +218,15 @@ pub fn drain_backend_events(
                 if let Some(list) = state.messages.get_mut(&channel_id) {
                     list.retain(|m| m.id != id);
                 }
+            }
+            BackendEvent::Gateway(GatewayEvent::ReactionAdd { channel_id, message_id, user_id, emoji }) => {
+                state.apply_reaction(&channel_id, &message_id, &user_id, emoji, true);
+            }
+            BackendEvent::Gateway(GatewayEvent::ReactionRemove { channel_id, message_id, user_id, emoji }) => {
+                state.apply_reaction(&channel_id, &message_id, &user_id, emoji, false);
+            }
+            BackendEvent::Gateway(GatewayEvent::ReactionRemoveAll { channel_id, message_id }) => {
+                state.clear_reactions(&channel_id, &message_id);
             }
             BackendEvent::Gateway(GatewayEvent::VoiceStateUpdate(voice_state)) => {
                 state.ding_for_voice_state(&voice_state);

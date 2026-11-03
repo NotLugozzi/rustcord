@@ -285,6 +285,22 @@ impl RestClient {
         .await
     }
 
+    pub async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<(), ClientError> {
+        let url = format!(
+            "{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{}/@me",
+            encode_path_segment(emoji)
+        );
+        self.send_empty(|| self.http.put(&url).header(header::CONTENT_LENGTH, "0")).await
+    }
+
+    pub async fn remove_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<(), ClientError> {
+        let url = format!(
+            "{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions/{}/@me",
+            encode_path_segment(emoji)
+        );
+        self.send_empty(|| self.http.delete(&url)).await
+    }
+
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<(), ClientError> {
         self.send_empty(|| self.http.post(format!("{API_BASE}/channels/{channel_id}/typing"))).await
     }
@@ -430,6 +446,17 @@ impl RestClient {
     }
 }
 
+pub fn encode_path_segment(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 const MAX_RATE_LIMIT_ATTEMPTS: u32 = 4;
 const MAX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -442,3 +469,35 @@ fn retry_after(resp: &Response) -> Option<std::time::Duration> {
 }
 
 const SUPER_PROPERTIES_B64: &str = "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyOS4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTI5LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjMwMDAwMCwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreserved_characters_pass_through() {
+        assert_eq!(encode_path_segment("smile:123"), "smile%3A123");
+        assert_eq!(encode_path_segment("aZ09-_.~"), "aZ09-_.~");
+    }
+
+    #[test]
+    fn a_unicode_emoji_is_percent_encoded_per_utf8_byte() {
+        assert_eq!(encode_path_segment("\u{1F44D}"), "%F0%9F%91%8D");
+        assert_eq!(encode_path_segment("\u{2764}"), "%E2%9D%A4");
+    }
+
+    #[test]
+    fn characters_that_would_break_the_path_are_escaped() {
+        for (raw, expected) in [("/", "%2F"), ("?", "%3F"), ("#", "%23"), ("%", "%25"), (" ", "%20")] {
+            assert_eq!(encode_path_segment(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_multi_codepoint_emoji_keeps_every_byte() {
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let encoded = encode_path_segment(family);
+        assert_eq!(encoded.matches('%').count(), family.len(), "{encoded}");
+        assert!(encoded.contains("%E2%80%8D"), "zero-width joiner must survive: {encoded}");
+    }
+}

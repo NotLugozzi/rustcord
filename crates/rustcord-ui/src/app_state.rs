@@ -217,7 +217,12 @@ pub struct AppState {
     pub reply_target: Option<Message>,
     pub presences: HashMap<String, Presence>,
     pub guild_emojis: HashMap<String, Vec<Emoji>>,
+    pub switcher_open: bool,
+    pub switcher_focus_input: bool,
+    pub switcher_query: String,
+    pub switcher_selected: usize,
     pub emoji_picker_filter: String,
+    pub emoji_picker_target: Option<(String, String)>,
     pub emoji_picker_category: usize,
     pub emoji_autocomplete_selected: usize,
     pub mention_autocomplete_selected: usize,
@@ -605,6 +610,94 @@ impl AppState {
         }
     }
 
+    pub fn apply_reaction(
+        &mut self,
+        channel_id: &str,
+        message_id: &str,
+        user_id: &str,
+        emoji: rustcord_client::models::ReactionEmoji,
+        added: bool,
+    ) {
+        let is_me = self.current_user.as_ref().is_some_and(|u| u.id == user_id);
+        let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) else {
+            return;
+        };
+        apply_reaction_to(&mut msg.reactions, emoji, is_me, added);
+    }
+
+    pub fn clear_reactions(&mut self, channel_id: &str, message_id: &str) {
+        if let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) {
+            msg.reactions.clear();
+        }
+    }
+
+    pub fn switcher_entries(&self) -> Vec<crate::switcher::Entry> {
+        use crate::switcher::{Entry, Target};
+        use rustcord_client::models::ChannelType;
+
+        let mut entries = Vec::new();
+        for dm in &self.dm_channels {
+            entries.push(Entry {
+                label: Self::dm_display_name(dm),
+                context: Some("Direct Message".to_string()),
+                target: Target::Dm { channel_id: dm.id.clone() },
+            });
+        }
+        for guild in &self.guilds {
+            entries.push(Entry {
+                label: guild.name.clone(),
+                context: Some("Server".to_string()),
+                target: Target::Guild { guild_id: guild.id.clone() },
+            });
+            let Some(channels) = self.guild_channels.get(&guild.id) else { continue };
+            for channel in channels {
+                if !matches!(channel.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement) {
+                    continue;
+                }
+                if !self.can_view_channel(&guild.id, channel) {
+                    continue;
+                }
+                let Some(name) = channel.name.as_ref() else { continue };
+                entries.push(Entry {
+                    label: format!("#{name}"),
+                    context: Some(guild.name.clone()),
+                    target: Target::Channel { guild_id: guild.id.clone(), channel_id: channel.id.clone() },
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn channel_name_map(&self) -> HashMap<String, String> {
+        let guild = self.guild_channels.values().flatten();
+        let dm = self.dm_channels.iter();
+        guild
+            .chain(dm)
+            .filter_map(|c| c.name.as_ref().map(|n| (c.id.clone(), n.clone())))
+            .collect()
+    }
+
+    pub fn role_name_map(&self) -> HashMap<String, (String, Option<[f32; 4]>)> {
+        let Some(guild_id) = self.selected_guild.as_ref() else { return HashMap::new() };
+        let Some(roles) = self.guild_roles.get(guild_id) else { return HashMap::new() };
+        roles.iter().map(|r| (r.id.clone(), (r.name.clone(), r.rgba()))).collect()
+    }
+
+    pub fn color_for_roles(&self, guild_id: &str, member_role_ids: &[String]) -> Option<[f32; 4]> {
+        let roles = self.guild_roles.get(guild_id)?;
+        roles
+            .iter()
+            .filter(|r| member_role_ids.iter().any(|id| id == &r.id))
+            .filter(|r| r.color != 0)
+            .max_by_key(|r| r.position)
+            .and_then(|r| r.rgba())
+    }
+
+    pub fn member_color(&self, guild_id: &str, user_id: &str) -> Option<[f32; 4]> {
+        let member = self.guild_members.get(guild_id)?.iter().find(|m| m.user.id == user_id)?;
+        self.color_for_roles(guild_id, &member.roles)
+    }
+
     pub fn channel_is_unread(&self, channel_id: &str, last_message_id: Option<&str>) -> bool {
         let Some(last_message_id) = last_message_id else { return false };
         let seen = self.last_read_message_id.get(channel_id);
@@ -884,6 +977,36 @@ impl AppState {
     }
 }
 
+
+pub fn apply_reaction_to(
+    reactions: &mut Vec<rustcord_client::models::Reaction>,
+    emoji: rustcord_client::models::ReactionEmoji,
+    is_me: bool,
+    added: bool,
+) {
+    let key = emoji.key();
+    let existing = reactions.iter().position(|r| r.emoji.key() == key);
+    match (existing, added) {
+        (Some(idx), true) => {
+            reactions[idx].count += 1;
+            if is_me {
+                reactions[idx].me = true;
+            }
+        }
+        (None, true) => reactions.push(rustcord_client::models::Reaction { emoji, count: 1, me: is_me }),
+        (Some(idx), false) => {
+            reactions[idx].count = reactions[idx].count.saturating_sub(1);
+            if is_me {
+                reactions[idx].me = false;
+            }
+            if reactions[idx].count == 0 {
+                reactions.remove(idx);
+            }
+        }
+        (None, false) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,5 +1143,223 @@ mod tests {
         let states = [remote("c", "100")];
         assert_eq!(merge_read_state(&mut local, &states), 1);
         assert_eq!(merge_read_state(&mut local, &states), 0);
+    }
+
+    fn role(id: &str, name: &str, position: i32, color: u32) -> rustcord_client::models::Role {
+        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color }
+    }
+
+    #[test]
+    fn the_highest_coloured_role_wins() {
+        let mut state = AppState::default();
+        state.guild_roles.insert(
+            "g".into(),
+            vec![role("low", "Member", 1, 0x00FF00), role("high", "Admin", 5, 0xFF0000)],
+        );
+        let c = state.color_for_roles("g", &["low".into(), "high".into()]).expect("a colour");
+        assert_eq!(c[0], 1.0, "expected red from the higher role, got {c:?}");
+        assert_eq!(c[1], 0.0);
+    }
+
+    #[test]
+    fn an_uncoloured_higher_role_does_not_mask_a_coloured_lower_one() {
+        let mut state = AppState::default();
+        state.guild_roles.insert(
+            "g".into(),
+            vec![role("low", "Member", 1, 0x00FF00), role("high", "Muted", 9, 0)],
+        );
+        let c = state.color_for_roles("g", &["low".into(), "high".into()]).expect("a colour");
+        assert_eq!(c[1], 1.0, "expected the green lower role, got {c:?}");
+    }
+
+    #[test]
+    fn a_member_with_no_coloured_roles_has_no_colour() {
+        let mut state = AppState::default();
+        state.guild_roles.insert("g".into(), vec![role("a", "Default", 0, 0)]);
+        assert!(state.color_for_roles("g", &["a".into()]).is_none());
+        assert!(state.color_for_roles("g", &[]).is_none());
+    }
+
+    #[test]
+    fn roles_from_another_guild_are_ignored() {
+        let mut state = AppState::default();
+        state.guild_roles.insert("g".into(), vec![role("a", "Admin", 3, 0xFF0000)]);
+        assert!(state.color_for_roles("other", &["a".into()]).is_none());
+        assert!(state.color_for_roles("g", &["unknown".into()]).is_none());
+    }
+
+    #[test]
+    fn role_colour_decodes_rgb_channels_in_order() {
+        assert_eq!(role("a", "a", 0, 0x336699).rgba(), Some([0x33 as f32 / 255.0, 0x66 as f32 / 255.0, 0x99 as f32 / 255.0, 1.0]));
+        assert_eq!(role("a", "a", 0, 0).rgba(), None, "colour 0 means inherit, not black");
+    }
+
+    #[test]
+    fn the_role_name_map_carries_colours() {
+        let mut state = AppState::default();
+        state.selected_guild = Some("g".into());
+        state.guild_roles.insert("g".into(), vec![role("r", "Mods", 2, 0xFF0000), role("p", "Plain", 1, 0)]);
+        let map = state.role_name_map();
+        assert_eq!(map.get("r").map(|(n, c)| (n.as_str(), c.is_some())), Some(("Mods", true)));
+        assert_eq!(map.get("p").map(|(n, c)| (n.as_str(), c.is_some())), Some(("Plain", false)));
+    }
+
+    #[test]
+    fn the_role_name_map_is_empty_in_a_dm() {
+        let mut state = AppState::default();
+        state.guild_roles.insert("g".into(), vec![role("r", "Mods", 2, 0xFF0000)]);
+        state.selected_guild = None;
+        assert!(state.role_name_map().is_empty());
+    }
+
+    fn unicode_emoji(name: &str) -> rustcord_client::models::ReactionEmoji {
+        rustcord_client::models::ReactionEmoji { id: None, name: Some(name.into()), animated: false }
+    }
+
+    fn custom_emoji(name: &str, id: &str) -> rustcord_client::models::ReactionEmoji {
+        rustcord_client::models::ReactionEmoji { id: Some(id.into()), name: Some(name.into()), animated: false }
+    }
+
+    #[test]
+    fn a_first_reaction_creates_the_entry() {
+        let mut reactions = Vec::new();
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), false, true);
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].count, 1);
+        assert!(!reactions[0].me);
+    }
+
+    #[test]
+    fn my_own_reaction_sets_the_me_flag() {
+        let mut reactions = Vec::new();
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), true, true);
+        assert!(reactions[0].me);
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), false, true);
+        assert_eq!(reactions[0].count, 2);
+        assert!(reactions[0].me, "another user reacting must not clear my flag");
+    }
+
+    #[test]
+    fn removing_the_last_reaction_drops_the_entry() {
+        let mut reactions = Vec::new();
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), true, true);
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), true, false);
+        assert!(reactions.is_empty(), "a zero-count reaction must not linger: {reactions:?}");
+    }
+
+    #[test]
+    fn removing_one_of_several_keeps_the_entry() {
+        let mut reactions = Vec::new();
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), false, true);
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), true, true);
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), true, false);
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].count, 1);
+        assert!(!reactions[0].me, "my flag should clear when I remove mine");
+    }
+
+    #[test]
+    fn a_remove_for_an_absent_emoji_is_ignored() {
+        let mut reactions = Vec::new();
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), true, false);
+        assert!(reactions.is_empty());
+    }
+
+    #[test]
+    fn a_count_never_underflows() {
+        let mut reactions = vec![rustcord_client::models::Reaction {
+            emoji: unicode_emoji("\u{1F44D}"),
+            count: 0,
+            me: false,
+        }];
+        apply_reaction_to(&mut reactions, unicode_emoji("\u{1F44D}"), false, false);
+        assert!(reactions.is_empty());
+    }
+
+    #[test]
+    fn custom_and_unicode_emoji_with_the_same_name_are_distinct() {
+        let mut reactions = Vec::new();
+        apply_reaction_to(&mut reactions, unicode_emoji("smile"), false, true);
+        apply_reaction_to(&mut reactions, custom_emoji("smile", "123"), false, true);
+        assert_eq!(reactions.len(), 2, "id must participate in identity: {reactions:?}");
+    }
+
+    #[test]
+    fn the_rest_path_for_a_custom_emoji_includes_its_id() {
+        assert_eq!(custom_emoji("smile", "123").reaction_path(), "smile:123");
+        assert_eq!(unicode_emoji("\u{1F44D}").reaction_path(), "\u{1F44D}");
+    }
+
+    fn test_guild(id: &str, name: &str) -> rustcord_client::models::Guild {
+        rustcord_client::models::Guild { id: id.into(), name: name.into(), icon: None, unavailable: false }
+    }
+
+    #[test]
+    fn switcher_entries_cover_guilds_channels_and_dms() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g1", "My Server"));
+        state.guild_channels.insert("g1".into(), vec![guild_channel("c1", "g1", "general")]);
+        state.dm_channels.push(Channel {
+            id: "d1".into(),
+            kind: ChannelType::Dm,
+            guild_id: None,
+            name: None,
+            topic: None,
+            position: None,
+            parent_id: None,
+            recipients: vec![rustcord_client::models::User {
+                id: "u1".into(),
+                username: "friend".into(),
+                global_name: None,
+                discriminator: "0".into(),
+                avatar: None,
+                bot: false,
+            }],
+            last_message_id: None,
+            permission_overwrites: Vec::new(),
+        });
+
+        let entries = state.switcher_entries();
+        let labels: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        assert!(labels.contains(&"My Server"), "{labels:?}");
+        assert!(labels.contains(&"#general"), "{labels:?}");
+        assert!(labels.contains(&"friend"), "{labels:?}");
+    }
+
+    #[test]
+    fn switcher_skips_voice_and_category_channels() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g1", "S"));
+        let mut voice = guild_channel("v1", "g1", "Lobby");
+        voice.kind = ChannelType::GuildVoice;
+        let mut category = guild_channel("cat1", "g1", "TEXT");
+        category.kind = ChannelType::GuildCategory;
+        state.guild_channels.insert("g1".into(), vec![voice, category, guild_channel("c1", "g1", "general")]);
+
+        let labels: Vec<String> = state.switcher_entries().into_iter().map(|e| e.label).collect();
+        assert!(labels.contains(&"#general".to_string()), "{labels:?}");
+        assert!(!labels.iter().any(|l| l.contains("Lobby")), "voice channel leaked: {labels:?}");
+        assert!(!labels.iter().any(|l| l.contains("TEXT")), "category leaked: {labels:?}");
+    }
+
+    #[test]
+    fn a_channel_entry_carries_its_guild_for_switching() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g1", "S"));
+        state.guild_channels.insert("g1".into(), vec![guild_channel("c1", "g1", "general")]);
+        let entry = state.switcher_entries().into_iter().find(|e| e.label == "#general").expect("the channel");
+        assert_eq!(
+            entry.target,
+            crate::switcher::Target::Channel { guild_id: "g1".into(), channel_id: "c1".into() },
+            "a channel in another guild must switch guild too"
+        );
+    }
+
+    #[test]
+    fn a_guild_with_no_loaded_channels_still_appears() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g1", "Unloaded"));
+        let labels: Vec<String> = state.switcher_entries().into_iter().map(|e| e.label).collect();
+        assert_eq!(labels, vec!["Unloaded".to_string()]);
     }
 }

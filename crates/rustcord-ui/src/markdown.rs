@@ -24,6 +24,36 @@ pub enum Span {
     CustomEmoji { name: String, id: String, animated: bool },
     UnicodeEmoji { ch: char },
     Mention { user_id: String },
+    ChannelMention { channel_id: String },
+    RoleMention { role_id: String },
+    EveryoneMention { here: bool },
+    Timestamp { unix: i64, style: TimestampStyle },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampStyle {
+    ShortTime,
+    LongTime,
+    ShortDate,
+    LongDate,
+    ShortDateTime,
+    LongDateTime,
+    Relative,
+}
+
+impl TimestampStyle {
+    fn from_flag(flag: Option<char>) -> Option<Self> {
+        Some(match flag {
+            Some('t') => Self::ShortTime,
+            Some('T') => Self::LongTime,
+            Some('d') => Self::ShortDate,
+            Some('D') => Self::LongDate,
+            None | Some('f') => Self::ShortDateTime,
+            Some('F') => Self::LongDateTime,
+            Some('R') => Self::Relative,
+            Some(_) => return None,
+        })
+    }
 }
 
 pub fn parse(input: &str) -> Vec<Block> {
@@ -121,9 +151,15 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
             i += consumed;
             continue;
         }
-        if let Some((user_id, consumed)) = try_parse_mention(&chars[i..]) {
+        if let Some((span, consumed)) = try_parse_tag(&chars[i..]) {
             flush!();
-            spans.push(Span::Mention { user_id });
+            spans.push(span);
+            i += consumed;
+            continue;
+        }
+        if let Some((span, consumed)) = try_parse_everyone(&chars[i..]) {
+            flush!();
+            spans.push(span);
             i += consumed;
             continue;
         }
@@ -154,12 +190,20 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
                 continue;
             }
         }
-        if chars[i..].starts_with(&['*', '*']) || chars[i..].starts_with(&['_', '_']) {
-            let marker = chars[i];
-            if let Some(end) = find_matching_pair(&chars, i + 2, marker) {
+        if chars[i..].starts_with(&['*', '*']) {
+            if let Some(end) = find_matching_pair(&chars, i + 2, '*') {
                 flush!();
                 let inner: String = chars[i + 2..end].iter().collect();
                 render_nested(&inner, Style { bold: true, ..style }, &mut spans);
+                i = end + 2;
+                continue;
+            }
+        }
+        if chars[i..].starts_with(&['_', '_']) {
+            if let Some(end) = find_matching_pair(&chars, i + 2, '_') {
+                flush!();
+                let inner: String = chars[i + 2..end].iter().collect();
+                render_nested(&inner, Style { underline: true, ..style }, &mut spans);
                 i = end + 2;
                 continue;
             }
@@ -186,7 +230,7 @@ pub fn parse_spans(text: &str) -> Vec<Span> {
             if let Some(end) = find_matching(&chars, i + 1, '_') {
                 flush!();
                 let inner: String = chars[i + 1..end].iter().collect();
-                render_nested(&inner, Style { underline: true, ..style }, &mut spans);
+                render_nested(&inner, Style { italic: true, ..style }, &mut spans);
                 i = end + 1;
                 continue;
             }
@@ -258,28 +302,102 @@ fn find_matching_pair(chars: &[char], start: usize, marker: char) -> Option<usiz
     None
 }
 
-fn try_parse_mention(chars: &[char]) -> Option<(String, usize)> {
-    let mut j = 0;
+fn try_parse_tag(chars: &[char]) -> Option<(Span, usize)> {
     if chars.first() != Some(&'<') {
         return None;
     }
-    j += 1;
-    if chars.get(j) != Some(&'@') {
-        return None;
-    }
-    j += 1;
-    if chars.get(j) == Some(&'!') {
+    let mut j = 1;
+    let span_kind = match chars.get(j)? {
+        '#' => {
+            j += 1;
+            TagKind::Channel
+        }
+        '@' => {
+            j += 1;
+            match chars.get(j) {
+                Some('&') => {
+                    j += 1;
+                    TagKind::Role
+                }
+                Some('!') => {
+                    j += 1;
+                    TagKind::User
+                }
+                _ => TagKind::User,
+            }
+        }
+        't' if chars.get(j + 1) == Some(&':') => {
+            j += 2;
+            TagKind::Timestamp
+        }
+        _ => return None,
+    };
+
+    let digits_start = j;
+    if span_kind == TagKind::Timestamp && chars.get(j) == Some(&'-') {
         j += 1;
     }
-    let id_start = j;
+    let num_start = j;
     while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
         j += 1;
     }
-    if j == id_start || chars.get(j) != Some(&'>') {
+    if j == num_start {
         return None;
     }
-    let user_id: String = chars[id_start..j].iter().collect();
-    Some((user_id, j + 1))
+    let digits: String = chars[digits_start..j].iter().collect();
+
+    if span_kind == TagKind::Timestamp {
+        let flag = match chars.get(j) {
+            Some('>') => None,
+            Some(':') => {
+                let f = *chars.get(j + 1)?;
+                j += 2;
+                Some(f)
+            }
+            _ => return None,
+        };
+        if chars.get(j) != Some(&'>') {
+            return None;
+        }
+        let unix = digits.parse::<i64>().ok()?;
+        let style = TimestampStyle::from_flag(flag)?;
+        return Some((Span::Timestamp { unix, style }, j + 1));
+    }
+
+    if chars.get(j) != Some(&'>') {
+        return None;
+    }
+    let span = match span_kind {
+        TagKind::User => Span::Mention { user_id: digits },
+        TagKind::Channel => Span::ChannelMention { channel_id: digits },
+        TagKind::Role => Span::RoleMention { role_id: digits },
+        TagKind::Timestamp => unreachable!("handled above"),
+    };
+    Some((span, j + 1))
+}
+
+#[derive(PartialEq, Eq)]
+enum TagKind {
+    User,
+    Channel,
+    Role,
+    Timestamp,
+}
+
+fn try_parse_everyone(chars: &[char]) -> Option<(Span, usize)> {
+    if chars.first() != Some(&'@') {
+        return None;
+    }
+    for (word, here) in [("everyone", false), ("here", true)] {
+        let len = word.len() + 1;
+        if chars.len() >= len && chars[1..len].iter().copied().eq(word.chars()) {
+            if chars.get(len).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+                continue;
+            }
+            return Some((Span::EveryoneMention { here }, len));
+        }
+    }
+    None
 }
 
 fn try_parse_custom_emoji(chars: &[char]) -> Option<(String, String, bool, usize)> {
@@ -507,5 +625,143 @@ normal again");
     #[test]
     fn scheme_without_a_host_is_not_a_link() {
         assert!(links("https://").is_empty());
+    }
+
+    #[test]
+    fn single_underscore_is_italic_not_underline() {
+        let spans = parse_spans("_hi_");
+        let Span::Text { style, .. } = &spans[0] else { panic!("{spans:?}") };
+        assert!(style.italic, "expected italic, got {style:?}");
+        assert!(!style.underline);
+    }
+
+    #[test]
+    fn double_underscore_is_underline_not_bold() {
+        let spans = parse_spans("__hi__");
+        let Span::Text { style, .. } = &spans[0] else { panic!("{spans:?}") };
+        assert!(style.underline, "expected underline, got {style:?}");
+        assert!(!style.bold);
+    }
+
+    #[test]
+    fn asterisk_emphasis_is_unchanged() {
+        let one = parse_spans("*hi*");
+        let Span::Text { style, .. } = &one[0] else { panic!() };
+        assert!(style.italic && !style.underline);
+        let two = parse_spans("**hi**");
+        let Span::Text { style, .. } = &two[0] else { panic!() };
+        assert!(style.bold && !style.underline);
+    }
+
+    #[test]
+    fn mixed_underscore_and_asterisk_nest() {
+        let spans = parse_spans("__*x*__");
+        let Span::Text { style, .. } = &spans[0] else { panic!("{spans:?}") };
+        assert!(style.underline && style.italic);
+    }
+
+    #[test]
+    fn parses_user_mention_both_forms() {
+        for src in ["<@123>", "<@!123>"] {
+            let spans = parse_spans(src);
+            assert!(matches!(&spans[0], Span::Mention { user_id } if user_id == "123"), "{src}: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn parses_channel_and_role_mentions() {
+        let spans = parse_spans("<#456>");
+        assert!(matches!(&spans[0], Span::ChannelMention { channel_id } if channel_id == "456"), "{spans:?}");
+        let spans = parse_spans("<@&789>");
+        assert!(matches!(&spans[0], Span::RoleMention { role_id } if role_id == "789"), "{spans:?}");
+    }
+
+    #[test]
+    fn role_mention_is_not_read_as_a_user() {
+        let spans = parse_spans("<@&789>");
+        assert!(!matches!(&spans[0], Span::Mention { .. }), "{spans:?}");
+    }
+
+    #[test]
+    fn parses_everyone_and_here() {
+        assert!(matches!(&parse_spans("@everyone")[0], Span::EveryoneMention { here: false }));
+        assert!(matches!(&parse_spans("@here")[0], Span::EveryoneMention { here: true }));
+    }
+
+    #[test]
+    fn everyone_requires_a_word_boundary() {
+        for src in ["@everyonewins", "@here2", "@everyone_x"] {
+            let spans = parse_spans(src);
+            assert!(
+                !spans.iter().any(|s| matches!(s, Span::EveryoneMention { .. })),
+                "{src} should not be a mention: {spans:?}"
+            );
+        }
+        let spans = parse_spans("@everyone!");
+        assert!(matches!(&spans[0], Span::EveryoneMention { here: false }), "{spans:?}");
+    }
+
+    #[test]
+    fn parses_timestamp_styles() {
+        use TimestampStyle::*;
+        for (src, want) in [
+            ("<t:1730000000>", ShortDateTime),
+            ("<t:1730000000:f>", ShortDateTime),
+            ("<t:1730000000:t>", ShortTime),
+            ("<t:1730000000:T>", LongTime),
+            ("<t:1730000000:d>", ShortDate),
+            ("<t:1730000000:D>", LongDate),
+            ("<t:1730000000:F>", LongDateTime),
+            ("<t:1730000000:R>", Relative),
+        ] {
+            let spans = parse_spans(src);
+            let Span::Timestamp { unix, style } = &spans[0] else { panic!("{src}: {spans:?}") };
+            assert_eq!(*unix, 1730000000, "{src}");
+            assert_eq!(*style, want, "{src}");
+        }
+    }
+
+    #[test]
+    fn timestamp_accepts_negative_and_rejects_bad_style() {
+        let spans = parse_spans("<t:-86400:R>");
+        assert!(matches!(&spans[0], Span::Timestamp { unix: -86400, .. }), "{spans:?}");
+        let spans = parse_spans("<t:1730000000:Z>");
+        assert!(!spans.iter().any(|s| matches!(s, Span::Timestamp { .. })), "{spans:?}");
+    }
+
+    #[test]
+    fn malformed_tags_stay_literal() {
+        for src in ["<@>", "<#>", "<@&>", "<@abc>", "<t:>", "<t:abc>", "<@123", "<#123"] {
+            let spans = parse_spans(src);
+            let is_tag = spans.iter().any(|s| {
+                matches!(
+                    s,
+                    Span::Mention { .. } | Span::ChannelMention { .. } | Span::RoleMention { .. } | Span::Timestamp { .. }
+                )
+            });
+            assert!(!is_tag, "{src} should stay literal: {spans:?}");
+        }
+    }
+
+    #[test]
+    fn custom_emoji_still_wins_over_tag_parser() {
+        let spans = parse_spans("<:smile:12345>");
+        assert!(matches!(&spans[0], Span::CustomEmoji { .. }), "{spans:?}");
+    }
+
+    #[test]
+    fn mentions_parse_inline_with_surrounding_text() {
+        let spans = parse_spans("hey <@1> look at <#2> re <@&3>");
+        let kinds: Vec<&str> = spans
+            .iter()
+            .map(|s| match s {
+                Span::Text { .. } => "text",
+                Span::Mention { .. } => "user",
+                Span::ChannelMention { .. } => "channel",
+                Span::RoleMention { .. } => "role",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "user", "text", "channel", "text", "role"], "{spans:?}");
     }
 }

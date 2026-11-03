@@ -23,6 +23,7 @@ Use at your own risk.
 - [x] TOML-based theming (switchable live from Settings)
 - [x] Persisted login (OS keychain)
 - [x] Markdown: bold, italic, strikethrough, underline, spoilers, blockquotes, headers, inline/block code, links
+- [x] Mentions: users, channels, roles, `@everyone`/`@here`, and `<t:>` timestamps
 - [x] Typing indicators (send + receive)
 - [x] Real avatars (users) and guild icons
 - [x] User bar with settings dialog (account info, logout, theme switcher)
@@ -44,7 +45,7 @@ Use at your own risk.
 - [x] Server users panel (low priority)
 - [x] VC Leave/Join sound
 - [x] Inline video attachment playback (optional `video` feature, needs ffmpeg)
-- [ ] Reactions
+- [x] Reactions
 - [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
 - [x] Message read status sync
 - [ ] performance improvements in voice calls (SSRC decoder leak fixed; re-measure CPU)

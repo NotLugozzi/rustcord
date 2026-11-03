@@ -203,6 +203,23 @@ pub struct Role {
     #[serde(deserialize_with = "deserialize_permissions_bits")]
     pub permissions: u64,
     pub position: i32,
+    #[serde(default)]
+    pub color: u32,
+}
+
+impl Role {
+    pub fn rgba(&self) -> Option<[f32; 4]> {
+        if self.color == 0 {
+            return None;
+        }
+        let c = self.color;
+        Some([
+            ((c >> 16) & 255) as f32 / 255.0,
+            ((c >> 8) & 255) as f32 / 255.0,
+            (c & 255) as f32 / 255.0,
+            1.0,
+        ])
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -221,14 +238,59 @@ pub struct SelfGuildMember {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReactionEmoji {
+    pub id: Option<Snowflake>,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub animated: bool,
+}
+
+impl ReactionEmoji {
+    pub fn key(&self) -> String {
+        match (&self.id, &self.name) {
+            (Some(id), Some(name)) => format!("{name}:{id}"),
+            (Some(id), None) => format!(":{id}"),
+            (None, Some(name)) => name.clone(),
+            (None, None) => String::new(),
+        }
+    }
+
+    pub fn reaction_path(&self) -> String {
+        match &self.id {
+            Some(id) => format!("{}:{}", self.name.as_deref().unwrap_or("_"), id),
+            None => self.name.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Reaction {
+    pub emoji: ReactionEmoji,
+    pub count: u32,
+    #[serde(default)]
+    pub me: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PartialMember {
+    pub nick: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<Snowflake>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message {
     pub id: Snowflake,
     pub channel_id: Snowflake,
     pub guild_id: Option<Snowflake>,
     pub author: User,
+    #[serde(default)]
+    pub member: Option<PartialMember>,
     pub content: String,
     pub timestamp: String,
     pub edited_timestamp: Option<String>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
     #[serde(default)]
     pub attachments: Vec<Attachment>,
     #[serde(default)]

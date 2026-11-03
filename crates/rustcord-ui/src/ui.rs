@@ -40,6 +40,13 @@ fn same_group_window(a: &str, b: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub struct MentionCtx<'a> {
+    pub known_users: &'a HashMap<String, rustcord_client::models::User>,
+    pub profiles_requested: &'a mut std::collections::HashSet<String>,
+    pub channel_names: &'a HashMap<String, String>,
+    pub role_names: &'a HashMap<String, (String, Option<[f32; 4]>)>,
+}
+
 fn draw_markdown(
     ui: &Ui,
     fonts: &Fonts,
@@ -49,13 +56,12 @@ fn draw_markdown(
     id_seed: &str,
     textures: &mut TextureCache,
     cmd_tx: &UnboundedSender<UiCommand>,
-    known_users: &HashMap<String, rustcord_client::models::User>,
-    profiles_requested: &mut std::collections::HashSet<String>,
+    mentions: &mut MentionCtx,
 ) {
     let blocks = markdown::parse(content);
     for (block_idx, block) in blocks.iter().enumerate() {
         match block {
-            Block::Paragraph(spans) => draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested),
+            Block::Paragraph(spans) => draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions),
             Block::Heading { level, spans } => {
                 let font = match level {
                     1 => fonts.bold,
@@ -69,14 +75,14 @@ fn draw_markdown(
                 };
                 let token = ui.push_font(font);
                 ui.set_window_font_scale(scale);
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
                 ui.set_window_font_scale(1.0);
                 token.pop();
             }
             Block::Subtext(spans) => {
                 let color = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
                 ui.set_window_font_scale(0.85);
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
                 ui.set_window_font_scale(1.0);
                 color.pop();
             }
@@ -84,7 +90,7 @@ fn draw_markdown(
                 let token = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
                 ui.text("| ");
                 ui.same_line();
-                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, known_users, profiles_requested);
+                draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
                 token.pop();
             }
             Block::CodeBlock { code, language } => {
@@ -119,8 +125,7 @@ fn draw_spans(
     block_idx: usize,
     textures: &mut TextureCache,
     cmd_tx: &UnboundedSender<UiCommand>,
-    known_users: &HashMap<String, rustcord_client::models::User>,
-    profiles_requested: &mut std::collections::HashSet<String>,
+    mentions: &mut MentionCtx,
 ) {
     for (span_idx, span) in spans.iter().enumerate() {
         if span_idx > 0 {
@@ -144,13 +149,12 @@ fn draw_spans(
                 draw_styled_text(ui, fonts, theme, text, *style);
             }
             Span::Link { label, url } => {
-                let color = ui.push_style_color(imgui::StyleColor::Text, theme.accent);
-                if ui.selectable(label) {
+                let shown = if label == url { elide_url(label) } else { label.clone() };
+                if clickable_text_wrapping(ui, &format!("link_{id_seed}_{block_idx}_{span_idx}"), &shown, theme.accent) {
                     let _ = open::that(url);
                 }
-                color.pop();
                 if ui.is_item_hovered() {
-                    ui.tooltip_text(url);
+                    ui.tooltip_text(elide_url(url));
                 }
             }
             Span::CustomEmoji { name, id, animated } => {
@@ -173,20 +177,38 @@ fn draw_spans(
                 }
             }
             Span::Mention { user_id } => {
-                let name = known_users.get(user_id).map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()));
-                if name.is_none() && profiles_requested.insert(user_id.clone()) {
+                let name = mentions.known_users.get(user_id).map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()));
+                if name.is_none() && mentions.profiles_requested.insert(user_id.clone()) {
                     let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user_id.clone() });
                 }
-                let label = format!("@{}", name.as_deref().unwrap_or(user_id));
-                let bg = ui.push_style_color(imgui::StyleColor::Button, [theme.accent[0], theme.accent[1], theme.accent[2], 0.25]);
-                let text = ui.push_style_color(imgui::StyleColor::Text, theme.accent);
-                let font = ui.push_font(fonts.bold);
-                ui.small_button(&label);
-                font.pop();
-                text.pop();
-                bg.pop();
+                mention_pill(ui, fonts, theme, &format!("@{}", name.as_deref().unwrap_or(user_id)));
                 if ui.is_item_hovered() {
-                    ui.tooltip_text(format!("@{}", known_users.get(user_id).map(|u| u.username.as_str()).unwrap_or(user_id)));
+                    ui.tooltip_text(format!("@{}", mentions.known_users.get(user_id).map(|u| u.username.as_str()).unwrap_or(user_id)));
+                }
+            }
+            Span::ChannelMention { channel_id } => {
+                let label = match mentions.channel_names.get(channel_id) {
+                    Some(name) => format!("#{name}"),
+                    None => format!("#{channel_id}"),
+                };
+                mention_pill(ui, fonts, theme, &label);
+            }
+            Span::RoleMention { role_id } => {
+                let (label, color) = match mentions.role_names.get(role_id) {
+                    Some((name, color)) => (format!("@{name}"), color.unwrap_or(theme.accent)),
+                    None => ("@unknown-role".to_string(), theme.accent),
+                };
+                mention_pill_colored(ui, fonts, &label, color);
+            }
+            Span::EveryoneMention { here } => {
+                mention_pill(ui, fonts, theme, if *here { "@here" } else { "@everyone" });
+            }
+            Span::Timestamp { unix, style } => {
+                let token = ui.push_style_color(imgui::StyleColor::Button, theme.panel);
+                ui.small_button(format_discord_timestamp(*unix, *style));
+                token.pop();
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(format_discord_timestamp(*unix, markdown::TimestampStyle::LongDateTime));
                 }
             }
         }
@@ -224,6 +246,95 @@ fn draw_unicode_emoji(ui: &Ui, textures: &TextureCache, ch: char, display_size: 
             true
         }
         EmojiTexture::Failed => false,
+    }
+}
+
+const REACTION_EMOJI_SIZE: f32 = 20.0;
+const REACTION_PILL_PAD_X: f32 = 6.0;
+const REACTION_PILL_PAD_Y: f32 = 2.0;
+const REACTION_PILL_GAP: f32 = 4.0;
+
+fn reaction_pill_width(count_width: f32) -> f32 {
+    REACTION_PILL_PAD_X * 2.0 + REACTION_EMOJI_SIZE + REACTION_PILL_GAP + count_width
+}
+
+fn draw_reaction_row(
+    ui: &Ui,
+    theme: &crate::theme::Theme,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    msg: &rustcord_client::models::Message,
+) {
+    if msg.reactions.is_empty() {
+        return;
+    }
+    ui.dummy([0.0, 2.0]);
+    let max_x = ui.window_content_region_max()[0];
+    for (idx, reaction) in msg.reactions.iter().enumerate() {
+        let count = reaction.count.to_string();
+        let pill_width = reaction_pill_width(ui.calc_text_size(&count)[0]);
+        let pill_height = REACTION_EMOJI_SIZE + REACTION_PILL_PAD_Y * 2.0;
+        if idx > 0 {
+            ui.same_line();
+            if ui.cursor_pos()[0] + pill_width > max_x {
+                ui.new_line();
+            }
+        }
+        let bg = if reaction.me {
+            [theme.accent[0], theme.accent[1], theme.accent[2], 0.35]
+        } else {
+            [theme.text_muted[0], theme.text_muted[1], theme.text_muted[2], 0.15]
+        };
+        let bg_token = ui.push_style_color(imgui::StyleColor::ChildBg, bg);
+        let id = format!("reaction_{}_{idx}", msg.id);
+        let rounding = ui.push_style_var(imgui::StyleVar::ChildRounding(pill_height / 2.0));
+        let padding = ui.push_style_var(imgui::StyleVar::WindowPadding([REACTION_PILL_PAD_X, REACTION_PILL_PAD_Y]));
+        let spacing = ui.push_style_var(imgui::StyleVar::ItemSpacing([REACTION_PILL_GAP, 0.0]));
+        ui.child_window(&id)
+            .size([pill_width, pill_height])
+            .always_use_window_padding(true)
+            .build(|| {
+                let row_top = ui.cursor_pos()[1];
+                match (&reaction.emoji.id, &reaction.emoji.name) {
+                    (Some(emoji_id), _) => {
+                        let ext = if reaction.emoji.animated { "gif" } else { "png" };
+                        let url = format!("https://cdn.discordapp.com/emojis/{emoji_id}.{ext}?size=32");
+                        if let Some((texture_id, _)) = textures.get(&url) {
+                            imgui::Image::new(texture_id, [REACTION_EMOJI_SIZE, REACTION_EMOJI_SIZE]).build(ui);
+                        } else {
+                            textures.request(&url, cmd_tx);
+                            ui.dummy([REACTION_EMOJI_SIZE, REACTION_EMOJI_SIZE]);
+                        }
+                    }
+                    (None, Some(name)) => {
+                        let ch = name.chars().next().unwrap_or('?');
+                        if !draw_unicode_emoji(ui, textures, ch, [REACTION_EMOJI_SIZE, REACTION_EMOJI_SIZE]) {
+                            ui.text(name);
+                        }
+                    }
+                    (None, None) => ui.dummy([REACTION_EMOJI_SIZE, REACTION_EMOJI_SIZE]),
+                }
+                ui.same_line();
+                let text_y = row_top + (REACTION_EMOJI_SIZE - ui.text_line_height()) / 2.0;
+                ui.set_cursor_pos([ui.cursor_pos()[0], text_y]);
+                ui.text_colored(if reaction.me { theme.accent } else { theme.text_muted }, &count);
+            });
+        spacing.pop();
+        padding.pop();
+        rounding.pop();
+        bg_token.pop();
+        if ui.is_item_clicked() {
+            let _ = cmd_tx.send(UiCommand::ToggleReaction {
+                channel_id: msg.channel_id.clone(),
+                message_id: msg.id.clone(),
+                emoji: reaction.emoji.reaction_path(),
+                add: !reaction.me,
+            });
+        }
+        if ui.is_item_hovered() {
+            let label = reaction.emoji.name.clone().unwrap_or_default();
+            ui.tooltip_text(format!(":{label}: \u{00d7} {}", reaction.count));
+        }
     }
 }
 
@@ -337,6 +448,31 @@ fn draw_circular_image_button_placeholder(ui: &Ui, id: &str, label: &str, size: 
     clicked
 }
 
+fn truncate_measured(text: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> Option<String> {
+    if measure(text) <= max_width {
+        return None;
+    }
+    let ellipsis = '\u{2026}';
+    let budget = max_width - measure(&ellipsis.to_string());
+    if budget <= 0.0 {
+        return Some(ellipsis.to_string());
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        out.push(ch);
+        if measure(&out) > budget {
+            out.pop();
+            break;
+        }
+    }
+    out.push(ellipsis);
+    Some(out)
+}
+
+fn truncate_to_width(ui: &Ui, text: &str, max_width: f32) -> Option<String> {
+    truncate_measured(text, max_width, |s| ui.calc_text_size(s)[0])
+}
+
 fn clickable_text(ui: &Ui, id: &str, text: &str, color: [f32; 4]) -> bool {
     let start = ui.cursor_pos();
     ui.text_colored(color, text);
@@ -346,6 +482,86 @@ fn clickable_text(ui: &Ui, id: &str, text: &str, color: [f32; 4]) -> bool {
     ui.set_cursor_pos(start);
     ui.text_colored(color, text);
     clicked
+}
+
+fn clickable_text_wrapping(ui: &Ui, id: &str, text: &str, color: [f32; 4]) -> bool {
+    let width = ui.calc_text_size(text)[0];
+    let max_x = ui.window_content_region_max()[0];
+    if ui.cursor_pos()[0] + width > max_x && width <= max_x {
+        ui.new_line();
+    }
+    clickable_text(ui, id, text, color)
+}
+
+fn mention_pill(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, label: &str) {
+    mention_pill_colored(ui, fonts, label, theme.accent);
+}
+
+fn mention_pill_colored(ui: &Ui, fonts: &Fonts, label: &str, color: [f32; 4]) {
+    let width = ui.calc_text_size(label)[0] + ui.clone_style().frame_padding[0] * 2.0;
+    let max_x = ui.window_content_region_max()[0];
+    if ui.cursor_pos()[0] + width > max_x && width <= max_x {
+        ui.new_line();
+    }
+    let bg = ui.push_style_color(imgui::StyleColor::Button, [color[0], color[1], color[2], 0.25]);
+    let text = ui.push_style_color(imgui::StyleColor::Text, color);
+    let font = ui.push_font(fonts.bold);
+    ui.small_button(label);
+    font.pop();
+    text.pop();
+    bg.pop();
+}
+
+fn format_discord_timestamp(unix: i64, style: markdown::TimestampStyle) -> String {
+    use markdown::TimestampStyle as T;
+    let Some(dt) = chrono::DateTime::from_timestamp(unix, 0) else {
+        return format!("<invalid timestamp {unix}>");
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    match style {
+        T::ShortTime => local.format("%H:%M").to_string(),
+        T::LongTime => local.format("%H:%M:%S").to_string(),
+        T::ShortDate => local.format("%d/%m/%Y").to_string(),
+        T::LongDate => local.format("%-d %B %Y").to_string(),
+        T::ShortDateTime => local.format("%-d %B %Y %H:%M").to_string(),
+        T::LongDateTime => local.format("%A, %-d %B %Y %H:%M").to_string(),
+        T::Relative => format_relative(unix),
+    }
+}
+
+fn format_relative(unix: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let delta = unix - now;
+    let secs = delta.unsigned_abs();
+    let (n, unit) = match secs {
+        0..=44 => (secs.max(1), "second"),
+        45..=2699 => ((secs + 30) / 60, "minute"),
+        2700..=86_399 => ((secs + 1800) / 3600, "hour"),
+        86_400..=2_591_999 => ((secs + 43_200) / 86_400, "day"),
+        2_592_000..=31_535_999 => ((secs + 1_296_000) / 2_592_000, "month"),
+        _ => ((secs + 15_768_000) / 31_536_000, "year"),
+    };
+    let n = n.max(1);
+    let plural = if n == 1 { "" } else { "s" };
+    if delta <= 0 {
+        format!("{n} {unit}{plural} ago")
+    } else {
+        format!("in {n} {unit}{plural}")
+    }
+}
+
+fn elide_url(url: &str) -> String {
+    const MAX: usize = 72;
+    let trimmed = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    let head: String = trimmed.chars().take(MAX - 20).collect();
+    let tail: String = {
+        let chars: Vec<char> = trimmed.chars().collect();
+        chars[chars.len() - 16..].iter().collect()
+    };
+    format!("{head}\u{2026}{tail}")
 }
 
 const USER_ROW_AVATAR_SIZE: [f32; 2] = [28.0, 28.0];
@@ -383,6 +599,7 @@ fn draw_user_row(
     platform: Option<&str>,
     activity: Option<&str>,
     row_bg_color: [f32; 4],
+    name_color: Option<[f32; 4]>,
 ) -> UserRowResult {
     let row_start = ui.cursor_pos();
     let row_height = USER_ROW_AVATAR_SIZE[1] + 8.0;
@@ -420,7 +637,12 @@ fn draw_user_row(
         row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0
     };
     ui.set_cursor_pos([text_x, text_y]);
-    let name_clicked = clickable_text(ui, &format!("name_row_{}", user.id), name, ui.style_color(imgui::StyleColor::Text));
+    let name_clicked = clickable_text(
+        ui,
+        &format!("name_row_{}", user.id),
+        name,
+        name_color.unwrap_or_else(|| ui.style_color(imgui::StyleColor::Text)),
+    );
     if let Some(platform) = platform {
         ui.same_line();
         let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
@@ -1247,7 +1469,9 @@ fn draw_unicode_emoji_grid(ui: &Ui, textures: &TextureCache, group: Option<emoji
 
 fn draw_emoji_picker(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
     let mut insert: Option<String> = None;
+    let mut open = false;
     ui.popup("emoji_picker", || {
+        open = true;
         ui.set_next_item_width(EMOJI_PICKER_WIDTH);
         ui.input_text("##emoji_search", &mut state.emoji_picker_filter).hint("Search emoji...").build();
         let filter = state.emoji_picker_filter.to_lowercase();
@@ -1311,9 +1535,35 @@ fn draw_emoji_picker(ui: &Ui, state: &mut AppState, textures: &mut TextureCache,
                 }
             });
     });
+    if !open && insert.is_none() {
+        state.emoji_picker_target = None;
+    }
     if let Some(glyph) = insert {
-        state.compose_buf.push_str(&glyph);
-        state.focus_compose = true;
+        match state.emoji_picker_target.take() {
+            Some((channel_id, message_id)) => {
+                let _ = cmd_tx.send(UiCommand::ToggleReaction {
+                    channel_id,
+                    message_id,
+                    emoji: reaction_emoji_path(&glyph),
+                    add: true,
+                });
+            }
+            None => {
+                state.compose_buf.push_str(&glyph);
+                state.focus_compose = true;
+            }
+        }
+    }
+}
+
+fn reaction_emoji_path(picked: &str) -> String {
+    let Some(inner) = picked.strip_prefix('<').and_then(|r| r.strip_suffix('>')) else {
+        return picked.to_string();
+    };
+    let body = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':'));
+    match body.and_then(|rest| rest.split_once(':')) {
+        Some((name, id)) if !name.is_empty() && !id.is_empty() => format!("{name}:{id}"),
+        _ => picked.to_string(),
     }
 }
 
@@ -1631,6 +1881,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         return;
     }
 
+    if ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::K) {
+        state.switcher_open = true;
+        state.switcher_focus_input = true;
+        state.switcher_query.clear();
+        state.switcher_selected = 0;
+    }
     dispatch_keybinds(ui, state, cmd_tx);
 
     let [display_w, display_h] = ui.io().display_size;
@@ -1721,8 +1977,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         let is_unread = *visible && state.channel_is_unread(channel_id, last_message_id.as_deref());
                         let row_start = ui.cursor_screen_pos();
                         let _dim = (!visible).then(|| ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted));
+                        let label = format!("# {name}");
+                        let shown = truncate_to_width(ui, &label, ui.content_region_avail()[0]);
                         if *visible {
-                            if ui.selectable(format!("# {name}")) {
+                            let clicked = ui.selectable(shown.as_deref().unwrap_or(&label));
+                            if shown.is_some() && ui.is_item_hovered() {
+                                ui.tooltip_text(&label);
+                            }
+                            if clicked {
                                 let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
                                 state.selected_channel = Some(channel_id.clone());
                                 if let Some(last_id) = last_message_id {
@@ -1732,7 +1994,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 }
                             }
                         } else {
-                            ui.text(format!("# {name}"));
+                            ui.text(shown.as_deref().unwrap_or(&label));
                             if ui.is_item_hovered() {
                                 ui.tooltip_text("You don't have access to this channel");
                             }
@@ -1757,7 +2019,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     for (channel_id, name) in &voice_channels {
                         let is_connected = state.connected_voice_channel.as_ref() == Some(&(Some(guild_id.clone()), channel_id.clone()));
                         let label = if is_connected { format!("[voice] {name} (connected)") } else { format!("[voice] {name}") };
-                        if ui.selectable(label) && !is_connected && !state.voice_connecting {
+                        let shown = truncate_to_width(ui, &label, ui.content_region_avail()[0]);
+                        let clicked = ui.selectable(shown.as_deref().unwrap_or(&label));
+                        if shown.is_some() && ui.is_item_hovered() {
+                            ui.tooltip_text(&label);
+                        }
+                        if clicked && !is_connected && !state.voice_connecting {
                             let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
                             state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
                         }
@@ -1867,6 +2134,34 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_settings_dialog(ui, state, cmd_tx, textures);
     draw_profile_popout(ui, state, cmd_tx, textures);
 
+    let mut open_emoji_picker = false;
+    let channel_names = state.channel_name_map();
+    let role_names = state.role_name_map();
+    let author_colors: HashMap<String, Option<[f32; 4]>> = match state.selected_guild.clone() {
+        Some(guild_id) => {
+            let mut roles_by_author: HashMap<String, Vec<String>> = HashMap::new();
+            for msg in state.active_messages() {
+                if let Some(member) = &msg.member {
+                    roles_by_author.insert(msg.author.id.clone(), member.roles.clone());
+                } else if !roles_by_author.contains_key(&msg.author.id) {
+                    roles_by_author.insert(msg.author.id.clone(), Vec::new());
+                }
+            }
+            roles_by_author
+                .into_iter()
+                .map(|(id, role_ids)| {
+                    let color = if role_ids.is_empty() {
+                        state.member_color(&guild_id, &id)
+                    } else {
+                        state.color_for_roles(&guild_id, &role_ids)
+                    };
+                    (id, color)
+                })
+                .collect()
+        }
+        None => HashMap::new(),
+    };
+
     let members_panel_open = state.show_members_panel && state.selected_guild.is_some();
     let members_panel_width = if members_panel_open { MEMBERS_PANEL_WIDTH } else { 0.0 };
 
@@ -1897,7 +2192,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if state.selected_guild.is_some() {
                 let button_label = if state.show_members_panel { "Members >" } else { "< Members" };
                 let button_width = ui.calc_text_size(button_label)[0] + 20.0;
-                ui.set_cursor_pos([ui.content_region_avail()[0] - button_width, 4.0]);
+                ui.set_cursor_pos([ui.window_size()[0] - button_width - 16.0, 4.0]);
                 if ui.button(button_label) {
                     state.show_members_panel = !state.show_members_panel;
                     if state.show_members_panel {
@@ -2003,7 +2298,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
                             ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
-                                if clickable_text(ui, &format!("name_{}", msg.id), &author, state.theme.accent) {
+                                let author_color = author_colors.get(&msg.author.id).copied().flatten().unwrap_or(state.theme.accent);
+                                if clickable_text(ui, &format!("name_{}", msg.id), &author, author_color) {
                                     state.profile_popout = Some(msg.author.clone());
                                 }
                                 ui.same_line();
@@ -2015,17 +2311,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 token.pop();
 
                                 if !msg.content.is_empty() {
-                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &state.known_users, &mut state.profiles_requested);
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
-                                    draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &state.known_users, &mut state.profiles_requested);
+                                    draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
+                                draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
 
                             let group_height = AVATAR_SIZE[1].max(ui.item_rect_size()[1]);
@@ -2034,17 +2331,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
                                 if !msg.content.is_empty() {
-                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &state.known_users, &mut state.profiles_requested);
+                                    draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                     if msg.edited_timestamp.is_some() {
                                         ui.text_colored(state.theme.text_muted, "(edited)");
                                     }
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
-                                    draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &state.known_users, &mut state.profiles_requested);
+                                    draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
+                                draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
                             ui.set_cursor_pos([row_start[0], content_top + ui.item_rect_size()[1]]);
                         }
@@ -2064,6 +2362,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         ui.popup(format!("msg_ctx_menu_{}", msg.id), || {
                             if ui.menu_item("Reply") {
                                 state.reply_target = Some(msg.clone());
+                            }
+                            if ui.menu_item("Add Reaction") {
+                                state.emoji_picker_target = Some((msg.channel_id.clone(), msg.id.clone()));
+                                open_emoji_picker = true;
                             }
                             if ui.menu_item("Copy Text") {
                                 ui.set_clipboard_text(&msg.content);
@@ -2261,6 +2563,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             ui.popup("picker_soon", || {
                 ui.text_disabled("GIFs and stickers are coming soon.");
             });
+            if open_emoji_picker {
+                ui.open_popup("emoji_picker");
+            }
             draw_emoji_picker(ui, state, textures, cmd_tx);
 
             let compose_focused = input_focused;
@@ -2336,6 +2641,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_video_fullscreen(ui, textures, cmd_tx);
     draw_incoming_calls(ui, state, cmd_tx);
     draw_voice_info(ui, state);
+    draw_quick_switcher(ui, state, cmd_tx, display_w, display_h);
 }
 
 fn format_bitrate(bps: u32) -> String {
@@ -2560,8 +2866,7 @@ fn draw_embed(
     cmd_tx: &UnboundedSender<UiCommand>,
     lightbox: &mut Option<String>,
     revealed_spoilers: &mut std::collections::HashSet<usize>,
-    known_users: &HashMap<String, rustcord_client::models::User>,
-    profiles_requested: &mut std::collections::HashSet<String>,
+    mentions: &mut MentionCtx,
 ) {
     let color = embed
         .color
@@ -2596,13 +2901,23 @@ fn draw_embed(
             }
         }
         if let Some(description) = embed.description.as_deref().filter(|d| !d.is_empty()) {
-            draw_markdown(ui, fonts, theme, description, revealed_spoilers, &format!("embed_{id_seed}"), textures, cmd_tx, known_users, profiles_requested);
+            draw_markdown(ui, fonts, theme, description, revealed_spoilers, &format!("embed_{id_seed}"), textures, cmd_tx, mentions);
         }
-        for field in &embed.fields {
+        for (field_idx, field) in embed.fields.iter().enumerate() {
             let font = ui.push_font(fonts.bold);
             ui.text_wrapped(&field.name);
             font.pop();
-            ui.text_wrapped(&field.value);
+            draw_markdown(
+                ui,
+                fonts,
+                theme,
+                &field.value,
+                revealed_spoilers,
+                &format!("embed_{id_seed}_field_{field_idx}"),
+                textures,
+                cmd_tx,
+                mentions,
+            );
         }
         let mut draw_media = |media: &rustcord_client::models::EmbedMedia, max: [f32; 2], open_on_click: bool| {
             let url = media.best_url();
@@ -2789,6 +3104,169 @@ fn draw_video_fullscreen(ui: &Ui, textures: &mut TextureCache, cmd_tx: &Unbounde
     }
     if ui.is_key_pressed(imgui::Key::Escape) {
         textures.exit_video_fullscreen(&url);
+    }
+}
+
+const SWITCHER_WIDTH: f32 = 540.0;
+const SWITCHER_ROW_HEIGHT: f32 = 30.0;
+const SWITCHER_MAX_RESULTS: usize = 8;
+
+fn draw_quick_switcher(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, display_w: f32, display_h: f32) {
+    if !state.switcher_open {
+        return;
+    }
+    let entries = state.switcher_entries();
+    let results = crate::switcher::rank(&entries, state.switcher_query.trim(), SWITCHER_MAX_RESULTS);
+
+    if ui.is_key_pressed(imgui::Key::DownArrow) && !results.is_empty() {
+        state.switcher_selected = (state.switcher_selected + 1) % results.len();
+    }
+    if ui.is_key_pressed(imgui::Key::UpArrow) && !results.is_empty() {
+        state.switcher_selected = (state.switcher_selected + results.len() - 1) % results.len();
+    }
+    state.switcher_selected = state.switcher_selected.min(results.len().saturating_sub(1));
+
+    let rows = results.len().max(1) as f32;
+    let height = 44.0 + rows * SWITCHER_ROW_HEIGHT + 16.0;
+    let x = (display_w - SWITCHER_WIDTH) / 2.0;
+    let y = (display_h * 0.25).min(160.0);
+
+    let mut chosen: Option<crate::switcher::Target> = None;
+    let mut close = ui.is_key_pressed(imgui::Key::Escape);
+
+    ui.window("##quick_switcher_backdrop")
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([display_w, display_h], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(true)
+        .bg_alpha(0.55)
+        .focus_on_appearing(false)
+        .build(|| {
+            if ui.is_window_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Left) {
+                close = true;
+            }
+        });
+
+    ui.window("##quick_switcher")
+        .position([x, y], imgui::Condition::Always)
+        .size([SWITCHER_WIDTH, height], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(true)
+        .build(|| {
+            if state.switcher_focus_input {
+                ui.set_keyboard_focus_here();
+                state.switcher_focus_input = false;
+            }
+            ui.set_next_item_width(SWITCHER_WIDTH - 16.0);
+            let submitted = ui
+                .input_text("##switcher_query", &mut state.switcher_query)
+                .hint("Jump to a server, channel or DM...")
+                .enter_returns_true(true)
+                .build();
+            ui.separator();
+
+            if results.is_empty() {
+                ui.text_disabled("No matches");
+            }
+            for (idx, result) in results.iter().enumerate() {
+                let selected = idx == state.switcher_selected;
+                let token = selected.then(|| {
+                    ui.push_style_color(
+                        imgui::StyleColor::Header,
+                        [state.theme.accent[0], state.theme.accent[1], state.theme.accent[2], 0.45],
+                    )
+                });
+                let clicked = ui
+                    .selectable_config(format!("##switcher_row_{idx}"))
+                    .selected(selected)
+                    .size([0.0, SWITCHER_ROW_HEIGHT])
+                    .build();
+                drop(token);
+                if ui.is_item_hovered() {
+                    state.switcher_selected = idx;
+                }
+                let row_min = ui.item_rect_min();
+                ui.set_cursor_screen_pos([row_min[0] + 6.0, row_min[1] + (SWITCHER_ROW_HEIGHT - ui.text_line_height()) / 2.0]);
+                draw_highlighted_label(ui, &state.theme, &result.entry.label, &result.hits);
+                if let Some(context) = &result.entry.context {
+                    ui.same_line();
+                    ui.text_colored(state.theme.text_muted, context);
+                }
+                if clicked {
+                    chosen = Some(result.entry.target.clone());
+                }
+            }
+
+            if submitted {
+                chosen = results.get(state.switcher_selected).map(|r| r.entry.target.clone());
+                if chosen.is_none() {
+                    close = true;
+                }
+            }
+        });
+
+    if let Some(target) = chosen {
+        apply_switcher_target(state, cmd_tx, target);
+        close = true;
+    }
+    if close {
+        state.switcher_open = false;
+        state.switcher_query.clear();
+        state.switcher_selected = 0;
+    }
+}
+
+fn draw_highlighted_label(ui: &Ui, theme: &crate::theme::Theme, label: &str, hits: &[usize]) {
+    let mut run = String::new();
+    let mut run_is_hit = false;
+    let mut first = true;
+    let flush = |run: &mut String, is_hit: bool, first: &mut bool| {
+        if run.is_empty() {
+            return;
+        }
+        if !*first {
+            ui.same_line_with_spacing(0.0, 0.0);
+        }
+        *first = false;
+        if is_hit {
+            ui.text_colored(theme.accent, run.as_str());
+        } else {
+            ui.text(run.as_str());
+        }
+        run.clear();
+    };
+    for (idx, ch) in label.chars().enumerate() {
+        let is_hit = hits.contains(&idx);
+        if is_hit != run_is_hit {
+            flush(&mut run, run_is_hit, &mut first);
+            run_is_hit = is_hit;
+        }
+        run.push(ch);
+    }
+    flush(&mut run, run_is_hit, &mut first);
+}
+
+fn apply_switcher_target(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, target: crate::switcher::Target) {
+    use crate::switcher::Target;
+    match target {
+        Target::Guild { guild_id } => {
+            let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
+            state.selected_guild = Some(guild_id);
+            state.selected_channel = None;
+        }
+        Target::Channel { guild_id, channel_id } => {
+            if state.selected_guild.as_deref() != Some(guild_id.as_str()) {
+                let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
+                state.selected_guild = Some(guild_id);
+            }
+            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+            state.selected_channel = Some(channel_id);
+        }
+        Target::Dm { channel_id } => {
+            state.selected_guild = None;
+            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+            state.selected_channel = Some(channel_id);
+        }
     }
 }
 
@@ -3133,8 +3611,13 @@ fn draw_member_row(
     let platform = state.platform_for(&member.user.id).map(str::to_string);
     let activity = state.activity_for(&member.user.id);
     let offline = status == rustcord_client::models::PresenceStatus::Offline;
+    let member_color = if offline {
+        None
+    } else {
+        state.selected_guild.clone().and_then(|g| state.member_color(&g, &member.user.id))
+    };
     let _dim = offline.then(|| ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted));
-    let result = draw_user_row(ui, cmd_tx, textures, &member.user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel);
+    let result = draw_user_row(ui, cmd_tx, textures, &member.user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel, member_color);
     if result.avatar_clicked {
         state.profile_popout = Some(member.user.clone());
     } else if result.row_clicked {
@@ -3218,7 +3701,7 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
             let activity = state.activity_for(&user.id);
-            let result = draw_user_row(ui, cmd_tx, textures, user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel);
+            let result = draw_user_row(ui, cmd_tx, textures, user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel, None);
             if result.avatar_clicked {
                 state.profile_popout = Some(user.clone());
             } else if result.row_clicked {
@@ -3253,7 +3736,7 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
             let activity = state.activity_for(&user.id);
-            let r = draw_user_row(ui, cmd_tx, textures, user, name, is_selected, status, platform.as_deref(), activity.as_deref(), state.theme.panel);
+            let r = draw_user_row(ui, cmd_tx, textures, user, name, is_selected, status, platform.as_deref(), activity.as_deref(), state.theme.panel, None);
             (r.row_clicked, r.avatar_clicked, r.right_clicked)
         } else {
             let clicked = ui.selectable_config(name).selected(is_selected).build();
@@ -3912,6 +4395,115 @@ fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>
                 token.pop();
             }
         });
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn a_reaction_pill_hugs_its_contents() {
+        let count_w = 7.0;
+        let w = reaction_pill_width(count_w);
+        let content = REACTION_EMOJI_SIZE + REACTION_PILL_GAP + count_w;
+        assert_eq!(w - content, REACTION_PILL_PAD_X * 2.0, "padding should be the only slack");
+        assert!(w < REACTION_EMOJI_SIZE * 3.0, "pill is too wide for one emoji and a digit: {w}");
+    }
+
+    #[test]
+    fn the_emoji_is_the_largest_part_of_the_pill() {
+        let w = reaction_pill_width(7.0);
+        assert!(REACTION_EMOJI_SIZE / w > 0.45, "emoji should dominate the pill, got {}", REACTION_EMOJI_SIZE / w);
+    }
+
+    #[test]
+    fn a_unicode_glyph_is_its_own_reaction_path() {
+        assert_eq!(reaction_emoji_path("\u{1F600}"), "\u{1F600}");
+    }
+
+    #[test]
+    fn a_custom_emoji_tag_becomes_name_colon_id() {
+        assert_eq!(reaction_emoji_path("<:smile:12345>"), "smile:12345");
+        assert_eq!(reaction_emoji_path("<a:dance:67890>"), "dance:67890");
+    }
+
+    #[test]
+    fn a_malformed_tag_is_passed_through_unchanged() {
+        for src in ["<:smile>", "<>", "<::>", "plain"] {
+            assert_eq!(reaction_emoji_path(src), src, "{src}");
+        }
+    }
+
+    fn fixed_width(s: &str) -> f32 {
+        s.chars().count() as f32 * 10.0
+    }
+
+    #[test]
+    fn text_that_fits_is_not_truncated() {
+        assert_eq!(truncate_measured("abc", 100.0, fixed_width), None);
+        assert_eq!(truncate_measured("abc", 30.0, fixed_width), None);
+    }
+
+    #[test]
+    fn long_text_is_cut_and_marked_with_an_ellipsis() {
+        let out = truncate_measured("mercury doing mercury things", 100.0, fixed_width).expect("truncated");
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(fixed_width(&out) <= 100.0, "still too wide: {out}");
+    }
+
+    #[test]
+    fn truncation_is_char_safe_on_multibyte_text() {
+        let out = truncate_measured(&"\u{e9}".repeat(40), 100.0, fixed_width).expect("truncated");
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(fixed_width(&out) <= 100.0);
+    }
+
+    #[test]
+    fn an_impossibly_narrow_column_yields_just_the_ellipsis() {
+        assert_eq!(truncate_measured("abcdef", 5.0, fixed_width), Some("\u{2026}".into()));
+    }
+
+    #[test]
+    fn a_short_url_loses_only_its_scheme() {
+        assert_eq!(elide_url("https://example.com/a"), "example.com/a");
+        assert_eq!(elide_url("http://example.com"), "example.com");
+    }
+
+    #[test]
+    fn a_long_url_is_elided_in_the_middle_keeping_host_and_tail() {
+        let url = format!("https://cdn.example.com/attachments/{}/file_name.png", "9".repeat(120));
+        let out = elide_url(&url);
+        assert!(out.chars().count() < 80, "still long: {out} ({})", out.chars().count());
+        assert!(out.starts_with("cdn.example.com/"), "lost the host: {out}");
+        assert!(out.ends_with("file_name.png"), "lost the tail: {out}");
+        assert!(out.contains('\u{2026}'), "no ellipsis: {out}");
+    }
+
+    #[test]
+    fn eliding_is_char_safe_on_multibyte_urls() {
+        let url = format!("https://example.com/{}", "\u{e9}".repeat(200));
+        let out = elide_url(&url);
+        assert!(out.chars().count() < 80, "{out}");
+    }
+
+    #[test]
+    fn relative_time_reads_naturally_in_both_directions() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(format_relative(now - 3600), "1 hour ago");
+        assert_eq!(format_relative(now + 7200), "in 2 hours");
+        assert_eq!(format_relative(now - 86_400 * 3), "3 days ago");
+        assert_eq!(format_relative(now), "1 second ago");
+    }
+
+    #[test]
+    fn a_timestamp_style_never_renders_as_an_empty_label() {
+        use markdown::TimestampStyle::*;
+        for style in [ShortTime, LongTime, ShortDate, LongDate, ShortDateTime, LongDateTime, Relative] {
+            let out = format_discord_timestamp(1_730_000_000, style);
+            assert!(!out.trim().is_empty(), "{style:?} rendered empty");
+            assert!(!out.contains("invalid"), "{style:?} -> {out}");
+        }
+    }
 }
 
 #[cfg(test)]

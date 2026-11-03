@@ -116,6 +116,7 @@ pub enum UiCommand {
     LoadProfile { user_id: String },
     EditMessage { channel_id: String, message_id: String, content: String },
     DeleteMessage { channel_id: String, message_id: String },
+    ToggleReaction { channel_id: String, message_id: String, emoji: String, add: bool },
     AckMessage { channel_id: String, message_id: String },
     JoinGuildByInvite { invite_code: String },
     CreateGuild { name: String },
@@ -445,6 +446,18 @@ pub fn spawn(
                     if let Some(client) = &rest {
                         if let Err(e) = client.delete_message(&channel_id, &message_id).await {
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to delete message: {e}")));
+                        }
+                    }
+                }
+                UiCommand::ToggleReaction { channel_id, message_id, emoji, add } => {
+                    if let Some(client) = &rest {
+                        let result = if add {
+                            client.add_reaction(&channel_id, &message_id, &emoji).await
+                        } else {
+                            client.remove_reaction(&channel_id, &message_id, &emoji).await
+                        };
+                        if let Err(e) = result {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to update reaction: {e}")));
                         }
                     }
                 }
