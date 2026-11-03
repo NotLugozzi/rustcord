@@ -194,6 +194,36 @@ impl RestClient {
         self.post("/guilds", &serde_json::json!({ "name": name })).await
     }
 
+    pub async fn search_guild_messages(
+        &self,
+        guild_id: &str,
+        query: &SearchQuery<'_>,
+    ) -> Result<SearchResults, ClientError> {
+        self.search(&format!("/guilds/{guild_id}/messages/search"), query).await
+    }
+
+    pub async fn search_channel_messages(
+        &self,
+        channel_id: &str,
+        query: &SearchQuery<'_>,
+    ) -> Result<SearchResults, ClientError> {
+        self.search(&format!("/channels/{channel_id}/messages/search"), query).await
+    }
+
+    async fn search(&self, path: &str, query: &SearchQuery<'_>) -> Result<SearchResults, ClientError> {
+        let url = format!("{API_BASE}{path}?{}", query.to_query_string());
+        let resp = self.send_retrying(|| self.http.get(&url)).await?;
+        if resp.status() == reqwest::StatusCode::ACCEPTED {
+            let body: IndexingBody = resp.json().await.unwrap_or_default();
+            return Err(ClientError::NotIndexed { retry_after: body.retry_after });
+        }
+        let body: SearchBody = resp.json().await?;
+        Ok(SearchResults {
+            total: body.total_results,
+            messages: body.messages.into_iter().flatten().collect(),
+        })
+    }
+
     pub async fn guild_emojis(&self, guild_id: &str) -> Result<Vec<Emoji>, ClientError> {
         self.get(&format!("/guilds/{guild_id}/emojis")).await
     }
@@ -209,6 +239,15 @@ impl RestClient {
         limit: u32,
     ) -> Result<Vec<Message>, ClientError> {
         self.get(&format!("/channels/{channel_id}/messages?limit={limit}&before={before}")).await
+    }
+
+    pub async fn messages_around(
+        &self,
+        channel_id: &str,
+        around: &str,
+        limit: u32,
+    ) -> Result<Vec<Message>, ClientError> {
+        self.get(&format!("/channels/{channel_id}/messages?limit={limit}&around={around}")).await
     }
 
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message, ClientError> {
@@ -446,6 +485,57 @@ impl RestClient {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchQuery<'a> {
+    pub content: &'a str,
+    pub channel_id: Option<&'a str>,
+    pub author_id: Option<&'a str>,
+    pub has: Option<&'a str>,
+    pub offset: u32,
+}
+
+impl SearchQuery<'_> {
+    pub fn to_query_string(&self) -> String {
+        let mut parts = vec![format!("content={}", encode_path_segment(self.content))];
+        for (key, value) in [
+            ("channel_id", self.channel_id),
+            ("author_id", self.author_id),
+            ("has", self.has),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                parts.push(format!("{key}={}", encode_path_segment(value)));
+            }
+        }
+        parts.push(format!("limit={SEARCH_PAGE_SIZE}"));
+        if self.offset > 0 {
+            parts.push(format!("offset={}", self.offset));
+        }
+        parts.join("&")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResults {
+    pub total: u32,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchBody {
+    #[serde(default)]
+    total_results: u32,
+    #[serde(default)]
+    messages: Vec<Vec<Message>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct IndexingBody {
+    #[serde(default)]
+    retry_after: f64,
+}
+
+pub const SEARCH_PAGE_SIZE: u32 = 25;
+
 pub fn encode_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -491,6 +581,67 @@ mod tests {
         for (raw, expected) in [("/", "%2F"), ("?", "%3F"), ("#", "%23"), ("%", "%25"), (" ", "%20")] {
             assert_eq!(encode_path_segment(raw), expected, "{raw}");
         }
+    }
+
+    #[test]
+    fn a_search_query_encodes_spaces_and_skips_empty_filters() {
+        let query = SearchQuery { content: "hello world", ..Default::default() };
+        assert_eq!(query.to_query_string(), "content=hello%20world&limit=25");
+    }
+
+    #[test]
+    fn a_search_query_carries_its_filters() {
+        let query = SearchQuery {
+            content: "deploy",
+            channel_id: Some("123"),
+            author_id: Some("456"),
+            has: Some("image"),
+            offset: 50,
+        };
+        assert_eq!(
+            query.to_query_string(),
+            "content=deploy&channel_id=123&author_id=456&has=image&limit=25&offset=50",
+        );
+    }
+
+    #[test]
+    fn an_empty_filter_string_is_omitted_rather_than_sent_blank() {
+        let query = SearchQuery { content: "x", author_id: Some(""), ..Default::default() };
+        assert!(!query.to_query_string().contains("author_id"), "{}", query.to_query_string());
+    }
+
+    #[test]
+    fn search_results_flatten_the_nested_message_arrays() {
+        let raw = serde_json::json!({
+            "total_results": 2,
+            "messages": [[sample_message("1")], [sample_message("2")]],
+        });
+        let body: SearchBody = serde_json::from_value(raw).unwrap();
+        let flattened: Vec<Message> = body.messages.into_iter().flatten().collect();
+        assert_eq!(body.total_results, 2);
+        assert_eq!(flattened.len(), 2);
+        assert_eq!(flattened[0].id, "1");
+        assert_eq!(flattened[1].id, "2");
+    }
+
+    #[test]
+    fn an_empty_result_set_is_not_an_error() {
+        let body: SearchBody =
+            serde_json::from_value(serde_json::json!({ "total_results": 0, "messages": [] })).unwrap();
+        assert_eq!(body.total_results, 0);
+        assert!(body.messages.is_empty());
+    }
+
+    fn sample_message(id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "channel_id": "c",
+            "author": { "id": "u", "username": "u", "discriminator": "0" },
+            "content": "hi",
+            "timestamp": "2026-11-03T00:00:00+00:00",
+            "edited_timestamp": null,
+            "hit": true,
+        })
     }
 
     #[test]

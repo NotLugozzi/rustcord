@@ -16,6 +16,8 @@ pub struct Theme {
     pub accent_hover: [f32; 4],
     pub border: [f32; 4],
     #[serde(default)]
+    pub mention_badge: Option<[f32; 4]>,
+    #[serde(default)]
     pub gradient: Option<[[f32; 4]; 2]>,
 }
 
@@ -36,12 +38,17 @@ impl Default for Theme {
             accent: [0.345, 0.396, 0.949, 1.0],      
             accent_hover: [0.278, 0.322, 0.816, 1.0],
             border: [0.133, 0.141, 0.153, 1.0],  
+            mention_badge: None,
             gradient: None,
         }
     }
 }
 
 impl Theme {
+    pub fn mention_badge(&self) -> [f32; 4] {
+        self.mention_badge.unwrap_or([0.925, 0.259, 0.278, 1.0])
+    }
+
     pub fn servers_bg(&self) -> [f32; 4] {
         self.servers_bg.unwrap_or_else(|| darken(self.background, 0.8))
     }
@@ -96,16 +103,15 @@ impl Theme {
         style.popup_border_size = 1.0;
         style.frame_border_size = 0.0;
 
-        style.frame_rounding = 6.0;
+        style.frame_rounding = 5.0;
         style.popup_rounding = 8.0;
-        style.scrollbar_rounding = 8.0;
+        style.child_rounding = 8.0;
+        style.scrollbar_rounding = 4.0;
         style.grab_rounding = 4.0;
 
         style.window_padding = [12.0, 12.0];
-        style.frame_padding = [10.0, 8.0];
-        style.item_spacing = [8.0, 8.0];
-        
-        // Scrollbar sottile stile Discord
+        style.frame_padding = [9.0, 6.0];
+        style.item_spacing = [8.0, 6.0];
         style.scrollbar_size = 10.0;
     }
 

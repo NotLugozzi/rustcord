@@ -153,6 +153,37 @@ pub fn load_rail() -> (Vec<GuildFolder>, Vec<RailItem>) {
     (file.folders, file.order)
 }
 
+pub struct SearchState {
+    pub scope: crate::backend::SearchScope,
+    pub query: String,
+    pub offset: u32,
+    pub total: u32,
+    pub results: Vec<Message>,
+    pub status: SearchStatus,
+}
+
+#[derive(PartialEq)]
+pub enum SearchStatus {
+    Loading,
+    Ready,
+    Indexing { retry_after: f64 },
+    Failed(String),
+}
+
+impl SearchState {
+    pub fn page(&self) -> u32 {
+        self.offset / rustcord_client::rest::SEARCH_PAGE_SIZE
+    }
+
+    pub fn pages(&self) -> u32 {
+        self.total.div_ceil(rustcord_client::rest::SEARCH_PAGE_SIZE)
+    }
+
+    pub fn has_next_page(&self) -> bool {
+        self.page() + 1 < self.pages()
+    }
+}
+
 #[derive(Default)]
 pub struct AppState {
     pub current_user: Option<User>,
@@ -161,6 +192,9 @@ pub struct AppState {
     pub relationships: Vec<Relationship>,
     pub dm_search: String,
     pub sidebar_tab: usize,
+    pub pending_sidebar_tab: Option<usize>,
+    pub scroll_to_message: Option<String>,
+    pub viewing_jumped_history: bool,
     pub sidebar_width: f32,
     pub groups: Vec<DmGroup>,
     pub new_group_name: String,
@@ -221,6 +255,12 @@ pub struct AppState {
     pub switcher_focus_input: bool,
     pub switcher_query: String,
     pub switcher_selected: usize,
+    pub mention_counts: HashMap<String, u32>,
+    pub search_open: bool,
+    pub search_follows_selection: bool,
+    pub search_focus_input: bool,
+    pub search_input: String,
+    pub search: Option<SearchState>,
     pub emoji_picker_filter: String,
     pub emoji_picker_target: Option<(String, String)>,
     pub emoji_picker_category: usize,
@@ -532,12 +572,23 @@ impl AppState {
             .is_none_or(|seen| snowflake_value(message_id) > snowflake_value(seen));
         if is_newer {
             self.last_read_message_id.insert(channel_id.to_string(), message_id.to_string());
+            self.mention_counts.remove(channel_id);
             self.save_read_state();
         }
         is_newer
     }
 
     pub fn apply_remote_read_state(&mut self, states: &[rustcord_client::gateway::ChannelReadState]) -> usize {
+        for state in states {
+            match state.mention_count {
+                0 => {
+                    self.mention_counts.remove(&state.channel_id);
+                }
+                count => {
+                    self.mention_counts.insert(state.channel_id.clone(), count);
+                }
+            }
+        }
         let advanced = merge_read_state(&mut self.last_read_message_id, states);
         if advanced > 0 {
             self.save_read_state();
@@ -637,16 +688,31 @@ impl AppState {
 
         let mut entries = Vec::new();
         for dm in &self.dm_channels {
+            let icon = dm
+                .recipients
+                .first()
+                .map(|u| {
+                    rustcord_client::cdn::avatar_url(u, 64)
+                        .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(u))
+                })
+                .map(crate::switcher::Icon::Image)
+                .unwrap_or(crate::switcher::Icon::Channel);
             entries.push(Entry {
                 label: Self::dm_display_name(dm),
                 context: Some("Direct Message".to_string()),
+                icon,
                 target: Target::Dm { channel_id: dm.id.clone() },
             });
         }
         for guild in &self.guilds {
+            let icon = match rustcord_client::cdn::guild_icon_url(guild, 64) {
+                Some(url) => crate::switcher::Icon::Image(url),
+                None => crate::switcher::Icon::Initials(crate::switcher::initials(&guild.name)),
+            };
             entries.push(Entry {
                 label: guild.name.clone(),
                 context: Some("Server".to_string()),
+                icon,
                 target: Target::Guild { guild_id: guild.id.clone() },
             });
             let Some(channels) = self.guild_channels.get(&guild.id) else { continue };
@@ -661,6 +727,7 @@ impl AppState {
                 entries.push(Entry {
                     label: format!("#{name}"),
                     context: Some(guild.name.clone()),
+                    icon: crate::switcher::Icon::Channel,
                     target: Target::Channel { guild_id: guild.id.clone(), channel_id: channel.id.clone() },
                 });
             }
@@ -696,6 +763,27 @@ impl AppState {
     pub fn member_color(&self, guild_id: &str, user_id: &str) -> Option<[f32; 4]> {
         let member = self.guild_members.get(guild_id)?.iter().find(|m| m.user.id == user_id)?;
         self.color_for_roles(guild_id, &member.roles)
+    }
+
+    pub fn seed_guild_channels(&mut self, guilds: Vec<(String, Vec<Channel>)>) -> usize {
+        let mut seeded = 0;
+        for (guild_id, channels) in guilds {
+            if self.guild_channels.contains_key(&guild_id) {
+                continue;
+            }
+            self.guild_channels.insert(guild_id, channels);
+            seeded += 1;
+        }
+        seeded
+    }
+
+    pub fn mention_count(&self, channel_id: &str) -> u32 {
+        self.mention_counts.get(channel_id).copied().unwrap_or(0)
+    }
+
+    pub fn guild_mention_count(&self, guild_id: &str) -> u32 {
+        let Some(channels) = self.guild_channels.get(guild_id) else { return 0 };
+        channels.iter().map(|c| self.mention_count(&c.id)).sum()
     }
 
     pub fn channel_is_unread(&self, channel_id: &str, last_message_id: Option<&str>) -> bool {
@@ -1012,8 +1100,126 @@ mod tests {
     use super::*;
     use rustcord_client::gateway::ChannelReadState;
 
+    fn search_page(total: u32, offset: u32) -> SearchState {
+        SearchState {
+            scope: crate::backend::SearchScope::Guild { guild_id: "g".into() },
+            query: "q".into(),
+            offset,
+            total,
+            results: Vec::new(),
+            status: SearchStatus::Ready,
+        }
+    }
+
+    #[test]
+    fn a_partial_last_page_still_counts_as_a_page() {
+        let search = search_page(26, 0);
+        assert_eq!(search.pages(), 2);
+        assert!(search.has_next_page());
+    }
+
+    #[test]
+    fn an_exactly_full_page_has_no_next_page() {
+        let search = search_page(25, 0);
+        assert_eq!(search.pages(), 1);
+        assert!(!search.has_next_page());
+    }
+
+    #[test]
+    fn the_last_page_of_many_has_no_next_page() {
+        let search = search_page(60, 50);
+        assert_eq!(search.page(), 2);
+        assert_eq!(search.pages(), 3);
+        assert!(!search.has_next_page());
+    }
+
+    #[test]
+    fn a_middle_page_has_a_next_page() {
+        let search = search_page(60, 25);
+        assert_eq!(search.page(), 1);
+        assert!(search.has_next_page());
+    }
+
+    #[test]
+    fn an_empty_result_set_has_no_pages() {
+        let search = search_page(0, 0);
+        assert_eq!(search.pages(), 0);
+        assert!(!search.has_next_page());
+    }
+
+    fn remote_with_mentions(channel_id: &str, last_message_id: &str, mention_count: u32) -> ChannelReadState {
+        ChannelReadState {
+            channel_id: channel_id.into(),
+            last_message_id: last_message_id.into(),
+            mention_count,
+        }
+    }
+
+    #[test]
+    fn a_remote_mention_count_is_adopted() {
+        let mut state = AppState::default();
+        state.apply_remote_read_state(&[remote_with_mentions("c", "100", 4)]);
+        assert_eq!(state.mention_count("c"), 4);
+    }
+
+    #[test]
+    fn a_zero_mention_count_clears_a_stale_badge() {
+        let mut state = AppState::default();
+        state.apply_remote_read_state(&[remote_with_mentions("c", "100", 4)]);
+        state.apply_remote_read_state(&[remote_with_mentions("c", "200", 0)]);
+        assert_eq!(state.mention_count("c"), 0);
+    }
+
+    #[test]
+    fn reading_a_channel_clears_its_mention_badge() {
+        let mut state = AppState::default();
+        state.apply_remote_read_state(&[remote_with_mentions("c", "100", 7)]);
+        state.mark_channel_read("c", "200");
+        assert_eq!(state.mention_count("c"), 0);
+    }
+
+    #[test]
+    fn an_unchanged_read_marker_leaves_the_badge_alone() {
+        let mut state = AppState::default();
+        state.apply_remote_read_state(&[remote_with_mentions("c", "200", 3)]);
+        state.mark_channel_read("c", "100");
+        assert_eq!(state.mention_count("c"), 3);
+    }
+
+    #[test]
+    fn seeding_never_overwrites_channels_already_loaded() {
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), Vec::new());
+        let seeded = state.seed_guild_channels(vec![("g".into(), vec![test_channel("c", "general")])]);
+        assert_eq!(seeded, 0);
+        assert!(state.guild_channels["g"].is_empty());
+    }
+
+    #[test]
+    fn seeding_fills_in_a_guild_never_visited() {
+        let mut state = AppState::default();
+        let seeded = state.seed_guild_channels(vec![("g".into(), vec![test_channel("c", "general")])]);
+        assert_eq!(seeded, 1);
+        assert_eq!(state.guild_channels["g"].len(), 1);
+    }
+
+    fn test_channel(id: &str, name: &str) -> Channel {
+        Channel {
+            id: id.into(),
+            kind: ChannelType::GuildText,
+            guild_id: Some("g".into()),
+            name: Some(name.into()),
+            topic: None,
+            position: Some(0),
+            parent_id: None,
+            recipients: Vec::new(),
+            last_message_id: Some("999".into()),
+            permission_overwrites: Vec::new(),
+        }
+    }
+
     fn remote(channel_id: &str, last_message_id: &str) -> ChannelReadState {
-        ChannelReadState { channel_id: channel_id.into(), last_message_id: last_message_id.into() }
+        ChannelReadState { channel_id: channel_id.into(), last_message_id: last_message_id.into(), mention_count: 0 }
     }
 
     fn guild_channel(id: &str, guild_id: &str, name: &str) -> Channel {

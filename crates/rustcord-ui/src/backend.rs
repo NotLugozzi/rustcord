@@ -80,6 +80,12 @@ async fn save_attachment(url: &str, filename: &str) -> Result<std::path::PathBuf
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
 pub(crate) static VOICE_MEDIA_STATE: std::sync::Mutex<Option<rustcord_client::voice_gateway::VoiceMediaState>> = std::sync::Mutex::new(None);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchScope {
+    Guild { guild_id: String },
+    Channel { channel_id: String },
+}
+
 pub enum UiCommand {
     LoginWithPassword { email: String, password: String },
     LoginWithToken { token: String },
@@ -118,6 +124,8 @@ pub enum UiCommand {
     DeleteMessage { channel_id: String, message_id: String },
     ToggleReaction { channel_id: String, message_id: String, emoji: String, add: bool },
     AckMessage { channel_id: String, message_id: String },
+    SearchMessages { scope: SearchScope, query: String, offset: u32 },
+    JumpToMessage { channel_id: String, message_id: String },
     JoinGuildByInvite { invite_code: String },
     CreateGuild { name: String },
     RequestGuildMembers { guild_id: String },
@@ -155,6 +163,15 @@ pub enum BackendEvent {
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
     MessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
     OlderMessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
+    SearchResults {
+        query: String,
+        offset: u32,
+        total: u32,
+        messages: Vec<rustcord_client::models::Message>,
+    },
+    SearchIndexing { retry_after: f64 },
+    MessagesAroundLoaded { channel_id: String, message_id: String, messages: Vec<rustcord_client::models::Message> },
+    SearchFailed(String),
     RelationshipsLoaded(Vec<rustcord_client::models::Relationship>),
     DmOpened(rustcord_client::models::Channel),
     ImageDownloaded { url: String, image: crate::images::Decoded },
@@ -267,6 +284,32 @@ pub fn spawn(
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to load older messages: {e}")));
                             }
                         }
+                    }
+                }
+                UiCommand::JumpToMessage { channel_id, message_id } => {
+                    if let Some(client) = &rest {
+                        match client.messages_around(&channel_id, &message_id, 50).await {
+                            Ok(messages) => {
+                                let _ = event_tx.send(BackendEvent::MessagesAroundLoaded {
+                                    channel_id,
+                                    message_id,
+                                    messages,
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("failed to load messages around {message_id}: {e}");
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to jump: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::SearchMessages { scope, query, offset } => {
+                    if let Some(client) = &rest {
+                        let client = client.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            run_search(&client, scope, query, offset, &event_tx).await;
+                        });
                     }
                 }
                 UiCommand::SendMessage { channel_id, content, reply_to } => {
@@ -716,6 +759,36 @@ async fn load_guild_emojis(client: &RestClient, guild_id: String, event_tx: &mps
         }
         Err(e) => tracing::warn!("failed to load emojis for guild {guild_id}: {e}"),
     }
+}
+
+async fn run_search(
+    client: &RestClient,
+    scope: SearchScope,
+    query: String,
+    offset: u32,
+    event_tx: &mpsc::UnboundedSender<BackendEvent>,
+) {
+    let params = rustcord_client::rest::SearchQuery { content: &query, offset, ..Default::default() };
+    let result = match &scope {
+        SearchScope::Guild { guild_id } => client.search_guild_messages(guild_id, &params).await,
+        SearchScope::Channel { channel_id } => client.search_channel_messages(channel_id, &params).await,
+    };
+    let event = match result {
+        Ok(results) => BackendEvent::SearchResults {
+            query,
+            offset,
+            total: results.total,
+            messages: results.messages,
+        },
+        Err(rustcord_client::error::ClientError::NotIndexed { retry_after }) => {
+            BackendEvent::SearchIndexing { retry_after }
+        }
+        Err(e) => {
+            tracing::warn!("search failed: {e}");
+            BackendEvent::SearchFailed(e.to_string())
+        }
+    };
+    let _ = event_tx.send(event);
 }
 
 fn spawn_guild_emoji_loads(client: &RestClient, guild_ids: Vec<String>, event_tx: &mpsc::UnboundedSender<BackendEvent>) {

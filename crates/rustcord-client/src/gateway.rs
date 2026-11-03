@@ -32,6 +32,7 @@ pub enum GatewayEvent {
     GuildCreate { guild_id: String, roles: Vec<Role>, member_roles: Vec<(String, Vec<String>)> },
     GuildMembersChunk { guild_id: String, members: Vec<GuildMember>, presences: Vec<Presence> },
     ReadState(Vec<ChannelReadState>),
+    InitialGuildChannels(Vec<(String, Vec<crate::models::Channel>)>),
     ChannelUpsert(Channel),
     ChannelDelete { channel_id: String, guild_id: Option<String> },
     GuildUpdate { guild_id: String, name: Option<String>, icon: Option<String> },
@@ -44,6 +45,7 @@ pub enum GatewayEvent {
 pub struct ChannelReadState {
     pub channel_id: String,
     pub last_message_id: String,
+    pub mention_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +314,11 @@ impl Gateway {
                 }
                 deduplicate_presences(&mut friend_presences);
                 tracing::info!("READY supplied {} friend presences", friend_presences.len());
+                let guild_channels = parse_initial_guild_channels(data.get("guilds"));
+                tracing::info!("READY supplied channels for {} guilds", guild_channels.len());
+                if !guild_channels.is_empty() {
+                    let _ = tx.send(GatewayEvent::InitialGuildChannels(guild_channels));
+                }
                 let read_state = parse_read_state(data.get("read_state"));
                 tracing::info!("READY supplied {} channel read states", read_state.len());
                 if !read_state.is_empty() {
@@ -470,6 +477,32 @@ fn frame_is_resumable(reason: &str) -> bool {
     !reason.starts_with("1000") && !reason.starts_with("1001") && !reason.starts_with("4004")
 }
 
+fn parse_initial_guild_channels(guilds: Option<&Value>) -> Vec<(String, Vec<crate::models::Channel>)> {
+    let Some(guilds) = guilds.and_then(Value::as_array) else { return Vec::new() };
+    let mut out = Vec::new();
+    for guild in guilds {
+        if guild.get("unavailable").and_then(Value::as_bool).unwrap_or(false) {
+            continue;
+        }
+        let Some(id) = guild.get("id").and_then(Value::as_str) else { continue };
+        let Some(raw) = guild.get("channels").and_then(Value::as_array) else { continue };
+        let channels: Vec<crate::models::Channel> = raw
+            .iter()
+            .filter_map(|c| {
+                let mut c = c.clone();
+                if let Some(obj) = c.as_object_mut() {
+                    obj.entry("guild_id").or_insert_with(|| Value::String(id.to_string()));
+                }
+                serde_json::from_value(c).ok()
+            })
+            .collect();
+        if !channels.is_empty() {
+            out.push((id.to_string(), channels));
+        }
+    }
+    out
+}
+
 fn parse_read_state(value: Option<&Value>) -> Vec<ChannelReadState> {
     let items = match value {
         Some(Value::Array(items)) => items,
@@ -491,7 +524,8 @@ fn parse_read_state(value: Option<&Value>) -> Vec<ChannelReadState> {
             if last_message_id.is_empty() || last_message_id == "0" {
                 return None;
             }
-            Some(ChannelReadState { channel_id: channel_id.to_string(), last_message_id })
+            let mention_count = item.get("mention_count").and_then(Value::as_u64).unwrap_or(0) as u32;
+            Some(ChannelReadState { channel_id: channel_id.to_string(), last_message_id, mention_count })
         })
         .collect()
 }

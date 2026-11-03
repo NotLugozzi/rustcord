@@ -46,6 +46,9 @@ Use at your own risk.
 - [x] VC Leave/Join sound
 - [x] Inline video attachment playback (optional `video` feature, needs ffmpeg)
 - [x] Reactions
+- [x] Quick switcher (Ctrl-K, with avatars)
+- [x] Message search (per-server and per-DM, jump to message)
+- [x] Per-channel unread indicators and mention badges
 - [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
 - [x] Message read status sync
 - [ ] performance improvements in voice calls (SSRC decoder leak fixed; re-measure CPU)
@@ -53,6 +56,11 @@ Use at your own risk.
 - [ ] server admin actions (low priority)
 
 ## Credits
+
+Text rendering falls back to [DejaVu Sans](https://dejavu-fonts.github.io/) for glyphs
+Inter does not cover (box drawing, dingbats and similar decorative characters common in
+Discord channel names). DejaVu Sans is based on Bitstream Vera, © 2003 Bitstream, Inc.;
+see `crates/rustcord-ui/assets/fonts/DejaVuSans-LICENSE.txt`.
 
 Emoji artwork is [Twemoji](https://github.com/jdecked/twemoji) © Twitter, Inc. and other contributors, licensed
 [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/). Emoji are fetched on demand and cached locally.

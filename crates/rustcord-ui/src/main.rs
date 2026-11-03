@@ -176,6 +176,16 @@ pub fn drain_backend_events(
                 }
                 state.push_message(message);
             }
+            BackendEvent::MessagesAroundLoaded { channel_id, message_id, messages } => {
+                state.set_message_history(channel_id.clone(), messages);
+                state.history_exhausted.remove(&channel_id);
+                state.scroll_to_message = Some(message_id);
+                state.viewing_jumped_history = true;
+            }
+            BackendEvent::Gateway(GatewayEvent::InitialGuildChannels(guilds)) => {
+                let count = state.seed_guild_channels(guilds);
+                tracing::info!("seeded channels for {count} guilds from READY");
+            }
             BackendEvent::Gateway(GatewayEvent::ReadState(states)) => {
                 let advanced = state.apply_remote_read_state(&states);
                 tracing::info!("adopted {advanced} of {} remote read states", states.len());
@@ -341,6 +351,7 @@ pub fn drain_backend_events(
                 state.dm_channels = channels;
             }
             BackendEvent::MessagesLoaded { channel_id, messages } => {
+                state.viewing_jumped_history = false;
                 if let Some(newest) = messages.iter().max_by_key(|m| m.id.parse::<u64>().unwrap_or(0)) {
                     if state.mark_channel_read(&channel_id, &newest.id) {
                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: newest.id.clone() });
@@ -354,6 +365,25 @@ pub fn drain_backend_events(
                     state.history_exhausted.insert(channel_id.clone());
                 }
                 state.prepend_message_history(channel_id, messages);
+            }
+            BackendEvent::SearchResults { query, offset, total, messages } => {
+                if let Some(search) = &mut state.search {
+                    if search.query == query && search.offset == offset {
+                        search.total = total;
+                        search.results = messages;
+                        search.status = app_state::SearchStatus::Ready;
+                    }
+                }
+            }
+            BackendEvent::SearchIndexing { retry_after } => {
+                if let Some(search) = &mut state.search {
+                    search.status = app_state::SearchStatus::Indexing { retry_after };
+                }
+            }
+            BackendEvent::SearchFailed(message) => {
+                if let Some(search) = &mut state.search {
+                    search.status = app_state::SearchStatus::Failed(message);
+                }
             }
             BackendEvent::RelationshipsLoaded(relationships) => {
                 state.relationships = relationships;

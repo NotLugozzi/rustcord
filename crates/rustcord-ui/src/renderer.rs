@@ -4,6 +4,37 @@ use crate::drain_backend_events;
 use crate::images::TextureCache;
 use crate::ui;
 use imgui::{FontConfig, FontSource};
+
+const TEXT_GLYPH_RANGES: &[u32] = &[
+    0x0020, 0x00FF,
+    0x0100, 0x024F,
+    0x0250, 0x02FF,
+    0x0300, 0x036F,
+    0x0370, 0x03FF,
+    0x0400, 0x04FF,
+    0x0E00, 0x0E7F,
+    0x1D00, 0x1D7F,
+    0x1E00, 0x1EFF,
+    0x2000, 0x206F,
+    0x2070, 0x209F,
+    0x20A0, 0x20BF,
+    0x2100, 0x214F,
+    0x2190, 0x21FF,
+    0x2200, 0x22FF,
+    0x2300, 0x23FF,
+    0x2460, 0x24FF,
+    0x2500, 0x257F,
+    0x2580, 0x259F,
+    0x25A0, 0x25FF,
+    0x2600, 0x26FF,
+    0x2700, 0x27BF,
+    0x27C0, 0x27EF,
+    0x2900, 0x297F,
+    0x2B00, 0x2BFF,
+    0x3000, 0x303F,
+    0xFF00, 0xFFEF,
+    0,
+];
 use imgui_wgpu::{Renderer, RendererConfig};
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use pollster::block_on;
@@ -104,34 +135,62 @@ impl AppWindow {
                 oversample_v: 2,
                 pixel_snap_h: true,
                 size_pixels,
+                glyph_ranges: imgui::FontGlyphRanges::from_slice(TEXT_GLYPH_RANGES),
                 ..Default::default()
             })
         };
-        let regular = context.fonts().add_font(&[FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        }]);
-        let bold = context.fonts().add_font(&[FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Bold.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        }]);
-        let italic = context.fonts().add_font(&[FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Italic.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        }]);
-        let bold_italic = context.fonts().add_font(&[FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        }]);
-        let mono = context.fonts().add_font(&[FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
-            size_pixels: mono_size,
-            config: make_config(mono_size),
-        }]);
+        let fallback = |size_pixels: f32| FontSource::TtfData {
+            data: include_bytes!("../assets/fonts/DejaVuSans.ttf"),
+            size_pixels,
+            config: Some(FontConfig {
+                oversample_h: 2,
+                oversample_v: 2,
+                pixel_snap_h: true,
+                size_pixels,
+                glyph_ranges: imgui::FontGlyphRanges::from_slice(TEXT_GLYPH_RANGES),
+                ..Default::default()
+            }),
+        };
+        let regular = context.fonts().add_font(&[
+            FontSource::TtfData {
+                data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
+                size_pixels: font_size,
+                config: make_config(font_size),
+            },
+            fallback(font_size),
+        ]);
+        let bold = context.fonts().add_font(&[
+            FontSource::TtfData {
+                data: include_bytes!("../assets/fonts/Inter-Bold.ttf"),
+                size_pixels: font_size,
+                config: make_config(font_size),
+            },
+            fallback(font_size),
+        ]);
+        let italic = context.fonts().add_font(&[
+            FontSource::TtfData {
+                data: include_bytes!("../assets/fonts/Inter-Italic.ttf"),
+                size_pixels: font_size,
+                config: make_config(font_size),
+            },
+            fallback(font_size),
+        ]);
+        let bold_italic = context.fonts().add_font(&[
+            FontSource::TtfData {
+                data: include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"),
+                size_pixels: font_size,
+                config: make_config(font_size),
+            },
+            fallback(font_size),
+        ]);
+        let mono = context.fonts().add_font(&[
+            FontSource::TtfData {
+                data: include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+                size_pixels: mono_size,
+                config: make_config(mono_size),
+            },
+            fallback(mono_size),
+        ]);
 
         let fonts = crate::ui::Fonts { regular, bold, italic, bold_italic, mono };
 
@@ -365,4 +424,47 @@ pub fn run(state: AppState, cmd_tx: UnboundedSender<UiCommand>, event_rx: Unboun
     };
 
     event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+#[cfg(test)]
+mod glyph_range_tests {
+    use super::TEXT_GLYPH_RANGES;
+
+    #[test]
+    fn the_range_table_is_shaped_the_way_imgui_demands() {
+        assert_eq!(TEXT_GLYPH_RANGES.len() % 2, 1, "must be odd (pairs plus terminator)");
+        assert_eq!(TEXT_GLYPH_RANGES.last(), Some(&0), "must be zero terminated");
+        assert!(TEXT_GLYPH_RANGES[..TEXT_GLYPH_RANGES.len() - 1].iter().all(|&c| c != 0));
+        for pair in TEXT_GLYPH_RANGES[..TEXT_GLYPH_RANGES.len() - 1].chunks(2) {
+            assert!(pair[0] <= pair[1], "range {:04X}..{:04X} is inverted", pair[0], pair[1]);
+        }
+    }
+
+    #[test]
+    fn the_ranges_never_overlap_or_sit_out_of_order() {
+        let pairs: Vec<&[u32]> = TEXT_GLYPH_RANGES[..TEXT_GLYPH_RANGES.len() - 1].chunks(2).collect();
+        for window in pairs.windows(2) {
+            assert!(
+                window[0][1] < window[1][0],
+                "{:04X}..{:04X} overlaps or precedes {:04X}..{:04X}",
+                window[0][0], window[0][1], window[1][0], window[1][1],
+            );
+        }
+    }
+
+    #[test]
+    fn decorative_channel_name_characters_are_covered() {
+        let covered = |ch: char| {
+            TEXT_GLYPH_RANGES[..TEXT_GLYPH_RANGES.len() - 1]
+                .chunks(2)
+                .any(|p| (p[0]..=p[1]).contains(&(ch as u32)))
+        };
+        let mut missing: Vec<char> = Vec::new();
+        for ch in "\u{2605}\u{FF61}\u{00B0}\u{02D6}\u{2727}\u{2726}\u{2500}\u{2501}\u{2661}\u{22C6}\u{2027}\u{208A}\u{02DA}\u{029A}\u{025E}\u{27E1}\u{0E51}\u{2022}\u{1D17}\u{2192}\u{2713}".chars() {
+            if !covered(ch) {
+                missing.push(ch);
+            }
+        }
+        assert!(missing.is_empty(), "channel-name glyphs outside the ranges: {missing:?}");
+    }
 }

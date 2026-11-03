@@ -5,11 +5,27 @@ pub enum Target {
     Guild { guild_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Icon {
+    Image(String),
+    Initials(String),
+    Channel,
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub label: String,
     pub context: Option<String>,
+    pub icon: Icon,
     pub target: Target,
+}
+
+pub fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|word| word.chars().next())
+        .take(3)
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +88,38 @@ mod tests {
     use super::*;
 
     fn entry(label: &str) -> Entry {
-        Entry { label: label.into(), context: None, target: Target::Guild { guild_id: label.into() } }
+        Entry {
+            label: label.into(),
+            context: None,
+            icon: Icon::Initials(initials(label)),
+            target: Target::Guild { guild_id: label.into() },
+        }
+    }
+
+    #[test]
+    fn initials_take_the_first_letter_of_each_word() {
+        assert_eq!(initials("Hyper Nova"), "HN");
+        assert_eq!(initials("the rust mob"), "TRM");
+    }
+
+    #[test]
+    fn initials_cap_at_three_letters() {
+        assert_eq!(initials("a b c d e"), "ABC");
+    }
+
+    #[test]
+    fn initials_of_a_single_word_are_one_letter() {
+        assert_eq!(initials("general"), "G");
+    }
+
+    #[test]
+    fn initials_of_a_nameless_guild_are_empty_rather_than_panicking() {
+        assert_eq!(initials("   "), "");
+    }
+
+    #[test]
+    fn initials_handle_a_multibyte_first_character() {
+        assert_eq!(initials("\u{e9}quipe rouge"), "\u{c9}R");
     }
 
     fn best(labels: &[&str], query: &str) -> String {

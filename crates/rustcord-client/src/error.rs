@@ -18,4 +18,6 @@ pub enum ClientError {
     CaptchaFailed(String),
     #[error("malformed token")]
     MalformedToken,
+    #[error("search index not ready, retry in {retry_after}s")]
+    NotIndexed { retry_after: f64 },
 }
