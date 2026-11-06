@@ -34,6 +34,10 @@ struct EncodedVideoFrame {
     timestamp: u32,
     #[cfg(feature = "screenshare")]
     keyframe: bool,
+    #[cfg(feature = "screenshare")]
+    width: u32,
+    #[cfg(feature = "screenshare")]
+    height: u32,
 }
 
 struct IncomingVideoPacket {
@@ -80,6 +84,12 @@ pub struct VoiceStats {
     pub video_codec: String,
     pub video_decrypt_failures: u64,
     pub video_decoder_drops: u64,
+    pub video_fps_up: f32,
+    pub video_bitrate_up_bps: u32,
+    pub audio_stream_bitrate_up_bps: u32,
+    pub audio_stream_active: bool,
+    pub video_up_width: u32,
+    pub video_up_height: u32,
 }
 
 const VOICE_VERSION: &str = "v=8";
@@ -231,6 +241,16 @@ impl VoiceGateway {
         #[cfg(feature = "screenshare")]
         let mut video_interval_bytes = 0u64;
         #[cfg(feature = "screenshare")]
+        let mut video_up_interval_frames = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_up_interval_bytes = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut audio_up_interval_bytes = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_up_width = 0u32;
+        #[cfg(feature = "screenshare")]
+        let mut video_up_height = 0u32;
+        #[cfg(feature = "screenshare")]
         let mut video_width = 0u32;
         #[cfg(feature = "screenshare")]
         let mut video_height = 0u32;
@@ -301,10 +321,21 @@ impl VoiceGateway {
                     #[cfg(feature = "screenshare")]
                     let video_bitrate_sample = (video_interval_bytes as f32 * 8.0 / video_sample_elapsed).min(u32::MAX as f32) as u32;
                     #[cfg(feature = "screenshare")]
+                    let video_fps_up_sample = video_up_interval_frames as f32 / video_sample_elapsed;
+                    #[cfg(feature = "screenshare")]
+                    let video_bitrate_up_sample = (video_up_interval_bytes as f32 * 8.0 / video_sample_elapsed).min(u32::MAX as f32) as u32;
+                    #[cfg(feature = "screenshare")]
+                    let audio_stream_bitrate_up_sample = (audio_up_interval_bytes as f32 * 8.0 / video_sample_elapsed).min(u32::MAX as f32) as u32;
+                    #[cfg(feature = "screenshare")]
+                    let audio_stream_active = audio_up_interval_bytes > 0;
+                    #[cfg(feature = "screenshare")]
                     {
                         video_interval_started = Instant::now();
                         video_interval_packets = 0;
                         video_interval_bytes = 0;
+                        video_up_interval_frames = 0;
+                        video_up_interval_bytes = 0;
+                        audio_up_interval_bytes = 0;
                     }
                     const SSRC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
                     for ssrc in codec.idle_ssrcs(SSRC_IDLE_TIMEOUT) {
@@ -324,12 +355,15 @@ impl VoiceGateway {
                     let rtc_stats = rtc.as_ref().map(|r| r.stats.clone()).unwrap_or_default();
                     let dave = dave_session.epoch_info();
                     #[cfg(feature = "screenshare")]
-                    let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total) = (
+                    let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total,
+                        video_fps_up, video_bitrate_up_bps, audio_stream_bitrate_up_bps, audio_stream_active, video_up_width, video_up_height) = (
                         video_fps_sample, video_bitrate_sample, video_width, video_height,
                         format!("{:?}", negotiated_video_codec), video_decrypt_failures_total, video_decoder_drops_total,
+                        video_fps_up_sample, video_bitrate_up_sample, audio_stream_bitrate_up_sample, audio_stream_active, video_up_width, video_up_height,
                     );
                     #[cfg(not(feature = "screenshare"))]
-                    let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total) = (0.0, 0, 0, 0, String::new(), 0, 0);
+                    let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total,
+                        video_fps_up, video_bitrate_up_bps, audio_stream_bitrate_up_bps, audio_stream_active, video_up_width, video_up_height) = (0.0, 0, 0, 0, String::new(), 0, 0, 0.0, 0, 0, false, 0, 0);
                     let _ = tx.send(VoiceGatewayEvent::Stats(VoiceStats {
                         bitrate_up_bps: up,
                         bitrate_down_bps: down,
@@ -351,6 +385,12 @@ impl VoiceGateway {
                         video_codec,
                         video_decrypt_failures: video_decrypt_failures_total,
                         video_decoder_drops: video_decoder_drops_total,
+                        video_fps_up,
+                        video_bitrate_up_bps,
+                        audio_stream_bitrate_up_bps,
+                        audio_stream_active,
+                        video_up_width,
+                        video_up_height,
                     }));
                 }
                 _ = device_check.tick(), if media_connected => {
@@ -468,6 +508,8 @@ impl VoiceGateway {
                         bytes_sent = bytes_sent.saturating_add(payload.len() as u64);
                         if let Err(error) = active_rtc.send_audio_frame(&payload) {
                             tracing::debug!("screen audio: failed to send Opus frame: {error}");
+                        } else {
+                            audio_up_interval_bytes = audio_up_interval_bytes.saturating_add(payload.len() as u64);
                         }
                     }
                     if let Some(error) = send_error { break Err(error); }
@@ -492,10 +534,16 @@ impl VoiceGateway {
                         } else {
                             frame.data
                         };
-                        bytes_sent = bytes_sent.saturating_add(data.len() as u64);
+                        let frame_bytes = data.len() as u64;
+                        bytes_sent = bytes_sent.saturating_add(frame_bytes);
                         let rtc_frame = crate::screen_encode::EncodedFrame { data, timestamp: frame.timestamp, keyframe: frame.keyframe };
                         if let Err(error) = active_rtc.send_video_frame(&rtc_frame) {
                             tracing::debug!("voice: failed to send VP8 frame: {error}");
+                        } else {
+                            video_up_interval_frames += 1;
+                            video_up_interval_bytes = video_up_interval_bytes.saturating_add(frame_bytes);
+                            video_up_width = frame.width;
+                            video_up_height = frame.height;
                         }
                     }
                     #[cfg(not(feature = "screenshare"))]
@@ -1319,8 +1367,9 @@ fn encode_screen_frames(
             .expect("encoder initialized")
             .encode(&frame)
             .map_err(|error| error.to_string())?;
+        let (encoded_width, encoded_height) = encoder.as_ref().expect("encoder initialized").target_size();
         for frame in encoded {
-            if frames.try_send(EncodedVideoFrame { data: frame.data, timestamp: frame.timestamp, keyframe: frame.keyframe }).is_err() {
+            if frames.try_send(EncodedVideoFrame { data: frame.data, timestamp: frame.timestamp, keyframe: frame.keyframe, width: encoded_width, height: encoded_height }).is_err() {
                 tracing::trace!("screen share: dropping encoded frame because the RTP queue is full");
             }
         }
