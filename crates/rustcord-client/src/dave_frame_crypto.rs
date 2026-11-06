@@ -144,7 +144,22 @@ impl FrameCrypto {
     }
 
     pub fn encrypt(&mut self, opus_frame: &[u8]) -> Option<Vec<u8>> {
-        if opus_frame.is_empty() { return None; }
+        self.encrypt_with_unencrypted_ranges(opus_frame, &[])
+    }
+
+    pub fn encrypt_with_unencrypted_ranges(&mut self, frame: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
+        if frame.is_empty() { return None; }
+        let mut aad = Vec::new();
+        let mut ciphertext = Vec::new();
+        let mut previous_end = 0usize;
+        for &(offset, length) in ranges {
+            let end = offset.checked_add(length)?;
+            if length == 0 || offset < previous_end { return None; }
+            ciphertext.extend_from_slice(frame.get(previous_end..offset)?);
+            aad.extend_from_slice(frame.get(offset..end)?);
+            previous_end = end;
+        }
+        ciphertext.extend_from_slice(frame.get(previous_end..)?);
         let full_nonce = self.next_nonce;
         let next_nonce = full_nonce.checked_add(1)?;
         let nonce_value = full_nonce as u32;
@@ -153,13 +168,25 @@ impl FrameCrypto {
         let key = ratchet.key(generation)?;
         let mut nonce = [0u8; 12];
         nonce[8..].copy_from_slice(&nonce_value.to_le_bytes());
-        let mut ciphertext = opus_frame.to_vec();
-        let tag = encrypt_gcm(&key, &nonce, &mut ciphertext)?;
-        let mut output = Vec::with_capacity(opus_frame.len() + 16);
-        output.extend_from_slice(&ciphertext);
+        let tag = encrypt_gcm_with_aad(&key, &nonce, &aad, &mut ciphertext)?;
+        let mut output = Vec::with_capacity(frame.len() + 16 + ranges.len() * 4);
+        let mut frame_cursor = 0usize;
+        let mut encrypted_cursor = 0usize;
+        for &(offset, length) in ranges {
+            let encrypted_end = encrypted_cursor.checked_add(offset.checked_sub(frame_cursor)?)?;
+            output.extend_from_slice(ciphertext.get(encrypted_cursor..encrypted_end)?);
+            output.extend_from_slice(frame.get(offset..offset.checked_add(length)?)?);
+            encrypted_cursor = encrypted_end;
+            frame_cursor = offset.checked_add(length)?;
+        }
+        output.extend_from_slice(ciphertext.get(encrypted_cursor..)?);
         output.extend_from_slice(&tag[..TAG_LEN]);
         put_uleb128(nonce_value, &mut output);
-        let supplemental_size = output.len().checked_sub(opus_frame.len())?.checked_add(3)?;
+        for &(offset, length) in ranges {
+            put_uleb128(u32::try_from(offset).ok()?, &mut output);
+            put_uleb128(u32::try_from(length).ok()?, &mut output);
+        }
+        let supplemental_size = output.len().checked_sub(frame.len())?.checked_add(3)?;
         output.push(u8::try_from(supplemental_size).ok()?);
         output.extend_from_slice(&MARKER);
         self.next_nonce = next_nonce;
@@ -173,23 +200,48 @@ impl FrameCrypto {
         if supplemental_size < TAG_LEN + 1 + 2 || supplemental_size > marker_offset { return None; }
         let tag_start = marker_offset.checked_sub(supplemental_size.checked_sub(2)?)?;
         let mut cursor = tag_start.checked_add(TAG_LEN)?;
-        let (nonce_value, nonce_len) = read_uleb128(&frame[cursor..marker_offset - 1])?;
+        let supplemental_end = marker_offset - 1;
+        let (nonce_value, nonce_len) = read_uleb128(&frame[cursor..supplemental_end])?;
         cursor += nonce_len;
-        if cursor != marker_offset - 1 { return None; }
-        let ciphertext = &frame[..tag_start];
+        let mut ranges = Vec::new();
+        while cursor < supplemental_end {
+            let (offset, offset_len) = read_uleb128(&frame[cursor..supplemental_end])?;
+            cursor += offset_len;
+            let (length, length_len) = read_uleb128(&frame[cursor..supplemental_end])?;
+            cursor += length_len;
+            let offset = usize::try_from(offset).ok()?;
+            let length = usize::try_from(length).ok()?;
+            let end = offset.checked_add(length)?;
+            if length == 0 || ranges.last().is_some_and(|(_, previous_end)| offset < *previous_end) {
+                return None;
+            }
+            ranges.push((offset, end));
+        }
+        if cursor != supplemental_end { return None; }
+        let media_frame = &frame[..tag_start];
+        let mut aad = Vec::new();
+        let mut ciphertext = Vec::new();
+        let mut previous_end = 0;
+        for &(offset, end) in &ranges {
+            let clear = media_frame.get(offset..end)?;
+            ciphertext.extend_from_slice(media_frame.get(previous_end..offset)?);
+            aad.extend_from_slice(clear);
+            previous_end = end;
+        }
+        ciphertext.extend_from_slice(media_frame.get(previous_end..)?);
         let tag_end = tag_start.checked_add(TAG_LEN)?;
         let truncated_tag = frame.get(tag_start..tag_end)?;
         let now = Instant::now();
         self.previous_epochs.retain(|(expiry, _)| *expiry > now);
-        if let Some(plaintext) = try_decrypt(self.ratchets.get_mut(&sender_id), nonce_value, ciphertext, truncated_tag) {
-            return Some(plaintext);
+        if let Some(plaintext) = try_decrypt(self.ratchets.get_mut(&sender_id), nonce_value, &ciphertext, &aad, truncated_tag) {
+            return Some(restore_clear_ranges(media_frame, &ranges, &plaintext)?);
         }
-        if let Some(plaintext) = try_decrypt(self.pending_ratchets.get_mut(&sender_id), nonce_value, ciphertext, truncated_tag) {
-            return Some(plaintext);
+        if let Some(plaintext) = try_decrypt(self.pending_ratchets.get_mut(&sender_id), nonce_value, &ciphertext, &aad, truncated_tag) {
+            return Some(restore_clear_ranges(media_frame, &ranges, &plaintext)?);
         }
         for (_, epoch) in self.previous_epochs.iter_mut().rev() {
-            if let Some(plaintext) = try_decrypt(epoch.get_mut(&sender_id), nonce_value, ciphertext, truncated_tag) {
-                return Some(plaintext);
+            if let Some(plaintext) = try_decrypt(epoch.get_mut(&sender_id), nonce_value, &ciphertext, &aad, truncated_tag) {
+                return Some(restore_clear_ranges(media_frame, &ranges, &plaintext)?);
             }
         }
         None
@@ -200,6 +252,7 @@ fn try_decrypt(
     ratchet: Option<&mut SenderRatchet>,
     nonce_value: u32,
     ciphertext: &[u8],
+    aad: &[u8],
     truncated_tag: &[u8],
 ) -> Option<Vec<u8>> {
     let ratchet = ratchet?;
@@ -207,16 +260,36 @@ fn try_decrypt(
     let key = ratchet.key(generation)?;
     let mut nonce = [0u8; 12];
     nonce[8..].copy_from_slice(&nonce_value.to_le_bytes());
-    let expected_tag = calculate_tag(&key, &nonce, ciphertext)?;
+    let expected_tag = calculate_tag_with_aad(&key, &nonce, aad, ciphertext)?;
     if !bool::from(expected_tag[..TAG_LEN].ct_eq(truncated_tag)) { return None; }
     let mut plaintext = ciphertext.to_vec();
     apply_ctr(&key, &nonce, &mut plaintext)?;
     Some(plaintext)
 }
 
+fn restore_clear_ranges(media_frame: &[u8], ranges: &[(usize, usize)], encrypted: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::with_capacity(media_frame.len());
+    let mut frame_cursor = 0usize;
+    let mut encrypted_cursor = 0usize;
+    for &(offset, end) in ranges {
+        let encrypted_end = encrypted_cursor.checked_add(offset.checked_sub(frame_cursor)?)?;
+        output.extend_from_slice(encrypted.get(encrypted_cursor..encrypted_end)?);
+        output.extend_from_slice(media_frame.get(offset..end)?);
+        encrypted_cursor = encrypted_end;
+        frame_cursor = end;
+    }
+    output.extend_from_slice(encrypted.get(encrypted_cursor..)?);
+    (output.len() == media_frame.len()).then_some(output)
+}
+
+#[cfg(test)]
 fn encrypt_gcm(key: &[u8; 16], nonce: &[u8; 12], buffer: &mut [u8]) -> Option<[u8; 16]> {
+    encrypt_gcm_with_aad(key, nonce, &[], buffer)
+}
+
+fn encrypt_gcm_with_aad(key: &[u8; 16], nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]) -> Option<[u8; 16]> {
     apply_ctr(key, nonce, buffer)?;
-    calculate_tag(key, nonce, buffer)
+    calculate_tag_with_aad(key, nonce, aad, buffer)
 }
 
 fn apply_ctr(key: &[u8; 16], nonce: &[u8; 12], buffer: &mut [u8]) -> Option<()> {
@@ -234,15 +307,21 @@ fn apply_ctr(key: &[u8; 16], nonce: &[u8; 12], buffer: &mut [u8]) -> Option<()> 
     Some(())
 }
 
+#[cfg(test)]
 fn calculate_tag(key: &[u8; 16], nonce: &[u8; 12], ciphertext: &[u8]) -> Option<[u8; 16]> {
+    calculate_tag_with_aad(key, nonce, &[], ciphertext)
+}
+
+fn calculate_tag_with_aad(key: &[u8; 16], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Option<[u8; 16]> {
     let cipher = Aes128::new_from_slice(key).ok()?;
     let mut zero = GenericArray::default();
     cipher.encrypt_block(&mut zero);
     let ghash_key = GHashKey::clone_from_slice(&zero);
     let mut ghash = GHash::new(&ghash_key);
+    ghash.update_padded(aad);
     ghash.update_padded(ciphertext);
     let mut lengths = ghash::Block::default();
-    lengths[..8].copy_from_slice(&0u64.to_be_bytes());
+    lengths[..8].copy_from_slice(&(u64::try_from(aad.len()).ok()?.checked_mul(8)?).to_be_bytes());
     lengths[8..].copy_from_slice(&(u64::try_from(ciphertext.len()).ok()?.checked_mul(8)?).to_be_bytes());
     ghash.update(&[lengths]);
     let mut tag = ghash.finalize();

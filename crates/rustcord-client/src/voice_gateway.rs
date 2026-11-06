@@ -7,6 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+#[cfg(feature = "screenshare")]
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -71,6 +73,13 @@ pub struct VoiceStats {
     pub dave_version: u32,
     pub dave_epoch: Option<u64>,
     pub dave_code: Option<[u8; 4]>,
+    pub video_fps: f32,
+    pub video_bitrate_down_bps: u32,
+    pub video_width: u32,
+    pub video_height: u32,
+    pub video_codec: String,
+    pub video_decrypt_failures: u64,
+    pub video_decoder_drops: u64,
 }
 
 const VOICE_VERSION: &str = "v=8";
@@ -132,8 +141,14 @@ impl VoiceGateway {
     ) -> Result<(), ClientError> {
         let _ = tx.send(VoiceGatewayEvent::Connecting);
 
+        if self.stream_media {
+            tracing::info!(publish_stream = self.publish_stream, "connecting screen share voice gateway");
+        }
         let url = format!("wss://{}/?{VOICE_VERSION}", self.endpoint);
         let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+        if self.stream_media {
+            tracing::info!("screen share voice websocket connected");
+        }
         let (mut write, mut read) = ws_stream.split();
 
         let hello = read
@@ -141,6 +156,9 @@ impl VoiceGateway {
             .await
             .ok_or_else(|| ClientError::GatewayClosed("no voice hello frame".into()))??;
         let hello_payload: Payload = serde_json::from_str(&hello.into_text()?)?;
+        if self.stream_media {
+            tracing::info!("screen share voice websocket received hello");
+        }
         let heartbeat_interval = hello_payload
             .d
             .and_then(|d| d.get("heartbeat_interval").and_then(Value::as_f64))
@@ -192,6 +210,34 @@ impl VoiceGateway {
         let mut mic_frame_count: u64 = 0;
         let mut last_select_entry: Option<Instant> = None;
         let mut received_audio_frame_count: u64 = 0;
+        #[cfg(feature = "screenshare")]
+        let mut received_video_packet_count: u64 = 0;
+        #[cfg(feature = "screenshare")]
+        let mut logged_video_decrypt_result = false;
+        #[cfg(feature = "screenshare")]
+        let mut video_stats_started = Instant::now();
+        #[cfg(feature = "screenshare")]
+        let mut video_stats_frames = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_stats_bytes = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_decrypt_failures = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_queue_drops = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_interval_started = Instant::now();
+        #[cfg(feature = "screenshare")]
+        let mut video_interval_packets = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_interval_bytes = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_width = 0u32;
+        #[cfg(feature = "screenshare")]
+        let mut video_height = 0u32;
+        #[cfg(feature = "screenshare")]
+        let mut video_decrypt_failures_total = 0u64;
+        #[cfg(feature = "screenshare")]
+        let mut video_decoder_drops_total = 0u64;
         let mut decrypt_success_count: u64 = 0;
         let mut decrypt_failure_count: u64 = 0;
         let mut decode_success_count: u64 = 0;
@@ -248,6 +294,18 @@ impl VoiceGateway {
                     });
                 }
                 _ = stats_check.tick() => {
+                    #[cfg(feature = "screenshare")]
+                    let video_sample_elapsed = video_interval_started.elapsed().as_secs_f32().max(0.001);
+                    #[cfg(feature = "screenshare")]
+                    let video_fps_sample = video_interval_packets as f32 / video_sample_elapsed;
+                    #[cfg(feature = "screenshare")]
+                    let video_bitrate_sample = (video_interval_bytes as f32 * 8.0 / video_sample_elapsed).min(u32::MAX as f32) as u32;
+                    #[cfg(feature = "screenshare")]
+                    {
+                        video_interval_started = Instant::now();
+                        video_interval_packets = 0;
+                        video_interval_bytes = 0;
+                    }
                     const SSRC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
                     for ssrc in codec.idle_ssrcs(SSRC_IDLE_TIMEOUT) {
                         if remote_speakers.contains_key(&ssrc) {
@@ -265,6 +323,13 @@ impl VoiceGateway {
                     bytes_received = 0;
                     let rtc_stats = rtc.as_ref().map(|r| r.stats.clone()).unwrap_or_default();
                     let dave = dave_session.epoch_info();
+                    #[cfg(feature = "screenshare")]
+                    let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total) = (
+                        video_fps_sample, video_bitrate_sample, video_width, video_height,
+                        format!("{:?}", negotiated_video_codec), video_decrypt_failures_total, video_decoder_drops_total,
+                    );
+                    #[cfg(not(feature = "screenshare"))]
+                    let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total) = (0.0, 0, 0, 0, String::new(), 0, 0);
                     let _ = tx.send(VoiceGatewayEvent::Stats(VoiceStats {
                         bitrate_up_bps: up,
                         bitrate_down_bps: down,
@@ -279,6 +344,13 @@ impl VoiceGateway {
                         dave_version: target_dave_version,
                         dave_epoch: dave.map(|d| d.0),
                         dave_code: dave.map(|d| d.1),
+                        video_fps,
+                        video_bitrate_down_bps,
+                        video_width,
+                        video_height,
+                        video_codec,
+                        video_decrypt_failures: video_decrypt_failures_total,
+                        video_decoder_drops: video_decoder_drops_total,
                     }));
                 }
                 _ = device_check.tick(), if media_connected => {
@@ -411,7 +483,8 @@ impl VoiceGateway {
                             video_announced = true;
                         }
                         let data = if dave_enabled {
-                            let Some(encrypted) = frame_crypto.encrypt(&frame.data) else {
+                            let clear_header = if frame.keyframe { 10 } else { 1 };
+                            let Some(encrypted) = frame_crypto.encrypt_with_unencrypted_ranges(&frame.data, &[(0, clear_header)]) else {
                                 tracing::debug!("voice: DAVE encryption failed; dropping VP8 frame");
                                 continue;
                             };
@@ -429,6 +502,11 @@ impl VoiceGateway {
                     let _ = frame;
                 }
                 Some(frame) = decoded_video_rx.recv() => {
+                    #[cfg(feature = "screenshare")]
+                    {
+                        video_width = frame.width;
+                        video_height = frame.height;
+                    }
                     #[cfg(feature = "screenshare")]
                     let _ = tx.send(VoiceGatewayEvent::VideoFrame {
                         user_id: frame.user_id,
@@ -490,6 +568,9 @@ impl VoiceGateway {
                                             let rtx = stream["rtx_ssrc"].as_u64().map(|value| value as u32).unwrap_or(ssrc.wrapping_add(1));
                                             Some((ssrc, rtx))
                                         });
+                                }
+                                if self.stream_media {
+                                    tracing::info!(has_video_ssrc = ready_video_ssrcs.is_some(), "screen share voice gateway received READY");
                                 }
                                 if let Err(e) = write.send(WsMessage::Text(json!({ "op": 16, "d": {} }).to_string())).await {
                                     break Err(e.into());
@@ -559,6 +640,9 @@ impl VoiceGateway {
                                 let Some(remote) = remote_sdp else {
                                     break Err(ClientError::GatewayClosed("voice: session description missing parsable sdp".into()));
                                 };
+                                if self.stream_media {
+                                    tracing::info!(remote_ice_candidates = remote.candidates.len(), "applying screen share RTC session description");
+                                }
                                 if let Err(e) = active_rtc.set_remote(&remote) {
                                     tracing::warn!("voice: set_remote failed: {e}");
                                     break Err(e);
@@ -591,6 +675,9 @@ impl VoiceGateway {
                                         }
                                         #[cfg(feature = "screenshare")]
                                         if let (Some(user_id), true) = (speaker_id, video_ssrc != 0) {
+                                            if self.stream_media {
+                                                tracing::info!("screen share RTC mapped remote video SSRC");
+                                            }
                                             remote_video_speakers.insert(video_ssrc, user_id.to_string());
                                             if let Some(active_rtc) = rtc.as_mut() {
                                                 active_rtc.expect_remote_video(video_ssrc);
@@ -719,6 +806,9 @@ impl VoiceGateway {
                                     }
                                     #[cfg(feature = "screenshare")]
                                     if let (Some(user_id), true) = (user_id, video_ssrc != 0) {
+                                        if self.stream_media {
+                                            tracing::info!("screen share RTC announced remote video SSRC");
+                                        }
                                         remote_video_speakers.insert(video_ssrc, user_id.to_string());
                                         if let Some(active_rtc) = rtc.as_mut() {
                                             active_rtc.expect_remote_video(video_ssrc);
@@ -821,6 +911,9 @@ impl VoiceGateway {
                     match rtc_event {
                         Ok(Some(RtcEvent::Connected)) => {
                             media_connected = true;
+                            if self.stream_media {
+                                tracing::info!("screen share RTC media transport connected");
+                            }
                             let audio_ssrc = rtc.as_ref().map(|r| r.audio_ssrc()).unwrap_or_default();
                             #[cfg(feature = "screenshare")]
                             let client_connect = rtc.as_ref().map(|r| {
@@ -872,6 +965,35 @@ impl VoiceGateway {
                         }
                         #[cfg(feature = "screenshare")]
                         Ok(Some(RtcEvent::VideoData { ssrc, payload })) => {
+                            received_video_packet_count += 1;
+                            video_stats_frames += 1;
+                            video_stats_bytes = video_stats_bytes.saturating_add(payload.len() as u64);
+                            video_interval_packets += 1;
+                            video_interval_bytes = video_interval_bytes.saturating_add(payload.len() as u64);
+                            if self.stream_media && received_video_packet_count == 1 {
+                                tracing::info!(ssrc, bytes = payload.len(), dave_active = dave_enabled, "received first screen share RTP video packet");
+                            }
+                            let stats_elapsed = video_stats_started.elapsed();
+                            if stats_elapsed >= Duration::from_secs(2) {
+                                if self.stream_media || self.publish_stream {
+                                    tracing::info!(
+                                        frames = video_stats_frames,
+                                        fps = video_stats_frames as f32 / stats_elapsed.as_secs_f32(),
+                                        receive_kbps = video_stats_bytes as f32 * 8.0 / stats_elapsed.as_secs_f32() / 1000.0,
+                                        average_frame_bytes = video_stats_bytes / video_stats_frames.max(1),
+                                        codec = ?negotiated_video_codec,
+                                        dave_active = dave_enabled,
+                                        decrypt_failures = video_decrypt_failures,
+                                        decoder_queue_drops = video_queue_drops,
+                                        "screen share incoming video stats"
+                                    );
+                                }
+                                video_stats_started = Instant::now();
+                                video_stats_frames = 0;
+                                video_stats_bytes = 0;
+                                video_decrypt_failures = 0;
+                                video_queue_drops = 0;
+                            }
                             let Some(user_id) = remote_video_speakers.get(&ssrc).cloned() else {
                                 tracing::trace!("voice: video frame for unknown SSRC {ssrc}");
                                 continue;
@@ -879,15 +1001,27 @@ impl VoiceGateway {
                             let payload = if dave_enabled {
                                 let Ok(numeric_id) = user_id.parse::<u64>() else { continue };
                                 let Some(clear) = frame_crypto.decrypt(numeric_id, &payload) else {
-                                    tracing::debug!("voice: failed to decrypt VP8 frame for user {user_id}");
+                                    video_decrypt_failures += 1;
+                                    video_decrypt_failures_total += 1;
+                                    if self.stream_media && !logged_video_decrypt_result {
+                                        tracing::warn!("DAVE could not decrypt the first screen share video packet");
+                                        logged_video_decrypt_result = true;
+                                    }
+                                    tracing::debug!("voice: failed to decrypt video frame for user {user_id}");
                                     continue;
                                 };
+                                if self.stream_media && !logged_video_decrypt_result {
+                                    tracing::info!("DAVE decrypted the first screen share video packet");
+                                    logged_video_decrypt_result = true;
+                                }
                                 clear
                             } else {
                                 payload
                             };
                             let packet = IncomingVideoPacket { ssrc, user_id, payload, codec: negotiated_video_codec };
                             if video_packet_tx.try_send(packet).is_err() {
+                                video_queue_drops += 1;
+                                video_decoder_drops_total += 1;
                                 tracing::trace!("voice: dropping incoming video frame because decoder queue is full");
                             }
                         }
@@ -1081,6 +1215,10 @@ fn decode_screen_packets(
 ) {
     let mut packets = packets;
     let mut decoders: HashMap<u32, (crate::screen_decode::VideoCodec, Option<crate::screen_decode::VideoDecoder>)> = HashMap::new();
+    let mut logged_first_packet: HashSet<u32> = HashSet::new();
+    let mut logged_first_frame: HashSet<u32> = HashSet::new();
+    let mut decode_stats_started = Instant::now();
+    let mut decode_stats_frames = 0u64;
     while let Some(packet) = packets.blocking_recv() {
         let entry = decoders.entry(packet.ssrc).or_insert_with(|| (packet.codec, None));
         if entry.0 != packet.codec {
@@ -1098,6 +1236,23 @@ fn decode_screen_packets(
         let Some(decoder) = entry.1.as_mut() else { continue };
         match decoder.decode(&packet.payload) {
             Ok(Some(frame)) => {
+                decode_stats_frames += 1;
+                if logged_first_frame.insert(packet.ssrc) {
+                    tracing::info!(codec = ?packet.codec, width = frame.width, height = frame.height, "decoded first remote screen share frame");
+                }
+                let elapsed = decode_stats_started.elapsed();
+                if elapsed >= Duration::from_secs(2) {
+                    tracing::info!(
+                        ssrc = packet.ssrc,
+                        codec = ?packet.codec,
+                        decoded_fps = decode_stats_frames as f32 / elapsed.as_secs_f32(),
+                        width = frame.width,
+                        height = frame.height,
+                        "screen share decoder stats"
+                    );
+                    decode_stats_started = Instant::now();
+                    decode_stats_frames = 0;
+                }
                 let decoded = DecodedScreenFrame {
                     user_id: packet.user_id,
                     width: frame.width,
@@ -1108,8 +1263,18 @@ fn decode_screen_packets(
                     break;
                 }
             }
-            Ok(None) => {}
-            Err(error) => tracing::debug!("could not decode remote {:?} frame: {error}", packet.codec),
+            Ok(None) => {
+                if logged_first_packet.insert(packet.ssrc) {
+                    tracing::info!(codec = ?packet.codec, "decoder accepted the first screen share packet but has not produced a frame");
+                }
+            }
+            Err(error) => {
+                if logged_first_packet.insert(packet.ssrc) {
+                    tracing::warn!("first remote {:?} screen share packet failed to decode: {error}", packet.codec);
+                } else {
+                    tracing::debug!("could not decode remote {:?} frame: {error}", packet.codec);
+                }
+            }
         }
     }
 }
@@ -1134,22 +1299,31 @@ fn encode_screen_frames(
     let mut encoder: Option<Vp8Encoder> = None;
     while sharing.load(std::sync::atomic::Ordering::Relaxed) {
         let Some(frame) = capture.blocking_next_frame() else { break };
-            if encoder.as_ref().is_none_or(|current| !current.matches_source(frame.width, frame.height, frame.layout)) {
-                encoder = Some(
-                    Vp8Encoder::new(frame.width, frame.height, frame.layout, EncoderSettings::default())
-                        .map_err(|error| error.to_string())?,
-                );
-            }
-            let encoded = encoder
-                .as_mut()
-                .expect("encoder initialized")
-                .encode(&frame)
+        if encoder.as_ref().is_none_or(|current| !current.matches_source(frame.width, frame.height, frame.layout)) {
+            let settings = EncoderSettings::default();
+            let new_encoder = Vp8Encoder::new(frame.width, frame.height, frame.layout, settings)
                 .map_err(|error| error.to_string())?;
-            for frame in encoded {
-                if frames.try_send(EncodedVideoFrame { data: frame.data, timestamp: frame.timestamp, keyframe: frame.keyframe }).is_err() {
-                    tracing::trace!("screen share: dropping encoded frame because the RTP queue is full");
-                }
+            let (target_width, target_height) = new_encoder.target_size();
+            tracing::info!(
+                source_width = frame.width,
+                source_height = frame.height,
+                encoded_width = target_width,
+                encoded_height = target_height,
+                bitrate_bps = settings.bitrate_bps,
+                "screen share VP8 encoder configured"
+            );
+            encoder = Some(new_encoder);
+        }
+        let encoded = encoder
+            .as_mut()
+            .expect("encoder initialized")
+            .encode(&frame)
+            .map_err(|error| error.to_string())?;
+        for frame in encoded {
+            if frames.try_send(EncodedVideoFrame { data: frame.data, timestamp: frame.timestamp, keyframe: frame.keyframe }).is_err() {
+                tracing::trace!("screen share: dropping encoded frame because the RTP queue is full");
             }
+        }
     }
     Ok(())
 }
