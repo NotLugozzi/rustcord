@@ -2064,8 +2064,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     let [display_w, display_h] = ui.io().display_size;
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
+    let surface_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.panel };
+    let servers_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.servers_bg() };
 
-    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.servers_bg());
+    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, servers_bg);
     ui.window("servers")
         .position([0.0, 0.0], imgui::Condition::Always)
         .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
@@ -2089,7 +2091,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             ui.set_cursor_pos([0.0, after_separator_y]);
 
             let _no_pad = ui.push_style_var(imgui::StyleVar::WindowPadding([0.0, 0.0]));
-            let _child_bg = ui.push_style_color(imgui::StyleColor::ChildBg, state.theme.servers_bg());
+            let _child_bg = ui.push_style_color(imgui::StyleColor::ChildBg, servers_bg);
             ui.child_window("guilds_scroll").size([RAIL_WIDTH, display_h - after_separator_y]).build(|| {
                 ui.set_cursor_pos([rail_center_x, 0.0]);
                 draw_rail_items(ui, state, cmd_tx, textures, rail_center_x);
@@ -2099,7 +2101,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         });
         _server_bg.pop(); // <- Non dimenticare il pop()!
 
-    let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
+    let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, surface_bg);
     ui.window("channels")
         .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
         .size([sidebar_width, display_h], imgui::Condition::Always)
@@ -2112,6 +2114,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             } else {
                 0.0
             };
+            let _channels_content_bg = ui.push_style_color(imgui::StyleColor::ChildBg, surface_bg);
             ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - voice_bar_reserved - 36.0]).build(|| {
             if state.selected_guild.is_some() {
                 let groups: Vec<(Option<String>, Vec<(String, String, Option<String>, bool)>)> = state
@@ -2335,6 +2338,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         0.0
     };
 
+    let chat_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.background };
+    let _chat_bg = ui.push_style_color(imgui::StyleColor::WindowBg, chat_bg);
     ui.window("chat")
         .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
         .size([display_w - RAIL_WIDTH - sidebar_width - right_panel_width, display_h], imgui::Condition::Always)
@@ -2352,10 +2357,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
             let mut header_height = if state.selected_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
             if state.selected_channel.is_some() {
+                let _header_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
                 draw_channel_header(ui, state, cmd_tx, textures, dm_channel.as_ref());
             }
             if let Some(dm) = &dm_channel {
                 if state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == dm.id) {
+                    let _call_panel_bg = ui.push_style_color(imgui::StyleColor::ChildBg, surface_bg);
                     draw_dm_call_panel(ui, state, textures, cmd_tx, dm);
                     header_height += CALL_PANEL_HEIGHT;
                 }
@@ -2373,6 +2380,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 + state.editing.is_some() as u32 as f32)
                 * line_height;
 
+            let _history_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
             ui.child_window(format!("history_{channel_key}"))
                 .size([0.0, display_h - 80.0 - status_height - header_height - extra_banner_height])
                 .build(|| {
@@ -3585,12 +3593,12 @@ fn emoji_button(ui: &Ui, textures: &TextureCache, id: &str, ch: char, tooltip: &
     let hovered = ui.is_item_hovered();
     let dl = ui.get_window_draw_list();
     let fill = match (active, hovered) {
-        (Some(c), _) => Some(c),
+        (Some(c), _) => Some([c[0], c[1], c[2], 0.18]),
         (None, true) => Some(ui.style_color(imgui::StyleColor::ButtonHovered)),
-        (None, false) => Some(ui.style_color(imgui::StyleColor::Button)),
+        (None, false) => None,
     };
     if let Some(c) = fill {
-        dl.add_rect(p, [p[0] + SIZE, p[1] + SIZE], c).filled(true).rounding(6.0).build();
+        dl.add_rect(p, [p[0] + SIZE, p[1] + SIZE], c).filled(true).rounding(9.0).build();
     }
     if let EmojiTexture::Ready(tex) = emoji_texture(textures, ch) {
         let pad = 4.0;
