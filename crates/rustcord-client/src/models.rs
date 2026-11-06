@@ -103,6 +103,8 @@ pub struct VoiceState {
     #[serde(default)]
     pub self_deaf: bool,
     #[serde(default)]
+    pub self_stream: Option<bool>,
+    #[serde(default)]
     pub mute: bool,
     #[serde(default)]
     pub deaf: bool,

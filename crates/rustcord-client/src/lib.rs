@@ -9,6 +9,10 @@ pub mod rest;
 #[cfg(feature = "screenshare")]
 pub mod screen_capture;
 #[cfg(feature = "screenshare")]
+pub mod screen_audio;
+#[cfg(feature = "screenshare")]
+pub mod screen_decode;
+#[cfg(feature = "screenshare")]
 pub mod screen_encode;
 pub mod gateway;
 pub mod voice_audio;
