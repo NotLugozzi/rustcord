@@ -24,6 +24,9 @@ pub struct VoiceMediaState {
     pub mic: crate::voice_audio::MicProcessing,
     pub user_volumes: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     pub screen_sharing: Arc<AtomicBool>,
+    pub system_audio_enabled: Arc<AtomicBool>,
+    pub screen_share_max_height: Arc<std::sync::atomic::AtomicU32>,
+    pub screen_share_fps: Arc<std::sync::atomic::AtomicU32>,
 }
 
 #[derive(Debug)]
@@ -453,13 +456,15 @@ impl VoiceGateway {
                         (false, true) => {
                             let frames = video_frame_tx.clone();
                             let sharing = self.media_state.screen_sharing.clone();
+                            let max_height = self.media_state.screen_share_max_height.load(std::sync::atomic::Ordering::Relaxed);
+                            let framerate = self.media_state.screen_share_fps.load(std::sync::atomic::Ordering::Relaxed);
                             screen_share_task = Some(tokio::spawn(async move {
-                                if let Err(error) = capture_and_encode_screen(frames, sharing).await {
+                                if let Err(error) = capture_and_encode_screen(frames, sharing, max_height, framerate).await {
                                     tracing::warn!("screen share stopped: {error}");
                                 }
                             }));
                             #[cfg(feature = "screenshare")]
-                            {
+                            if self.media_state.system_audio_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                 let audio = system_audio_tx.clone();
                                 let sharing = self.media_state.screen_sharing.clone();
                                 tokio::task::spawn_blocking(move || {
@@ -509,7 +514,8 @@ impl VoiceGateway {
                         if let Err(error) = active_rtc.send_audio_frame(&payload) {
                             tracing::debug!("screen audio: failed to send Opus frame: {error}");
                         } else {
-                            audio_up_interval_bytes = audio_up_interval_bytes.saturating_add(payload.len() as u64);
+                            #[cfg(feature = "screenshare")]
+                            { audio_up_interval_bytes = audio_up_interval_bytes.saturating_add(payload.len() as u64); }
                         }
                     }
                     if let Some(error) = send_error { break Err(error); }
@@ -1238,13 +1244,15 @@ impl VoiceGateway {
 async fn capture_and_encode_screen(
     frames: mpsc::Sender<EncodedVideoFrame>,
     sharing: Arc<AtomicBool>,
+    max_height: u32,
+    framerate: u32,
 ) -> Result<(), String> {
     #[cfg(feature = "screenshare")]
     {
-        let capture = crate::screen_capture::ScreenCapture::start()
+        let capture = crate::screen_capture::ScreenCapture::start(framerate)
             .await
             .map_err(|error| error.to_string())?;
-        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, sharing))
+        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, sharing, max_height, framerate))
             .await
             .map_err(|error| format!("screen encoder worker failed: {error}"))?
     }
@@ -1252,6 +1260,7 @@ async fn capture_and_encode_screen(
     {
         let _ = frames;
         let _ = sharing;
+        let _ = (max_height, framerate);
         Err("screen sharing was not enabled in this build".into())
     }
 }
@@ -1341,6 +1350,8 @@ fn encode_screen_frames(
     mut capture: crate::screen_capture::ScreenCapture,
     frames: mpsc::Sender<EncodedVideoFrame>,
     sharing: Arc<AtomicBool>,
+    max_height: u32,
+    framerate: u32,
 ) -> Result<(), String> {
     use crate::screen_encode::{EncoderSettings, Vp8Encoder};
 
@@ -1348,7 +1359,13 @@ fn encode_screen_frames(
     while sharing.load(std::sync::atomic::Ordering::Relaxed) {
         let Some(frame) = capture.blocking_next_frame() else { break };
         if encoder.as_ref().is_none_or(|current| !current.matches_source(frame.width, frame.height, frame.layout)) {
-            let settings = EncoderSettings::default();
+            let bitrate_bps = match (max_height >= 1080, framerate >= 60) {
+                (true, true) => 4_000_000,
+                (true, false) => 2_500_000,
+                (false, true) => 2_500_000,
+                (false, false) => 1_500_000,
+            };
+            let settings = EncoderSettings { max_height, bitrate_bps, keyframe_interval: framerate.saturating_mul(2) };
             let new_encoder = Vp8Encoder::new(frame.width, frame.height, frame.layout, settings)
                 .map_err(|error| error.to_string())?;
             let (target_width, target_height) = new_encoder.target_size();

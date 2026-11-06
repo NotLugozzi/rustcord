@@ -15,7 +15,6 @@ use tokio::sync::mpsc;
 
 pub const MAX_CAPTURE_WIDTH: u32 = 8192;
 pub const MAX_CAPTURE_HEIGHT: u32 = 8192;
-const PREFERRED_FRAMERATE: u32 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelLayout {
@@ -69,7 +68,7 @@ pub struct ScreenCapture {
 }
 
 impl ScreenCapture {
-    pub async fn start() -> Result<Self, ClientError> {
+    pub async fn start(framerate: u32) -> Result<Self, ClientError> {
         let (fd, node_id) = negotiate_portal().await?;
         let (frame_tx, frames) = mpsc::channel(2);
         let stop = Arc::new(AtomicBool::new(false));
@@ -77,7 +76,7 @@ impl ScreenCapture {
         let thread = std::thread::Builder::new()
             .name("screen-capture".into())
             .spawn(move || {
-                if let Err(e) = run_pipewire(fd, node_id, frame_tx, thread_stop) {
+                if let Err(e) = run_pipewire(fd, node_id, frame_tx, thread_stop, framerate.clamp(15, 60)) {
                     tracing::error!("screen capture loop failed: {e}");
                 }
             })
@@ -148,6 +147,7 @@ fn run_pipewire(
     node_id: u32,
     sender: mpsc::Sender<CapturedFrame>,
     stop: Arc<AtomicBool>,
+    framerate: u32,
 ) -> Result<(), ClientError> {
     let pipewire = |e: pw::Error| ClientError::ScreenCapture(e.to_string());
 
@@ -240,7 +240,7 @@ fn run_pipewire(
         .register()
         .map_err(pipewire)?;
 
-    let values = format_pod()?;
+    let values = format_pod(framerate)?;
     let mut params = [Pod::from_bytes(&values)
         .ok_or_else(|| ClientError::ScreenCapture("could not build the format descriptor".into()))?];
     stream
@@ -288,7 +288,7 @@ pub fn pack_rows(pixels: &[u8], width: u32, height: u32, stride: usize) -> Optio
     Some(packed)
 }
 
-fn format_pod() -> Result<Vec<u8>, ClientError> {
+fn format_pod(framerate: u32) -> Result<Vec<u8>, ClientError> {
     let obj = spa::pod::Object {
         type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: spa::param::ParamType::EnumFormat.as_raw(),
@@ -337,7 +337,7 @@ fn format_pod() -> Result<Vec<u8>, ClientError> {
                 value: Value::Choice(ChoiceValue::Fraction(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Range {
-                        default: Fraction { num: PREFERRED_FRAMERATE, denom: 1 },
+                        default: Fraction { num: framerate, denom: 1 },
                         min: Fraction { num: 0, denom: 1 },
                         max: Fraction { num: 120, denom: 1 },
                     },

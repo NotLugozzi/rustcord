@@ -147,7 +147,7 @@ pub enum UiCommand {
     DeclineCall { channel_id: String },
     LeaveVoiceChannel { guild_id: Option<String> },
     SetVoiceMuteDeaf { guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
-    SetScreenSharing { enabled: bool, guild_id: Option<String>, channel_id: String },
+    SetScreenSharing { enabled: bool, include_system_audio: bool, max_height: u32, framerate: u32, guild_id: Option<String>, channel_id: String },
     WatchStream { stream_key: String },
     StopWatchingStream { stream_key: String },
     SetVoiceInputDevice { device: Option<String> },
@@ -198,6 +198,8 @@ pub enum BackendEvent {
     ScreenShareStopped,
     VoiceSpeaking { user_id: String, speaking: bool },
     VoiceStats(rustcord_client::voice_gateway::VoiceStats),
+    #[cfg(feature = "screenshare")]
+    ScreenShareStats(rustcord_client::voice_gateway::VoiceStats),
     Notice(String),
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
     MemberRemoved { guild_id: String, user_id: String },
@@ -685,8 +687,11 @@ pub fn spawn(
                         media_state.deafened.store(self_deaf, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                UiCommand::SetScreenSharing { enabled, guild_id, channel_id } => {
+                UiCommand::SetScreenSharing { enabled, include_system_audio, max_height, framerate, guild_id, channel_id } => {
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        media_state.system_audio_enabled.store(include_system_audio, std::sync::atomic::Ordering::Relaxed);
+                        media_state.screen_share_max_height.store(max_height.clamp(720, 1080), std::sync::atomic::Ordering::Relaxed);
+                        media_state.screen_share_fps.store(framerate.clamp(15, 60), std::sync::atomic::Ordering::Relaxed);
                         media_state.screen_sharing.store(enabled, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
@@ -813,6 +818,7 @@ fn try_spawn_stream_gateway(
     if !publish_stream {
         media_state.screen_sharing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
+    tracing::info!(publish_stream, "starting screen share RTC gateway");
     if let Some(task) = stream_task.take() {
         task.abort();
     }
@@ -826,9 +832,15 @@ fn try_spawn_stream_gateway(
     let events_forward = forward_tx.clone();
     let stream_key_for_events = stream_key.clone();
     tokio::spawn(async move {
+        #[cfg(feature = "screenshare")]
+        let mut got_video_frame = false;
+        let mut got_stats = false;
         while let Some(event) = event_rx.recv().await {
             use rustcord_client::voice_gateway::VoiceGatewayEvent;
             match event {
+                VoiceGatewayEvent::Connecting => tracing::info!("screen share RTC websocket connecting"),
+                VoiceGatewayEvent::Ready => tracing::info!("screen share RTC signaling ready"),
+                VoiceGatewayEvent::MediaConnected => tracing::info!("screen share RTC media connected"),
                 VoiceGatewayEvent::ScreenShareStopped => {
                     if publish_stream {
                         if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
@@ -840,7 +852,8 @@ fn try_spawn_stream_gateway(
                         let _ = events_forward.send(BackendEvent::ScreenShareStopped);
                     }
                 }
-                VoiceGatewayEvent::Disconnected { .. } => {
+                VoiceGatewayEvent::Disconnected { reason } => {
+                    tracing::warn!(reason = %reason, "screen share RTC disconnected");
                     if publish_stream {
                         if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
                             media_state.screen_sharing.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -850,9 +863,21 @@ fn try_spawn_stream_gateway(
                 }
                 #[cfg(feature = "screenshare")]
                 VoiceGatewayEvent::VideoFrame { user_id, width, height, rgba } => {
+                    if !got_video_frame {
+                        tracing::info!(width, height, "received first decoded screen share frame");
+                        got_video_frame = true;
+                    }
                     if let Some(image) = image::RgbaImage::from_raw(width, height, rgba) {
                         let _ = events_forward.send(BackendEvent::RemoteVideoFrame { user_id, rgba: image });
                     }
+                }
+                VoiceGatewayEvent::Stats(stats) => {
+                    if !got_stats {
+                        tracing::info!(down_bps = stats.bitrate_down_bps, video_down_bps = stats.video_bitrate_down_bps, dave_active = stats.dave_active, "screen share RTC first stats");
+                        got_stats = true;
+                    }
+                    #[cfg(feature = "screenshare")]
+                    let _ = events_forward.send(BackendEvent::ScreenShareStats(stats));
                 }
                 _ => {}
             }

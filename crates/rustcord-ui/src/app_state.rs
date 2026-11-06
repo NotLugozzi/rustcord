@@ -277,17 +277,26 @@ pub struct AppState {
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
     pub active_streams: HashMap<String, String>,
     pub watching_stream: Option<String>,
+    pub unwatching_stream: Option<String>,
+    pub server_call_minimized: bool,
+    pub server_call_focus_stream: bool,
     pub voice_speaking_users: std::collections::HashSet<String>,
     pub connected_voice_channel: Option<(Option<String>, String)>,
     pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
     pub screen_sharing: bool,
+    pub share_system_audio: bool,
+    pub screen_share_max_height: u32,
+    pub screen_share_fps: u32,
+    pub show_screen_share_setup: bool,
     pub self_muted: bool,
     pub self_deafened: bool,
     pub voice_input_devices: Vec<String>,
     pub voice_output_devices: Vec<String>,
     pub voice_stats: rustcord_client::voice_gateway::VoiceStats,
     pub voice_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
+    pub screen_share_stats: rustcord_client::voice_gateway::VoiceStats,
+    pub screen_share_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
     pub show_voice_info: bool,
     pub voice_joined_at: Option<std::time::Instant>,
     pub selected_input_device: Option<String>,
@@ -1009,6 +1018,9 @@ impl AppState {
         {
             if voice_state.channel_id.is_none() || voice_state.self_stream == Some(false) {
                 self.active_streams.remove(&voice_state.user_id);
+                if self.unwatching_stream.as_deref().is_some_and(|key| key.ends_with(&format!(":{}", voice_state.user_id))) {
+                    self.unwatching_stream = None;
+                }
             } else if voice_state.self_stream == Some(true) {
                 if let (Some(guild_id), Some(channel_id)) = (&voice_state.guild_id, &voice_state.channel_id) {
                     let stream_key = format!("guild:{guild_id}:{channel_id}:{}", voice_state.user_id);

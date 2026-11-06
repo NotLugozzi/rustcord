@@ -58,6 +58,9 @@ fn main() {
         notes: app_state::load_notes(),
         mic_gain: saved_settings.mic_gain.unwrap_or(1.0),
         denoise: saved_settings.denoise,
+        share_system_audio: true,
+        screen_share_max_height: 1080,
+        screen_share_fps: 30,
         user_volumes: saved_settings.user_volumes,
         selected_input_device: saved_settings.input_device,
         selected_output_device: saved_settings.output_device,
@@ -264,6 +267,9 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::VoiceServerUpdate { .. }) => {}
             BackendEvent::Gateway(GatewayEvent::StreamCreate { stream_key, .. }) => {
+                if state.unwatching_stream.as_deref() == Some(stream_key.as_str()) {
+                    state.unwatching_stream = None;
+                }
                 if let Some(owner_id) = stream_key.rsplit(':').next() {
                     let owner_in_voice = state.voice_channel_states.values().flatten().any(|voice| voice.user_id == owner_id);
                     tracing::info!(owner_in_voice, "registered active screen share");
@@ -272,9 +278,16 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::StreamServerUpdate { .. }) => {}
             BackendEvent::Gateway(GatewayEvent::StreamDelete { stream_key }) => {
-                state.active_streams.retain(|_, key| key != &stream_key);
+                let left_only_this_view = state.unwatching_stream.as_deref() == Some(stream_key.as_str());
+                if left_only_this_view {
+                    state.unwatching_stream = None;
+                } else {
+                    state.active_streams.retain(|_, key| key != &stream_key);
+                }
                 if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
                     state.watching_stream = None;
+                    state.screen_share_stats = Default::default();
+                    state.screen_share_history.clear();
                 }
             }
             BackendEvent::Gateway(GatewayEvent::GuildCreate { guild_id, roles, member_roles }) => {
@@ -330,11 +343,15 @@ pub fn drain_backend_events(
                 state.voice_speaking_users.clear();
                 state.voice_stats = Default::default();
                 state.voice_history.clear();
+                state.screen_share_stats = Default::default();
+                state.screen_share_history.clear();
                 state.show_voice_info = false;
                 state.voice_joined_at = None;
             }
             BackendEvent::ScreenShareStopped => {
                 state.screen_sharing = false;
+                state.screen_share_stats = Default::default();
+                state.screen_share_history.clear();
             }
             BackendEvent::VoiceSpeaking { user_id, speaking } => {
                 state.set_voice_speaking(user_id, speaking);
@@ -345,6 +362,14 @@ pub fn drain_backend_events(
                 }
                 state.voice_history.push_back(stats.clone());
                 state.voice_stats = stats;
+            }
+            #[cfg(feature = "screenshare")]
+            BackendEvent::ScreenShareStats(stats) => {
+                if state.screen_share_history.len() >= 120 {
+                    state.screen_share_history.pop_front();
+                }
+                state.screen_share_history.push_back(stats.clone());
+                state.screen_share_stats = stats;
             }
             BackendEvent::VoiceDevicesLoaded { inputs, outputs } => {
                 state.voice_input_devices = inputs;
