@@ -89,6 +89,10 @@ impl ScreenCapture {
     pub async fn next_frame(&mut self) -> Option<CapturedFrame> {
         self.frames.recv().await
     }
+
+    pub(crate) fn blocking_next_frame(&mut self) -> Option<CapturedFrame> {
+        self.frames.blocking_recv()
+    }
 }
 
 impl Drop for ScreenCapture {
