@@ -341,6 +341,13 @@ pub fn play_ringtone(stop: Arc<AtomicBool>) {
     });
 }
 
+pub fn play_notification_sound() {
+    let stop = Arc::new(AtomicBool::new(false));
+    play_ringtone(stop.clone());
+    std::thread::sleep(std::time::Duration::from_millis(850));
+    stop.store(true, Ordering::Relaxed);
+}
+
 pub fn run_mic_test(input_device: Option<String>, output_device: Option<String>, duration: std::time::Duration) {
     let host = audio_host();
     let Some(in_device) = find_device(&host, input_device.as_deref(), true) else { return };

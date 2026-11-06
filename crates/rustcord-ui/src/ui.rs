@@ -2064,8 +2064,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     let [display_w, display_h] = ui.io().display_size;
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
+    let surface_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.panel };
+    let servers_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.servers_bg() };
 
-    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.servers_bg());
+    let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, servers_bg);
     ui.window("servers")
         .position([0.0, 0.0], imgui::Condition::Always)
         .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
@@ -2089,7 +2091,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             ui.set_cursor_pos([0.0, after_separator_y]);
 
             let _no_pad = ui.push_style_var(imgui::StyleVar::WindowPadding([0.0, 0.0]));
-            let _child_bg = ui.push_style_color(imgui::StyleColor::ChildBg, state.theme.servers_bg());
+            let _child_bg = ui.push_style_color(imgui::StyleColor::ChildBg, servers_bg);
             ui.child_window("guilds_scroll").size([RAIL_WIDTH, display_h - after_separator_y]).build(|| {
                 ui.set_cursor_pos([rail_center_x, 0.0]);
                 draw_rail_items(ui, state, cmd_tx, textures, rail_center_x);
@@ -2099,7 +2101,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         });
         _server_bg.pop(); // <- Non dimenticare il pop()!
 
-    let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
+    let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, surface_bg);
     ui.window("channels")
         .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
         .size([sidebar_width, display_h], imgui::Condition::Always)
@@ -2112,6 +2114,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             } else {
                 0.0
             };
+            let _channels_content_bg = ui.push_style_color(imgui::StyleColor::ChildBg, surface_bg);
             ui.child_window("channels_scroll").size([0.0, display_h - USER_BAR_HEIGHT - voice_bar_reserved - 36.0]).build(|| {
             if state.selected_guild.is_some() {
                 let groups: Vec<(Option<String>, Vec<(String, String, Option<String>, bool)>)> = state
@@ -2325,31 +2328,6 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     let mut open_emoji_picker = false;
     let channel_names = state.channel_name_map();
     let role_names = state.role_name_map();
-    let author_colors: HashMap<String, Option<[f32; 4]>> = match state.selected_guild.clone() {
-        Some(guild_id) => {
-            let mut roles_by_author: HashMap<String, Vec<String>> = HashMap::new();
-            for msg in state.active_messages() {
-                if let Some(member) = &msg.member {
-                    roles_by_author.insert(msg.author.id.clone(), member.roles.clone());
-                } else if !roles_by_author.contains_key(&msg.author.id) {
-                    roles_by_author.insert(msg.author.id.clone(), Vec::new());
-                }
-            }
-            roles_by_author
-                .into_iter()
-                .map(|(id, role_ids)| {
-                    let color = if role_ids.is_empty() {
-                        state.member_color(&guild_id, &id)
-                    } else {
-                        state.color_for_roles(&guild_id, &role_ids)
-                    };
-                    (id, color)
-                })
-                .collect()
-        }
-        None => HashMap::new(),
-    };
-
     let search_panel_open = state.search_open;
     let members_panel_open = state.show_members_panel && state.selected_guild.is_some() && !search_panel_open;
     let right_panel_width = if search_panel_open {
@@ -2360,6 +2338,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         0.0
     };
 
+    let chat_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.background };
+    let _chat_bg = ui.push_style_color(imgui::StyleColor::WindowBg, chat_bg);
     ui.window("chat")
         .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
         .size([display_w - RAIL_WIDTH - sidebar_width - right_panel_width, display_h], imgui::Condition::Always)
@@ -2377,10 +2357,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
             let mut header_height = if state.selected_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
             if state.selected_channel.is_some() {
+                let _header_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
                 draw_channel_header(ui, state, cmd_tx, textures, dm_channel.as_ref());
             }
             if let Some(dm) = &dm_channel {
                 if state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == dm.id) {
+                    let _call_panel_bg = ui.push_style_color(imgui::StyleColor::ChildBg, surface_bg);
                     draw_dm_call_panel(ui, state, textures, cmd_tx, dm);
                     header_height += CALL_PANEL_HEIGHT;
                 }
@@ -2398,9 +2380,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 + state.editing.is_some() as u32 as f32)
                 * line_height;
 
-            ui.child_window("history")
+            let _history_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
+            ui.child_window(format!("history_{channel_key}"))
                 .size([0.0, display_h - 80.0 - status_height - header_height - extra_banner_height])
                 .build(|| {
+                    let was_at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 40.0;
                     if messages.is_empty() {
                         ui.text_disabled("No messages loaded yet.");
                     }
@@ -2414,6 +2398,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     let mut scrolled_to_target = false;
 
                     for (idx, msg) in messages.iter().enumerate() {
+                        let message_y = ui.cursor_pos()[1];
+                        let is_history_anchor = state.history_scroll_anchor.as_ref().is_some_and(|(channel, id)| {
+                            channel == &channel_key && id == &msg.id
+                        });
                         let is_scroll_target = scroll_target.as_deref() == Some(msg.id.as_str());
                         let highlight_start = ui.cursor_screen_pos();
                         if msg.kind == 3 {
@@ -2429,6 +2417,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             ui.same_line();
                             ui.text_colored(state.theme.text_muted, format!("{text}  {}", format_timestamp(&msg.timestamp)));
                             ui.dummy([0.0, MESSAGE_GAP]);
+                            if is_history_anchor {
+                                ui.set_scroll_from_pos_y_with_ratio(message_y, 0.0);
+                                state.history_scroll_anchor = None;
+                            }
                             continue;
                         }
                         let starts_group = msg.referenced_message.is_some()
@@ -2483,7 +2475,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
                             ui.set_cursor_pos([row_start[0] + content_x_offset, content_top]);
                             ui.group(|| {
-                                let author_color = author_colors.get(&msg.author.id).copied().flatten().unwrap_or(state.theme.accent);
+                                let author_color = state.selected_guild.as_deref().and_then(|guild_id| {
+                                    msg.member.as_ref().and_then(|member| state.color_for_roles(guild_id, &member.roles))
+                                        .or_else(|| state.member_color(guild_id, &msg.author.id))
+                                }).unwrap_or(state.theme.accent);
                                 if clickable_text(ui, &format!("name_{}", msg.id), &author, author_color) {
                                     state.profile_popout = Some(msg.author.clone());
                                 }
@@ -2546,7 +2541,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                         ui.popup(format!("msg_ctx_menu_{}", msg.id), || {
                             if ui.menu_item("Reply") {
-                                state.reply_target = Some(msg.clone());
+                                state.reply_target = Some((**msg).clone());
                             }
                             if ui.menu_item("Add Reaction") {
                                 state.emoji_picker_target = Some((msg.channel_id.clone(), msg.id.clone()));
@@ -2583,6 +2578,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         };
                         ui.dummy([0.0, if next_starts_group { MESSAGE_GAP } else { 2.0 }]);
 
+                        if is_history_anchor {
+                            ui.set_scroll_from_pos_y_with_ratio(message_y, 0.0);
+                            state.history_scroll_anchor = None;
+                        }
+
                         if is_scroll_target {
                             let bottom = ui.cursor_screen_pos()[1];
                             let width = ui.window_size()[0];
@@ -2604,17 +2604,17 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         state.scroll_to_message = None;
                     }
 
-                    let scroll_y = ui.scroll_y();
-                    let near_bottom = scroll_y >= ui.scroll_max_y() - 40.0;
                     let snapping_to_bottom =
-                        scroll_target.is_none() && has_new_messages && (near_bottom || seen_count == 0);
+                        scroll_target.is_none() && (was_at_bottom || has_new_messages && seen_count == 0);
                     if snapping_to_bottom {
                         ui.set_scroll_here_y_with_ratio(1.0);
                     }
 
+                    let scroll_y = ui.scroll_y();
                     if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages && !state.history_exhausted.contains(&channel_key) {
                         if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), messages.first()) {
                             state.loading_older_messages = true;
+                            state.history_scroll_anchor = Some((channel_id.clone(), oldest.id.clone()));
                             let _ = cmd_tx.send(UiCommand::LoadOlderMessages {
                                 channel_id,
                                 before: oldest.id.clone(),
@@ -3143,6 +3143,36 @@ fn draw_embed(
             if url.is_empty() {
                 return;
             }
+            #[cfg(feature = "video")]
+            if open_on_click {
+                if let Some(video_url) = embed.video.as_ref().map(|v| v.url.as_str()).filter(|u| !u.is_empty()) {
+                    if textures.is_video(video_url) {
+                        if let Some(status) = textures.video_status(video_url) {
+                            if let Some((texture_id, natural)) = textures.get(video_url) {
+                                let size = scaled_image_size(natural);
+                                imgui::Image::new(texture_id, size).build(ui);
+                                if ui.is_item_clicked() {
+                                    textures.toggle_video_playback(video_url);
+                                }
+                                draw_video_controls(ui, cmd_tx, textures, video_url, id_seed, &status, size[0]);
+                            }
+                        }
+                        return;
+                    }
+                    if let Some((texture_id, natural)) = textures.get(url) {
+                        let scale = (max[0] / natural[0].max(1.0)).min(max[1] / natural[1].max(1.0)).min(1.0);
+                        let size = [natural[0] * scale, natural[1] * scale];
+                        imgui::Image::new(texture_id, size).build(ui);
+                        if ui.is_item_clicked() {
+                            textures.start_video(video_url, size, cmd_tx);
+                        }
+                    } else {
+                        textures.request(url, cmd_tx);
+                        ui.text_disabled("[loading video preview...]");
+                    }
+                    return;
+                }
+            }
             if let Some((texture_id, natural)) = textures.get(url) {
                 let scale = (max[0] / natural[0].max(1.0)).min(max[1] / natural[1].max(1.0)).min(1.0);
                 imgui::Image::new(texture_id, [natural[0] * scale, natural[1] * scale]).build(ui);
@@ -3563,12 +3593,12 @@ fn emoji_button(ui: &Ui, textures: &TextureCache, id: &str, ch: char, tooltip: &
     let hovered = ui.is_item_hovered();
     let dl = ui.get_window_draw_list();
     let fill = match (active, hovered) {
-        (Some(c), _) => Some(c),
+        (Some(c), _) => Some([c[0], c[1], c[2], 0.18]),
         (None, true) => Some(ui.style_color(imgui::StyleColor::ButtonHovered)),
-        (None, false) => Some(ui.style_color(imgui::StyleColor::Button)),
+        (None, false) => None,
     };
     if let Some(c) = fill {
-        dl.add_rect(p, [p[0] + SIZE, p[1] + SIZE], c).filled(true).rounding(6.0).build();
+        dl.add_rect(p, [p[0] + SIZE, p[1] + SIZE], c).filled(true).rounding(9.0).build();
     }
     if let EmojiTexture::Ready(tex) = emoji_texture(textures, ch) {
         let pad = 4.0;
@@ -4732,6 +4762,76 @@ fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
             let theme_file = path.file_name().map(|name| name.to_string_lossy().into_owned());
             crate::settings::save(&crate::settings::Settings { theme_file, input_device: state.selected_input_device.clone(), output_device: state.selected_output_device.clone(), ..state.audio_settings() });
         }
+    }
+
+    ui.separator();
+    ui.text("Create or edit a theme");
+    ui.text_disabled("Background colors the app when no gradient is active. Panel colors inputs, popups, and raised surfaces.");
+    ui.input_text("Theme name", &mut state.theme_name_input).hint("My theme").build();
+    for (label, color) in [
+        ("Background", &mut state.theme.background),
+        ("Panel", &mut state.theme.panel),
+        ("Text", &mut state.theme.text),
+        ("Muted text", &mut state.theme.text_muted),
+        ("Accent", &mut state.theme.accent),
+        ("Accent hover", &mut state.theme.accent_hover),
+        ("Border", &mut state.theme.border),
+    ] {
+        ui.color_edit4(label, color);
+    }
+    ui.separator();
+    ui.text("Global gradient");
+    ui.text_disabled("When enabled, this gradient fills the app background across all panes.");
+    let mut gradient_enabled = state.theme.gradient.is_some();
+    if ui.checkbox("Use global gradient", &mut gradient_enabled) {
+        state.theme.gradient = gradient_enabled.then_some([state.theme.background, state.theme.panel]);
+    }
+    if let Some([mut left, mut right]) = state.theme.gradient {
+        let left_changed = ui.color_edit4("Gradient start", &mut left);
+        let right_changed = ui.color_edit4("Gradient end", &mut right);
+        if left_changed || right_changed {
+            state.theme.gradient = Some([left, right]);
+        }
+    }
+    if ui.button("Save theme as TOML") {
+        let name = state.theme_name_input.trim();
+        let slug: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+            .collect::<String>()
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        if name.is_empty() || slug.is_empty() {
+            state.theme_save_status = Some("Enter a name using letters or numbers.".into());
+        } else if let Some(dir) = crate::theme::Theme::themes_dir() {
+            let path = dir.join(format!("{slug}.toml"));
+            let mut theme = state.theme.clone();
+            theme.name = name.to_string();
+            let result = std::fs::create_dir_all(&dir)
+                .map_err(|error| error.to_string())
+                .and_then(|_| theme.save_to_file(&path).map_err(|error| error.to_string()));
+            state.theme_save_status = match result {
+                Ok(()) => {
+                    state.theme = theme;
+                    crate::settings::save(&crate::settings::Settings {
+                        theme_file: path.file_name().map(|file| file.to_string_lossy().into_owned()),
+                        input_device: state.selected_input_device.clone(),
+                        output_device: state.selected_output_device.clone(),
+                        ..state.audio_settings()
+                    });
+                    state.theme_name_input.clear();
+                    Some(format!("Saved to {}", path.display()))
+                }
+                Err(error) => Some(format!("Could not save theme: {error}")),
+            };
+        } else {
+            state.theme_save_status = Some("Could not find the themes directory.".into());
+        }
+    }
+    if let Some(status) = &state.theme_save_status {
+        ui.text_colored(state.theme.text_muted, status);
     }
 }
 

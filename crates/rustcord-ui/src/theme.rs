@@ -87,13 +87,13 @@ impl Theme {
         style[Button] = self.accent;
         style[ButtonHovered] = self.accent_hover;
         style[ButtonActive] = self.accent_hover;
-        style[Header] = self.accent;
-        style[HeaderHovered] = self.accent_hover;
-        style[HeaderActive] = self.accent_hover;
+        style[Header] = [self.accent[0], self.accent[1], self.accent[2], 0.22];
+        style[HeaderHovered] = [self.accent_hover[0], self.accent_hover[1], self.accent_hover[2], 0.30];
+        style[HeaderActive] = [self.accent_hover[0], self.accent_hover[1], self.accent_hover[2], 0.38];
         style[Border] = self.border;
         style[FrameBg] = self.panel;
-        style[FrameBgHovered] = self.accent;
-        style[FrameBgActive] = self.accent_hover;
+        style[FrameBgHovered] = [self.accent[0], self.accent[1], self.accent[2], 0.22];
+        style[FrameBgActive] = [self.accent_hover[0], self.accent_hover[1], self.accent_hover[2], 0.30];
 
         style[ScrollbarGrabHovered] = self.border;
         style[ScrollbarGrabActive] = self.panel;
@@ -105,7 +105,7 @@ impl Theme {
 
         style.frame_rounding = 5.0;
         style.popup_rounding = 8.0;
-        style.child_rounding = 8.0;
+        style.child_rounding = 4.0;
         style.scrollbar_rounding = 4.0;
         style.grab_rounding = 4.0;
 

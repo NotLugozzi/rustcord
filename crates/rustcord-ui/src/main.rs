@@ -24,6 +24,21 @@ use backend::{BackendEvent, UiCommand};
 use rustcord_client::gateway::GatewayEvent;
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "macos")]
+static MAC_NOTIFICATION_APPLICATION: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+pub(crate) fn show_notification(notification: &notify_rust::Notification) {
+    #[cfg(target_os = "macos")]
+    MAC_NOTIFICATION_APPLICATION.get_or_init(|| {
+        if let Err(error) = notify_rust::set_application("com.apple.Terminal") {
+            tracing::warn!("could not set macOS notification application: {error}");
+        }
+    });
+    if let Err(error) = notification.show() {
+        tracing::warn!("notification failed: {error}");
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt::init();
 
@@ -71,7 +86,7 @@ fn main() {
     renderer::run(state, cmd_tx, event_rx);
 }
 
-fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message) {
+fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
     let Some(me) = &state.current_user else { return };
     if !state.notifications_enabled || message.author.id == me.id {
         return;
@@ -83,16 +98,9 @@ fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Messa
     }
     let title = message.author.global_name.clone().unwrap_or_else(|| message.author.username.clone());
     let body = if message.content.is_empty() { "[attachment]".to_string() } else { message.content.chars().take(160).collect() };
-    std::thread::spawn(move || {
-        if let Err(e) = notify_rust::Notification::new()
-            .summary(&title)
-            .body(&body)
-            .sound_name("message-new-instant")
-            .show()
-        {
-            tracing::warn!("notification failed: {e}");
-        }
-    });
+    let avatar_url = rustcord_client::cdn::avatar_url(&message.author, 64)
+        .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&message.author));
+    let _ = cmd_tx.send(UiCommand::ShowNotification { title, body, avatar_url });
 }
 
 pub fn drain_backend_events(
@@ -166,7 +174,7 @@ pub fn drain_backend_events(
                 if let Some(typing) = state.typing_users.get_mut(&message.channel_id) {
                     typing.remove(&message.author.id);
                 }
-                notify_if_relevant(state, &message);
+                notify_if_relevant(state, &message, cmd_tx);
                 if message.guild_id.is_none() && !state.dm_channels.iter().any(|c| c.id == message.channel_id) {
                     let _ = cmd_tx.send(UiCommand::RefreshDmChannels);
                 }
@@ -213,6 +221,7 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call }) => {
                 if let Some(msg) = state.messages.get_mut(&channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) {
+                    let msg = std::sync::Arc::make_mut(msg);
                     if let Some(content) = content {
                         msg.content = content;
                     }
@@ -280,10 +289,8 @@ pub fn drain_backend_events(
                         if !state.incoming_calls.contains(&channel_id) {
                             if state.notifications_enabled {
                                 std::thread::spawn(|| {
-                                    let _ = notify_rust::Notification::new()
-                                        .summary("Incoming call")
-                                        .sound_name("phone-incoming-call")
-                                        .show();
+                                    crate::show_notification(&notify_rust::Notification::new().summary("Incoming call"));
+                                    rustcord_client::voice_audio::play_notification_sound();
                                 });
                             }
                             state.incoming_calls.push(channel_id);

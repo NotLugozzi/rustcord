@@ -195,6 +195,7 @@ pub struct AppState {
     pub sidebar_tab: usize,
     pub pending_sidebar_tab: Option<usize>,
     pub scroll_to_message: Option<String>,
+    pub history_scroll_anchor: Option<(String, String)>,
     pub viewing_jumped_history: bool,
     pub sidebar_width: f32,
     pub groups: Vec<DmGroup>,
@@ -220,7 +221,7 @@ pub struct AppState {
     pub guild_members: HashMap<String, Vec<rustcord_client::models::GuildMember>>,
     pub guild_members_requested: std::collections::HashSet<String>,
     pub show_members_panel: bool,
-    pub messages: HashMap<String, Vec<Message>>,
+    pub messages: HashMap<String, Vec<std::sync::Arc<Message>>>,
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
     pub compose_buf: String,
@@ -232,6 +233,8 @@ pub struct AppState {
     pub login_status: Option<String>,
     pub logged_in: bool,
     pub theme: crate::theme::Theme,
+    pub theme_name_input: String,
+    pub theme_save_status: Option<String>,
     pub status_message: Option<String>,
     pub last_seen_message_count: HashMap<String, usize>,
     pub loading_older_messages: bool,
@@ -555,7 +558,7 @@ impl AppState {
         let list = self.messages.entry(message.channel_id.clone()).or_default();
         let new_id = snowflake_value(&message.id);
         let insert_at = list.partition_point(|m| snowflake_value(&m.id) <= new_id);
-        list.insert(insert_at, message);
+        list.insert(insert_at, std::sync::Arc::new(message));
     }
 
     pub fn save_read_state(&self) {
@@ -677,12 +680,12 @@ impl AppState {
         let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) else {
             return;
         };
-        apply_reaction_to(&mut msg.reactions, emoji, is_me, added);
+        apply_reaction_to(&mut std::sync::Arc::make_mut(msg).reactions, emoji, is_me, added);
     }
 
     pub fn clear_reactions(&mut self, channel_id: &str, message_id: &str) {
         if let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) {
-            msg.reactions.clear();
+            std::sync::Arc::make_mut(msg).reactions.clear();
         }
     }
 
@@ -813,21 +816,22 @@ impl AppState {
 
     pub fn set_message_history(&mut self, channel_id: String, mut messages: Vec<Message>) {
         messages.sort_by_key(|m| snowflake_value(&m.id));
-        self.messages.insert(channel_id, messages);
+        self.messages.insert(channel_id, messages.into_iter().map(std::sync::Arc::new).collect());
     }
 
     pub fn prepend_message_history(&mut self, channel_id: String, mut older: Vec<Message>) {
         older.sort_by_key(|m| snowflake_value(&m.id));
         let existing = self.messages.entry(channel_id).or_default();
-        older.extend(std::mem::take(existing));
-        *existing = older;
+        let mut combined: Vec<_> = older.into_iter().map(std::sync::Arc::new).collect();
+        combined.append(existing);
+        *existing = combined;
     }
 
     pub fn last_message_timestamp(&self, channel_id: &str) -> Option<&str> {
         self.messages.get(channel_id)?.last().map(|m| m.timestamp.as_str())
     }
 
-    pub fn active_messages(&self) -> &[Message] {
+    pub fn active_messages(&self) -> &[std::sync::Arc<Message>] {
         self.selected_channel
             .as_ref()
             .and_then(|id| self.messages.get(id))

@@ -105,7 +105,13 @@ equivalent paths apply on Windows/macOS), each defining a small color
 palette. The built-in themes are installed there on first launch, including
 in packaged builds. Alongside Discord Dark, Nord, and Solarized Light, the
 picker includes Aurora, Sunset, and Cosmic gradients. Custom themes may add
-an optional two-color horizontal gradient:
+an optional two-color horizontal gradient. `background` is the main app
+surface when no gradient is set; a gradient replaces it across the main panes.
+`panel` colors inputs, popups, and raised surfaces. `text` and `text_muted` set
+primary and secondary text, `accent` colors actions and selected items,
+`accent_hover` colors their hover and pressed states, and `border` colors
+separators. The appearance editor lets you adjust the gradient independently
+from the solid colors.
 
 ```toml
 name = "my-theme"
