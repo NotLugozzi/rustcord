@@ -54,6 +54,7 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libssl-dev \
+            pkg-config \
             cmake
 
       - name: Install ffmpeg development libraries
@@ -67,11 +68,19 @@ jobs:
             libswresample-dev \
             libclang-dev
 
+      - name: Record FFmpeg version
+        if: matrix.variant == 'video'
+        run: |
+          FFMPEG_VERSION=$(pkg-config --modversion libavcodec)
+          echo "FFMPEG_VERSION=$FFMPEG_VERSION" >> "$GITHUB_ENV"
+          echo "Using FFmpeg libavcodec $FFMPEG_VERSION"
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          env-vars: FFMPEG_VERSION
 
       - name: Install cargo-deb and cargo-generate-rpm
         run: |
