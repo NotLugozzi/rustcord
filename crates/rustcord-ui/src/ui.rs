@@ -4766,8 +4766,8 @@ fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
 
     ui.separator();
     ui.text("Create or edit a theme");
+    ui.text_disabled("Background colors the app when no gradient is active. Panel colors inputs, popups, and raised surfaces.");
     ui.input_text("Theme name", &mut state.theme_name_input).hint("My theme").build();
-    let mut colors_changed = false;
     for (label, color) in [
         ("Background", &mut state.theme.background),
         ("Panel", &mut state.theme.panel),
@@ -4777,10 +4777,21 @@ fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
         ("Accent hover", &mut state.theme.accent_hover),
         ("Border", &mut state.theme.border),
     ] {
-        colors_changed |= ui.color_edit4(label, color);
+        ui.color_edit4(label, color);
     }
-    if colors_changed {
-        state.theme.gradient = None;
+    ui.separator();
+    ui.text("Global gradient");
+    ui.text_disabled("When enabled, this gradient fills the app background across all panes.");
+    let mut gradient_enabled = state.theme.gradient.is_some();
+    if ui.checkbox("Use global gradient", &mut gradient_enabled) {
+        state.theme.gradient = gradient_enabled.then_some([state.theme.background, state.theme.panel]);
+    }
+    if let Some([mut left, mut right]) = state.theme.gradient {
+        let left_changed = ui.color_edit4("Gradient start", &mut left);
+        let right_changed = ui.color_edit4("Gradient end", &mut right);
+        if left_changed || right_changed {
+            state.theme.gradient = Some([left, right]);
+        }
     }
     if ui.button("Save theme as TOML") {
         let name = state.theme_name_input.trim();
