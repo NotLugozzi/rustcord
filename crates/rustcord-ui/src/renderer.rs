@@ -329,6 +329,8 @@ struct App {
     window: Option<AppWindow>,
     theme_applied: bool,
     last_input: Instant,
+    needs_redraw: bool,
+    typing_active: bool,
 }
 
 impl ApplicationHandler for App {
@@ -349,11 +351,18 @@ impl ApplicationHandler for App {
         match &event {
             WindowEvent::Resized(size) => {
                 window.resize(size.width, size.height);
+                self.needs_redraw = true;
             }
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::RedrawRequested => {}
-            WindowEvent::Focused(focused) => self.state.window_focused = *focused,
-            _ => self.last_input = Instant::now(),
+            WindowEvent::RedrawRequested => self.needs_redraw = false,
+            WindowEvent::Focused(focused) => {
+                self.state.window_focused = *focused;
+                self.needs_redraw = true;
+            }
+            _ => {
+                self.last_input = Instant::now();
+                self.needs_redraw = true;
+            }
         }
         match &event {
             WindowEvent::RedrawRequested => {
@@ -395,13 +404,21 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         rustcord_client::captcha::pump_main_thread();
         let Some(window) = self.window.as_mut() else { return };
-        let busy = self.last_input.elapsed() < Duration::from_millis(400) || window.textures.animating;
-        if busy {
-            event_loop.set_control_flow(ControlFlow::Poll);
-        } else {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
+        let active = self.last_input.elapsed() < Duration::from_millis(400);
+        let animating = window.textures.animating;
+        let typing = self.state.selected_channel.as_deref().is_some_and(|channel| {
+            self.state.typing_users_for(channel).iter().any(|id| self.state.current_user.as_ref().is_none_or(|me| me.id != *id))
+        });
+        if self.typing_active && !typing {
+            self.needs_redraw = true;
         }
-        window.window.request_redraw();
+        self.typing_active = typing;
+        if self.needs_redraw || active || animating || typing || !self.event_rx.is_empty() {
+            window.window.request_redraw();
+            self.needs_redraw = false;
+        }
+        let interval = if active { 16 } else if animating { 33 } else { 100 };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(interval)));
         window.imgui.platform.handle_event::<()>(
             window.imgui.context.io_mut(),
             &window.window,
@@ -421,6 +438,8 @@ pub fn run(state: AppState, cmd_tx: UnboundedSender<UiCommand>, event_rx: Unboun
         window: None,
         theme_applied: false,
         last_input: Instant::now(),
+        needs_redraw: true,
+        typing_active: false,
     };
 
     event_loop.run_app(&mut app).expect("event loop failed");

@@ -111,6 +111,7 @@ pub enum UiCommand {
         reply_to: Option<String>,
     },
     DownloadImage { url: String },
+    ShowNotification { title: String, body: String, avatar_url: String },
     #[cfg(feature = "video")]
     OpenVideo { url: String },
     #[cfg(feature = "video")]
@@ -385,6 +386,36 @@ pub fn spawn(
                             None => crate::images::Decoded::Failed,
                         };
                         let _ = event_tx.send(BackendEvent::ImageDownloaded { url, image });
+                    });
+                }
+                UiCommand::ShowNotification { title, body, avatar_url } => {
+                    tokio::spawn(async move {
+                        let image_path = match fetch_image_bytes(&avatar_url).await {
+                            Some(bytes) => {
+                                let path = cache_file(&avatar_url).map(|path| path.with_extension("notification.png"));
+                                tokio::task::spawn_blocking(move || {
+                                    let path = path?;
+                                    std::fs::create_dir_all(path.parent()?).ok()?;
+                                    let image = image::load_from_memory(&bytes).ok()?;
+                                    image.save_with_format(&path, image::ImageFormat::Png).ok()?;
+                                    Some(path)
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            }
+                            None => None,
+                        };
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut notification = notify_rust::Notification::new();
+                            notification.summary(&title).body(&body);
+                            if let Some(path) = image_path {
+                                notification.image_path(&path.to_string_lossy());
+                            }
+                            crate::show_notification(&notification);
+                            rustcord_client::voice_audio::play_notification_sound();
+                        })
+                        .await;
                     });
                 }
                 #[cfg(feature = "video")]

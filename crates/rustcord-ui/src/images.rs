@@ -725,7 +725,16 @@ fn upload_texture(
     renderer: &mut imgui_wgpu::Renderer,
     rgba: &image::RgbaImage,
 ) -> imgui::TextureId {
-    let (width, height) = rgba.dimensions();
+    let limit = device.limits().max_texture_dimension_2d;
+    let (mut width, mut height) = rgba.dimensions();
+    let mut resized = None;
+    if width > limit || height > limit {
+        let scale = (limit as f32 / width as f32).min(limit as f32 / height as f32);
+        width = (width as f32 * scale).floor().max(1.0) as u32;
+        height = (height as f32 * scale).floor().max(1.0) as u32;
+        resized = Some(image::imageops::resize(rgba, width, height, image::imageops::FilterType::Triangle));
+    }
+    let rgba = resized.as_ref().unwrap_or(rgba);
     let texture_config = imgui_wgpu::TextureConfig {
         size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         label: Some("chat-image"),
