@@ -275,10 +275,13 @@ pub struct AppState {
     pub mention_autocomplete_selected: usize,
     pub gateway_connected: bool,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
+    pub active_streams: HashMap<String, String>,
+    pub watching_stream: Option<String>,
     pub voice_speaking_users: std::collections::HashSet<String>,
     pub connected_voice_channel: Option<(Option<String>, String)>,
     pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
+    pub screen_sharing: bool,
     pub self_muted: bool,
     pub self_deafened: bool,
     pub voice_input_devices: Vec<String>,
@@ -1001,6 +1004,17 @@ impl AppState {
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
         if let Some(user) = voice_state.member.as_ref().and_then(|m| m.user.clone()) {
             self.known_users.insert(voice_state.user_id.clone(), user);
+        }
+        #[cfg(feature = "screenshare")]
+        {
+            if voice_state.channel_id.is_none() || voice_state.self_stream == Some(false) {
+                self.active_streams.remove(&voice_state.user_id);
+            } else if voice_state.self_stream == Some(true) {
+                if let (Some(guild_id), Some(channel_id)) = (&voice_state.guild_id, &voice_state.channel_id) {
+                    let stream_key = format!("guild:{guild_id}:{channel_id}:{}", voice_state.user_id);
+                    self.active_streams.insert(voice_state.user_id.clone(), stream_key);
+                }
+            }
         }
         let Some(guild_id) = voice_state.guild_id.clone().or_else(|| voice_state.channel_id.clone()) else {
             for states in self.voice_channel_states.values_mut() {

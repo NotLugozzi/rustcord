@@ -263,6 +263,20 @@ pub fn drain_backend_events(
                 state.apply_voice_state(voice_state);
             }
             BackendEvent::Gateway(GatewayEvent::VoiceServerUpdate { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::StreamCreate { stream_key, .. }) => {
+                if let Some(owner_id) = stream_key.rsplit(':').next() {
+                    let owner_in_voice = state.voice_channel_states.values().flatten().any(|voice| voice.user_id == owner_id);
+                    tracing::info!(owner_in_voice, "registered active screen share");
+                    state.active_streams.insert(owner_id.to_string(), stream_key);
+                }
+            }
+            BackendEvent::Gateway(GatewayEvent::StreamServerUpdate { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::StreamDelete { stream_key }) => {
+                state.active_streams.retain(|_, key| key != &stream_key);
+                if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                    state.watching_stream = None;
+                }
+            }
             BackendEvent::Gateway(GatewayEvent::GuildCreate { guild_id, roles, member_roles }) => {
                 state.guild_roles.insert(guild_id.clone(), roles);
                 if let Some(me) = &state.current_user {
@@ -306,9 +320,11 @@ pub fn drain_backend_events(
             }
             BackendEvent::VoiceConnected => {
                 state.voice_connecting = false;
+                state.screen_sharing = false;
             }
             BackendEvent::VoiceDisconnected => {
                 state.voice_connecting = false;
+                state.screen_sharing = false;
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
                 state.voice_speaking_users.clear();
@@ -316,6 +332,9 @@ pub fn drain_backend_events(
                 state.voice_history.clear();
                 state.show_voice_info = false;
                 state.voice_joined_at = None;
+            }
+            BackendEvent::ScreenShareStopped => {
+                state.screen_sharing = false;
             }
             BackendEvent::VoiceSpeaking { user_id, speaking } => {
                 state.set_voice_speaking(user_id, speaking);
@@ -407,6 +426,10 @@ pub fn drain_backend_events(
             BackendEvent::ImageDownloaded { url, image } => {
                 media.images.push((url, image));
             }
+            #[cfg(feature = "screenshare")]
+            BackendEvent::RemoteVideoFrame { user_id, rgba } => {
+                media.remote_videos.push((user_id, rgba));
+            }
             #[cfg(feature = "video")]
             BackendEvent::VideoBatchReady(batch) => {
                 media.videos.push(batch);
@@ -419,6 +442,8 @@ pub fn drain_backend_events(
 #[derive(Default)]
 pub struct DrainedMedia {
     pub images: Vec<(String, images::Decoded)>,
+    #[cfg(feature = "screenshare")]
+    pub remote_videos: Vec<(String, image::RgbaImage)>,
     #[cfg(feature = "video")]
     pub videos: Vec<images::VideoBatch>,
 }

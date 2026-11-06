@@ -1792,6 +1792,7 @@ const VIDEO_CONTROL_ICONS: [char; 6] = ['\u{25B6}', '\u{23F8}', '\u{1F501}', '\u
 const CHROME_ICONS: [char; 2] = ['\u{274C}', '\u{1F4AC}'];
 
 const HEADER_ICONS: [char; 4] = ['\u{1F4DE}', '\u{1F4F9}', '\u{1F465}', '\u{1F50D}'];
+const SCREENSHARE_ICON: char = '\u{1F5A5}';
 
 #[cfg(feature = "video")]
 fn draw_play_overlay(ui: &Ui, origin: [f32; 2], size: [f32; 2], hovered: bool) {
@@ -2236,6 +2237,25 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 state.context_vc_member = Some(member_id.clone());
                                 ui.open_popup("vc_member_context");
                             }
+                            #[cfg(feature = "screenshare")]
+                            if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
+                                let is_self = state.current_user.as_ref().is_some_and(|user| user.id == member_id);
+                                let watching = state.watching_stream.as_deref() == Some(stream_key.as_str());
+                                if !is_self {
+                                    ui.set_cursor_screen_pos([row_pos[0] + row_width - 52.0, row_pos[1] + 4.0]);
+                                    let label = if watching { "Stop" } else { "Watch" };
+                                    if ui.small_button(format!("{label}##stream_{member_id}")) {
+                                        if watching {
+                                            let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+                                            state.watching_stream = None;
+                                        } else {
+                                            let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+                                            state.watching_stream = Some(stream_key);
+                                        }
+                                    }
+                                    ui.set_cursor_screen_pos([row_pos[0], row_pos[1] + ROW_H]);
+                                }
+                            }
                             {
                                 let dl = ui.get_window_draw_list();
                                 let center = [row_pos[0] + 4.0 + AVATAR / 2.0, row_pos[1] + ROW_H / 2.0];
@@ -2286,6 +2306,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                         if ui.selectable("Message") {
                             let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: member_id.clone() });
+                        }
+                        #[cfg(feature = "screenshare")]
+                        if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
+                            if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                                if ui.selectable("Stop watching") {
+                                    let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+                                    state.watching_stream = None;
+                                }
+                            } else if ui.selectable("Watch screen share") {
+                                let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+                                state.watching_stream = Some(stream_key);
+                            }
                         }
                         ui.separator();
                         draw_user_volume_controls(ui, state, cmd_tx, &member_id);
@@ -2366,6 +2398,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     draw_dm_call_panel(ui, state, textures, cmd_tx, dm);
                     header_height += CALL_PANEL_HEIGHT;
                 }
+            }
+            #[cfg(feature = "screenshare")]
+            if dm_channel.is_none() && state.watching_stream.is_some() {
+                header_height += draw_watched_stream_panel(ui, state, textures, cmd_tx);
             }
 
             let line_height = ui.text_line_height_with_spacing();
@@ -3661,7 +3697,8 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
     const RED: [f32; 4] = [0.75, 0.25, 0.25, 1.0];
     const GREEN: [f32; 4] = [0.20, 0.60, 0.35, 1.0];
     if center {
-        let total = 5.0 * BUTTON + 4.0 * GAP;
+        let button_count = if cfg!(feature = "screenshare") { 6.0 } else { 5.0 };
+        let total = button_count * BUTTON + (button_count - 1.0) * GAP;
         let y = ui.cursor_pos()[1];
         ui.set_cursor_pos([(ui.window_size()[0] - total) / 2.0, y]);
     }
@@ -3708,6 +3745,19 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
         state.show_voice_info = !state.show_voice_info;
     }
     ui.same_line_with_spacing(0.0, GAP);
+    #[cfg(feature = "screenshare")]
+    {
+        let active = state.screen_sharing;
+        if emoji_button(ui, textures, "vc_screenshare", '\u{1F5A5}', if active { "Stop screen sharing" } else { "Share your screen" }, active.then_some(GREEN)) {
+            state.screen_sharing = !active;
+            let _ = cmd_tx.send(UiCommand::SetScreenSharing {
+                enabled: state.screen_sharing,
+                guild_id: guild_id.clone(),
+                channel_id: channel_id.to_string(),
+            });
+        }
+        ui.same_line_with_spacing(0.0, GAP);
+    }
     if emoji_button(ui, textures, "vc_disconnect", '\u{1F4F4}', "Disconnect", None) {
         let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: guild_id.clone() });
         state.self_muted = false;
@@ -3742,7 +3792,44 @@ fn draw_user_volume_controls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSe
     }
 }
 
+#[cfg(feature = "screenshare")]
+const CALL_PANEL_HEIGHT: f32 = 230.0;
+#[cfg(not(feature = "screenshare"))]
 const CALL_PANEL_HEIGHT: f32 = 130.0;
+
+#[cfg(feature = "screenshare")]
+fn draw_watched_stream_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) -> f32 {
+    let Some(stream_key) = state.watching_stream.clone() else { return 0.0 };
+    let owner_id = state.active_streams.iter().find_map(|(user_id, key)| (key == &stream_key).then(|| user_id.clone()));
+    let owner_name = owner_id.as_ref().and_then(|id| state.known_users.get(id))
+        .map(|user| user.global_name.clone().unwrap_or_else(|| user.username.clone()))
+        .or(owner_id.clone())
+        .unwrap_or_else(|| "screen share".into());
+    let frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    let image_size = frame.map(|(_, source)| {
+        let max_width = (ui.window_size()[0] - 24.0).clamp(1.0, 900.0);
+        let max_height = 400.0;
+        let scale = (max_width / source[0].max(1.0)).min(max_height / source[1].max(1.0));
+        [source[0] * scale, source[1] * scale]
+    });
+    let panel_height = image_size.map_or(74.0, |size| size[1] + 44.0);
+    ui.child_window("watched_stream_panel").size([0.0, panel_height]).build(|| {
+        ui.text(format!("Live: {owner_name}"));
+        ui.same_line();
+        if ui.small_button("Stop watching##live_stream_panel") {
+            let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+            state.watching_stream = None;
+        }
+        if let (Some((texture_id, _)), Some(size)) = (frame, image_size) {
+            let x = ((ui.window_size()[0] - size[0]) * 0.5).max(0.0);
+            ui.set_cursor_pos([x, 28.0]);
+            imgui::Image::new(texture_id, size).build(ui);
+        } else {
+            ui.text_disabled("Connecting to the stream…");
+        }
+    });
+    panel_height
+}
 
 fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
     const SIZE: f32 = 56.0;
@@ -3761,14 +3848,46 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
         })
         .collect();
     let in_call = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+    #[cfg(feature = "screenshare")]
+    let live_videos: Vec<_> = members.iter().map(|(user, _)| textures.live_video(&user.id)).collect();
     ui.child_window("dm_call_panel").size([0.0, CALL_PANEL_HEIGHT]).build(|| {
         let width = ui.window_size()[0];
+        #[cfg(feature = "screenshare")]
+        let row_w = live_videos.iter().map(|live| if live.is_some() { 180.0 } else { SIZE }).sum::<f32>()
+            + members.len().saturating_sub(1) as f32 * GAP;
+        #[cfg(not(feature = "screenshare"))]
         let row_w = members.len() as f32 * SIZE + members.len().saturating_sub(1) as f32 * GAP;
         ui.set_cursor_pos([(width - row_w) / 2.0, 12.0]);
-        for (user, speaking) in &members {
+        let mut row_height = SIZE;
+        for (member_index, (user, speaking)) in members.iter().enumerate() {
             let p = ui.cursor_screen_pos();
-            let center = [p[0] + SIZE / 2.0, p[1] + SIZE / 2.0];
+            #[cfg(feature = "screenshare")]
+            let live = live_videos.get(member_index).and_then(|v| *v);
+            #[cfg(feature = "screenshare")]
+            let tile_size = if let Some((_, source_size)) = live {
+                let scale = (180.0 / source_size[0].max(1.0)).min(112.0 / source_size[1].max(1.0));
+                [source_size[0] * scale, source_size[1] * scale]
+            } else {
+                [SIZE, SIZE]
+            };
+            #[cfg(not(feature = "screenshare"))]
+            let tile_size = [SIZE, SIZE];
+            row_height = row_height.max(tile_size[1]);
+            let center = [p[0] + tile_size[0] / 2.0, p[1] + tile_size[1] / 2.0];
             let url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+            #[cfg(feature = "screenshare")]
+            if let Some((texture_id, _)) = live {
+                imgui::Image::new(texture_id, tile_size).build(ui);
+            } else {
+                match textures.get(&url) {
+                    Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
+                    None => {
+                        textures.request(&url, cmd_tx);
+                        ui.dummy([SIZE, SIZE]);
+                    }
+                }
+            }
+            #[cfg(not(feature = "screenshare"))]
             match textures.get(&url) {
                 Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
                 None => {
@@ -3786,7 +3905,9 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
                     ui.open_popup("dm_call_member_ctx");
                 }
             }
-            ui.same_line_with_spacing(0.0, GAP);
+            if member_index + 1 < members.len() {
+                ui.same_line_with_spacing(0.0, GAP);
+            }
         }
         ui.popup("dm_call_member_ctx", || {
             let Some(member_id) = state.context_vc_member.clone() else { return };
@@ -3798,10 +3919,22 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
             if ui.selectable("Profile") {
                 state.profile_popout = known;
             }
+            #[cfg(feature = "screenshare")]
+            if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
+                if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                    if ui.selectable("Stop watching") {
+                        let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+                        state.watching_stream = None;
+                    }
+                } else if ui.selectable("Watch screen share") {
+                    let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+                    state.watching_stream = Some(stream_key);
+                }
+            }
             draw_user_volume_controls(ui, state, cmd_tx, &member_id);
         });
         if in_call {
-            ui.set_cursor_pos([0.0, 12.0 + SIZE + 18.0]);
+            ui.set_cursor_pos([0.0, 12.0 + row_height + 18.0]);
             draw_voice_controls(ui, state, textures, cmd_tx, None, &channel_id, true);
         }
     });
@@ -3918,14 +4051,33 @@ fn draw_channel_header(
                 } else {
                     let _ = cmd_tx
                         .send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone(), ring: true });
-                    state.pending_voice_channel = Some((None, channel_id));
+                    state.pending_voice_channel = Some((None, channel_id.clone()));
                 }
             }
             ui.same_line_with_spacing(0.0, ICON_GAP);
 
-            let _disabled = ui.begin_disabled(true);
-            emoji_button(ui, textures, "header_video", HEADER_ICONS[1], "Video calls aren't supported yet", None);
-            drop(_disabled);
+            #[cfg(feature = "screenshare")]
+            {
+                let disabled = ui.begin_disabled(!is_connected);
+                let tint = state.screen_sharing.then_some(state.theme.accent);
+                let tip = if state.screen_sharing { "Stop screen sharing" } else { "Share your screen" };
+                let clicked = emoji_button(ui, textures, "header_video", SCREENSHARE_ICON, tip, tint);
+                drop(disabled);
+                if clicked && is_connected {
+                    state.screen_sharing = !state.screen_sharing;
+                    let _ = cmd_tx.send(UiCommand::SetScreenSharing {
+                        enabled: state.screen_sharing,
+                        guild_id: None,
+                        channel_id: channel_id.clone(),
+                    });
+                }
+            }
+            #[cfg(not(feature = "screenshare"))]
+            {
+                let disabled = ui.begin_disabled(true);
+                emoji_button(ui, textures, "header_video", SCREENSHARE_ICON, "Screen sharing isn't available in this build", None);
+                drop(disabled);
+            }
             ui.same_line_with_spacing(0.0, ICON_GAP);
         } else {
             let members_tint = state.show_members_panel.then_some(state.theme.accent);
@@ -5092,7 +5244,7 @@ mod chrome_icon_tests {
             .expect("http client");
 
         let mut missing = Vec::new();
-        for icon in CHROME_ICONS.iter().chain(HEADER_ICONS.iter()).copied() {
+        for icon in CHROME_ICONS.iter().chain(HEADER_ICONS.iter()).copied().chain([SCREENSHARE_ICON]) {
             let url = crate::emoji::url(icon);
             match client.get(&url).send() {
                 Ok(resp) if resp.status().is_success() => {}
