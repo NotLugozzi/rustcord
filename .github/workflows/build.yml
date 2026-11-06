@@ -54,6 +54,7 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.1-dev \
             libssl-dev \
+            libopus-dev \
             pkg-config \
             cmake
 
@@ -88,6 +89,8 @@ jobs:
           cargo install cargo-generate-rpm --locked
 
       - name: Build release binary
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: cargo build --release -p rustcord-ui ${{ matrix.features }}
 
       - name: Package tar.gz
