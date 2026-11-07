@@ -5,6 +5,7 @@ mod clipboard;
 mod emoji;
 mod icons;
 mod images;
+mod invites;
 mod ipc;
 mod keybinds;
 mod markdown;
@@ -138,6 +139,9 @@ pub fn drain_backend_events(
                 if let Some(user) = user {
                     state.known_users.insert(user_id.clone(), user);
                 }
+                let mutual = profile.mutual_guild_ids.len();
+                let label = format!("{mutual} Mutual Server{}", if mutual == 1 { "" } else { "s" });
+                state.mutual_server_labels.insert(user_id.clone(), label);
                 state.profiles.insert(user_id, profile);
             }
             BackendEvent::RpcApps(apps) => {
@@ -193,7 +197,7 @@ pub fn drain_backend_events(
             }
             BackendEvent::MessagesAroundLoaded { channel_id, message_id, messages } => {
                 state.set_message_history(channel_id.clone(), messages);
-                state.history_exhausted.remove(&channel_id);
+                state.reached_start.remove(&channel_id);
                 state.scroll_to_message = Some(message_id);
                 state.viewing_jumped_history = true;
             }
@@ -372,6 +376,20 @@ pub fn drain_backend_events(
                 state.voice_input_devices = inputs;
                 state.voice_output_devices = outputs;
             }
+            BackendEvent::InviteResolved { code, result } => {
+                let state_for = match result {
+                    Ok(invite) => invites::InviteState::Ready(Box::new(invites::ResolvedInvite::new(invite))),
+                    Err(backend::InviteFailure::Invalid) => invites::InviteState::Invalid,
+                    Err(backend::InviteFailure::Unavailable) => invites::InviteState::Unavailable,
+                };
+                state.invites.insert(code, invites::InviteEntry { state: state_for, updated: std::time::Instant::now() });
+            }
+            BackendEvent::RelationshipSettled { user_id } => {
+                state.relationship_busy.remove(&user_id);
+            }
+            BackendEvent::GuildJoined(guild) => {
+                state.add_joined_guild(guild);
+            }
             BackendEvent::MemberRemoved { guild_id, user_id } => {
                 if let Some(members) = state.guild_members.get_mut(&guild_id) {
                     members.retain(|m| m.user.id != user_id);
@@ -405,12 +423,13 @@ pub fn drain_backend_events(
                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: newest.id.clone() });
                     }
                 }
+                state.note_history_page(&channel_id, messages.len());
                 state.set_message_history(channel_id, messages);
             }
             BackendEvent::OlderMessagesLoaded { channel_id, messages } => {
                 state.loading_older_messages = false;
-                if messages.is_empty() {
-                    state.history_exhausted.insert(channel_id.clone());
+                if messages.len() < backend::HISTORY_PAGE_SIZE as usize {
+                    state.reached_start.insert(channel_id.clone());
                 }
                 state.prepend_message_history(channel_id, messages);
             }

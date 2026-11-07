@@ -136,6 +136,8 @@ pub enum UiCommand {
     SearchMessages { scope: SearchScope, query: String, filters: SearchFilters, offset: u32 },
     JumpToMessage { channel_id: String, message_id: String },
     JoinGuildByInvite { invite_code: String },
+    ResolveInvite { code: String },
+    UpdateRelationship { user_id: String, action: RelationshipAction },
     CreateGuild { name: String },
     RequestGuildMembers { guild_id: String },
     KickMember { guild_id: String, user_id: String },
@@ -159,6 +161,21 @@ pub enum UiCommand {
     LoadVoiceDevices,
     RunMicTest { input_device: Option<String>, output_device: Option<String> },
     Logout,
+}
+
+pub const HISTORY_PAGE_SIZE: u32 = 50;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationshipAction {
+    SendRequest,
+    Remove,
+    Block,
+    Unblock,
+}
+
+pub enum InviteFailure {
+    Invalid,
+    Unavailable,
 }
 
 pub enum BackendEvent {
@@ -207,6 +224,9 @@ pub enum BackendEvent {
     Notice(String),
     VoiceDevicesLoaded { inputs: Vec<String>, outputs: Vec<String> },
     MemberRemoved { guild_id: String, user_id: String },
+    InviteResolved { code: String, result: Result<rustcord_client::models::Invite, InviteFailure> },
+    GuildJoined(rustcord_client::models::Guild),
+    RelationshipSettled { user_id: String },
     MicTestStarted,
     MicTestFinished,
 }
@@ -284,7 +304,7 @@ pub fn spawn(
                 }
                 UiCommand::SelectChannel { channel_id } => {
                     if let Some(client) = &rest {
-                        match client.messages(&channel_id, 50).await {
+                        match client.messages(&channel_id, HISTORY_PAGE_SIZE).await {
                             Ok(messages) => {
                                 let _ = event_tx.send(BackendEvent::MessagesLoaded { channel_id, messages });
                             }
@@ -297,7 +317,7 @@ pub fn spawn(
                 }
                 UiCommand::LoadOlderMessages { channel_id, before } => {
                     if let Some(client) = &rest {
-                        match client.messages_before(&channel_id, &before, 50).await {
+                        match client.messages_before(&channel_id, &before, HISTORY_PAGE_SIZE).await {
                             Ok(messages) => {
                                 let _ = event_tx.send(BackendEvent::OlderMessagesLoaded { channel_id, messages });
                             }
@@ -563,9 +583,53 @@ pub fn spawn(
                 }
                 UiCommand::JoinGuildByInvite { invite_code } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.join_guild_by_invite(&invite_code).await {
-                            let _ = event_tx.send(BackendEvent::Error(format!("failed to join server: {e}")));
+                        match client.join_guild_by_invite(&invite_code).await {
+                            Ok(invite) => {
+                                if let Some(guild) = invite.guild {
+                                    let _ = event_tx.send(BackendEvent::GuildJoined(guild.to_guild()));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to join server: {e}")));
+                            }
                         }
+                    }
+                }
+                UiCommand::UpdateRelationship { user_id, action } => {
+                    if let Some(client) = &rest {
+                        let result = match action {
+                            RelationshipAction::SendRequest => client.put_relationship(&user_id, None).await,
+                            RelationshipAction::Block => client.put_relationship(&user_id, Some(2)).await,
+                            RelationshipAction::Remove | RelationshipAction::Unblock => client.delete_relationship(&user_id).await,
+                        };
+                        if let Err(e) = result {
+                            let _ = event_tx.send(BackendEvent::Error(format!("could not update relationship: {e}")));
+                        }
+                        match client.relationships().await {
+                            Ok(relationships) => {
+                                let _ = event_tx.send(BackendEvent::RelationshipsLoaded(relationships));
+                            }
+                            Err(e) => tracing::warn!("failed to refresh relationships: {e}"),
+                        }
+                        let _ = event_tx.send(BackendEvent::RelationshipSettled { user_id });
+                    }
+                }
+                UiCommand::ResolveInvite { code } => {
+                    if let Some(client) = &rest {
+                        let client = client.clone();
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.invite(&code).await.map_err(|e| match e {
+                                rustcord_client::error::ClientError::Api { status, .. } if (400..500).contains(&status) && status != 429 => {
+                                    InviteFailure::Invalid
+                                }
+                                e => {
+                                    tracing::warn!("could not resolve invite {code}: {e}");
+                                    InviteFailure::Unavailable
+                                }
+                            });
+                            let _ = event_tx.send(BackendEvent::InviteResolved { code, result });
+                        });
                     }
                 }
                 UiCommand::CreateGuild { name } => {

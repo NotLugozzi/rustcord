@@ -284,7 +284,7 @@ fn draw_spans(
                 draw_styled_text(ui, fonts, theme, text, *style);
             }
             Span::Link { label, url } => {
-                let shown = if label == url { elide_url(label) } else { label.clone() };
+                let shown = if label == url && !crate::invites::is_invite_url(url) { elide_url(label) } else { label.clone() };
                 if clickable_text_wrapping(ui, &format!("link_{id_seed}_{block_idx}_{span_idx}"), &shown, theme.accent) {
                     let _ = open::that(url);
                 }
@@ -2081,6 +2081,13 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         state.switcher_selected = 0;
     }
     dispatch_keybinds(ui, state, cmd_tx);
+    if let Some((guild_id, channel_id)) = state.pending_invite_voice.clone() {
+        if state.guilds.iter().any(|g| g.id == guild_id) && !state.voice_connecting {
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
+            state.pending_voice_channel = Some((Some(guild_id), channel_id));
+            state.pending_invite_voice = None;
+        }
+    }
 
     let [display_w, display_h] = ui.io().display_size;
     #[cfg(feature = "screenshare")]
@@ -2475,7 +2482,13 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .size([0.0, display_h - 80.0 - status_height - header_height - extra_banner_height])
                 .build(|| {
                     let was_at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 40.0;
-                    if rows.is_empty() {
+                    let at_start = state.reached_start.contains(&channel_key);
+                    if at_start {
+                        if let Some(dm) = &dm_channel {
+                            draw_conversation_start(ui, state, cmd_tx, textures, fonts, dm);
+                        }
+                    }
+                    if rows.is_empty() && !at_start {
                         ui.text_disabled("No messages loaded yet.");
                     }
 
@@ -2591,6 +2604,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
+                                for code in &row.invites {
+                                    draw_invite_card(ui, state, textures, cmd_tx, code);
+                                }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
 
@@ -2611,6 +2627,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
+                                }
+                                for code in &row.invites {
+                                    draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
@@ -2701,7 +2720,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
 
                     let scroll_y = ui.scroll_y();
-                    if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !rows.is_empty() && !state.loading_older_messages && !state.history_exhausted.contains(&channel_key) {
+                    if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !rows.is_empty() && !state.loading_older_messages && !state.reached_start.contains(&channel_key) {
                         if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), rows.first().map(|r| &r.message)) {
                             state.loading_older_messages = true;
                             state.history_scroll_anchor = Some((channel_id.clone(), oldest.id.clone()));
@@ -3091,6 +3110,379 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
 }
 
 const SYSTEM_ICON_SIZE: f32 = 16.0;
+const START_AVATAR_SIZE: f32 = 80.0;
+const START_MUTUAL_ICON: f32 = 20.0;
+
+fn draw_bold_sentence(ui: &Ui, fonts: &Fonts, muted: [f32; 4], strong: [f32; 4], before: &str, name: &str, after: &str) {
+    ui.text_colored(muted, before);
+    ui.same_line_with_spacing(0.0, 0.0);
+    let bold = ui.push_font(fonts.bold);
+    ui.text_colored(strong, name);
+    bold.pop();
+    ui.same_line_with_spacing(0.0, 0.0);
+    ui.text_colored(muted, after);
+}
+
+fn draw_start_avatar(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, url: Option<&str>, fallback: [f32; 4]) {
+    match url.and_then(|url| textures.get(url)) {
+        Some((texture, _)) => draw_circular_image(ui, texture, [START_AVATAR_SIZE; 2]),
+        None => {
+            if let Some(url) = url {
+                textures.request(url, cmd_tx);
+            }
+            let min = ui.cursor_screen_pos();
+            let radius = START_AVATAR_SIZE / 2.0;
+            ui.get_window_draw_list()
+                .add_circle([min[0] + radius, min[1] + radius], radius, fallback)
+                .filled(true)
+                .num_segments(48)
+                .build();
+            let icon = 36.0;
+            let inset = (START_AVATAR_SIZE - icon) / 2.0;
+            draw_icon_at(ui, textures, crate::icons::Icon::Users, [min[0] + inset, min[1] + inset], icon, [1.0, 1.0, 1.0, 1.0]);
+            ui.dummy([START_AVATAR_SIZE; 2]);
+        }
+    }
+}
+
+fn draw_conversation_start(
+    ui: &Ui,
+    state: &mut AppState,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    fonts: &Fonts,
+    dm: &rustcord_client::models::Channel,
+) {
+    use crate::backend::RelationshipAction;
+    use rustcord_client::models::{ChannelType, RelationshipType};
+
+    let muted = state.theme.text_muted;
+    let strong = state.theme.text;
+    let accent = state.theme.accent;
+    let left = ui.cursor_pos()[0] + 24.0;
+    ui.dummy([0.0, 16.0]);
+    let indent = |ui: &Ui| ui.set_cursor_pos([left, ui.cursor_pos()[1]]);
+
+    if dm.kind == ChannelType::GroupDm {
+        let name = AppState::dm_display_name(dm);
+        let icon_url = dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 128));
+        indent(ui);
+        draw_start_avatar(ui, textures, cmd_tx, icon_url.as_deref(), accent);
+        indent(ui);
+        let bold = ui.push_font(fonts.bold);
+        ui.set_window_font_scale(1.6);
+        ui.text_colored(strong, &name);
+        ui.set_window_font_scale(1.0);
+        bold.pop();
+        indent(ui);
+        draw_bold_sentence(ui, fonts, muted, strong, "Welcome to the beginning of the ", &name, " group.");
+        ui.dummy([0.0, 16.0]);
+        return;
+    }
+
+    let Some(user) = dm.recipients.first() else { return };
+    let display = user.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&user.username);
+    let avatar = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+    indent(ui);
+    draw_start_avatar(ui, textures, cmd_tx, Some(&avatar), accent);
+    indent(ui);
+    let bold = ui.push_font(fonts.bold);
+    ui.set_window_font_scale(1.6);
+    ui.text_colored(strong, display);
+    ui.set_window_font_scale(1.0);
+    bold.pop();
+    indent(ui);
+    ui.set_window_font_scale(1.25);
+    ui.text_colored(strong, &user.username);
+    ui.set_window_font_scale(1.0);
+    ui.dummy([0.0, 4.0]);
+    indent(ui);
+    draw_bold_sentence(ui, fonts, muted, strong, "This is the beginning of your direct message history with ", display, ".");
+    ui.dummy([0.0, 2.0]);
+    indent(ui);
+
+    if !state.profiles_requested.contains(&user.id) {
+        state.profiles_requested.insert(user.id.clone());
+        let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user.id.clone() });
+    }
+    let mut started_row = false;
+    let profile = state.profiles.get(&user.id).filter(|p| !p.mutual_guild_ids.is_empty());
+    if let (Some(profile), Some(label)) = (profile, state.mutual_server_labels.get(&user.id)) {
+        let row_y = ui.cursor_screen_pos()[1];
+        let icon_y = row_y + (ui.frame_height() - START_MUTUAL_ICON) / 2.0;
+        let mut x = ui.cursor_screen_pos()[0];
+        for guild in profile.mutual_guild_ids.iter().take(3).filter_map(|id| state.guilds.iter().find(|g| &g.id == id)) {
+            if let Some(url) = rustcord_client::cdn::guild_icon_url(guild, 64) {
+                match textures.get(&url) {
+                    Some((texture, _)) => {
+                        ui.get_window_draw_list()
+                            .add_image_rounded(texture, [x, icon_y], [x + START_MUTUAL_ICON, icon_y + START_MUTUAL_ICON], START_MUTUAL_ICON / 2.0)
+                            .build();
+                    }
+                    None => textures.request(&url, cmd_tx),
+                }
+            }
+            x += START_MUTUAL_ICON - 4.0;
+        }
+        if x > ui.cursor_screen_pos()[0] {
+            ui.set_cursor_screen_pos([x + 8.0, row_y]);
+        }
+        let text_y = ui.cursor_pos()[1] + (ui.frame_height() - ui.text_line_height()) / 2.0;
+        ui.set_cursor_pos([ui.cursor_pos()[0], text_y]);
+        if clickable_text(ui, "mutual_servers_link", label, muted) {
+            ui.open_popup("mutual_servers");
+        }
+        if ui.is_item_hovered() {
+            ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+        }
+        ui.same_line();
+        ui.text_colored(muted, "\u{2022}");
+        ui.same_line();
+        started_row = true;
+        let mut picked = None;
+        ui.popup("mutual_servers", || {
+            ui.text_disabled("Mutual Servers");
+            ui.separator();
+            for id in &profile.mutual_guild_ids {
+                let Some(guild) = state.guilds.iter().find(|g| &g.id == id) else { continue };
+                if ui.selectable(&guild.name) {
+                    picked = Some(guild.id.clone());
+                }
+            }
+        });
+        if let Some(guild_id) = picked {
+            let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
+            state.selected_guild = Some(guild_id);
+            state.selected_channel = None;
+        }
+    }
+    if !started_row {
+        indent(ui);
+    }
+
+    if !user.bot {
+        let relationship = state.relationship_with(&user.id);
+        let busy = state.relationship_busy.contains(&user.id);
+        let mut request = None;
+        let _button = ui.push_style_color(imgui::StyleColor::Button, [muted[0], muted[1], muted[2], 0.22]);
+        let disabled = ui.begin_disabled(busy);
+        let friend_button = match relationship {
+            Some(RelationshipType::Friend) => Some(("Remove Friend", Some(RelationshipAction::Remove))),
+            Some(RelationshipType::OutgoingRequest) => Some(("Friend Request Sent", None)),
+            Some(RelationshipType::IncomingRequest) => Some(("Accept Friend Request", Some(RelationshipAction::SendRequest))),
+            Some(RelationshipType::Blocked) => None,
+            None => Some(("Add Friend", Some(RelationshipAction::SendRequest))),
+        };
+        if let Some((label, action)) = friend_button {
+            let inert = ui.begin_disabled(action.is_none());
+            if ui.button(label) {
+                request = action;
+            }
+            drop(inert);
+            ui.same_line();
+        }
+        let block_action = if relationship == Some(RelationshipType::Blocked) { RelationshipAction::Unblock } else { RelationshipAction::Block };
+        if ui.button(if block_action == RelationshipAction::Unblock { "Unblock" } else { "Block" }) {
+            request = Some(block_action);
+        }
+        drop(disabled);
+
+        match request {
+            Some(action @ (RelationshipAction::Remove | RelationshipAction::Block)) => {
+                state.relationship_confirm = Some((action, user.id.clone(), display.to_string()));
+                ui.open_popup("Confirm##relationship");
+            }
+            Some(action) => {
+                state.relationship_busy.insert(user.id.clone());
+                let _ = cmd_tx.send(UiCommand::UpdateRelationship { user_id: user.id.clone(), action });
+            }
+            None => {}
+        }
+    }
+
+    if let Some(_modal) = ui.modal_popup_config("Confirm##relationship").always_auto_resize(true).begin_popup() {
+        let mut close = false;
+        if let Some((action, user_id, name)) = state.relationship_confirm.clone() {
+            let (title, body, confirm) = if action == RelationshipAction::Block {
+                ("Block", "They won't be able to message you, and you won't see their messages.", "Block")
+            } else {
+                ("Remove Friend", "You'll need to send a new friend request to be friends again.", "Remove Friend")
+            };
+            let bold = ui.push_font(fonts.bold);
+            ui.text(format!("{title} {name}?"));
+            bold.pop();
+            ui.text_colored(muted, body);
+            ui.dummy([0.0, 6.0]);
+            if ui.button("Cancel") {
+                close = true;
+            }
+            ui.same_line();
+            let _danger = ui.push_style_color(imgui::StyleColor::Button, state.theme.mention_badge());
+            if ui.button(confirm) {
+                state.relationship_busy.insert(user_id.clone());
+                let _ = cmd_tx.send(UiCommand::UpdateRelationship { user_id, action });
+                close = true;
+            }
+        } else {
+            close = true;
+        }
+        if close {
+            state.relationship_confirm = None;
+            ui.close_current_popup();
+        }
+    }
+    ui.dummy([0.0, 16.0]);
+}
+const INVITE_CARD_WIDTH: f32 = 400.0;
+const INVITE_CARD_HEIGHT: f32 = 76.0;
+const INVITE_ICON_SIZE: f32 = 48.0;
+
+enum InviteAction {
+    JoinGuild,
+    JoinVoice { guild_id: String, channel_id: String, member: bool },
+}
+
+fn draw_invite_card(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, code: &str) {
+    use crate::invites::InviteState;
+    let _id = ui.push_id(code);
+    ui.dummy([0.0, 2.0]);
+    let start = ui.cursor_pos();
+    let origin = ui.cursor_screen_pos();
+    let width = INVITE_CARD_WIDTH.min(ui.content_region_avail()[0]).max(200.0);
+    let max = [origin[0] + width, origin[1] + INVITE_CARD_HEIGHT];
+    if ui.is_rect_visible(origin, max) {
+        state.ensure_invite(code, cmd_tx);
+    }
+    let panel = state.theme.panel;
+    let text_color = state.theme.text;
+    let muted = state.theme.text_muted;
+    let accent = state.theme.accent;
+    let call_green = state.theme.call_active();
+    ui.get_window_draw_list().add_rect(origin, max, panel).filled(true).rounding(8.0).build();
+    let icon_min = [origin[0] + 14.0, origin[1] + (INVITE_CARD_HEIGHT - INVITE_ICON_SIZE) / 2.0];
+    let icon_max = [icon_min[0] + INVITE_ICON_SIZE, icon_min[1] + INVITE_ICON_SIZE];
+    let text_x = start[0] + 14.0 + INVITE_ICON_SIZE + 14.0;
+    let line = ui.text_line_height_with_spacing();
+    let text_top = start[1] + (INVITE_CARD_HEIGHT - line * 2.0) / 2.0;
+    let button_y = start[1] + (INVITE_CARD_HEIGHT - ui.frame_height()) / 2.0;
+    let mut action = None;
+
+    match state.invites.get(code).map(|entry| &entry.state) {
+        None | Some(InviteState::Loading) => {
+            let skeleton = [muted[0], muted[1], muted[2], 0.18];
+            let dl = ui.get_window_draw_list();
+            dl.add_rect(icon_min, icon_max, skeleton).filled(true).rounding(12.0).build();
+            let bar_x = icon_max[0] + 14.0;
+            dl.add_rect([bar_x, origin[1] + 22.0], [bar_x + 140.0, origin[1] + 36.0], skeleton).filled(true).rounding(4.0).build();
+            dl.add_rect([bar_x, origin[1] + 44.0], [bar_x + 90.0, origin[1] + 54.0], skeleton).filled(true).rounding(4.0).build();
+        }
+        Some(InviteState::Invalid) | Some(InviteState::Unavailable) => {
+            let invalid = matches!(state.invites.get(code).map(|e| &e.state), Some(InviteState::Invalid));
+            let tint = [muted[0], muted[1], muted[2], 0.6];
+            ui.get_window_draw_list().add_rect(icon_min, icon_max, [tint[0], tint[1], tint[2], 0.12]).filled(true).rounding(12.0).build();
+            draw_icon_at(ui, textures, crate::icons::Icon::CircleHelp, [icon_min[0] + 12.0, icon_min[1] + 12.0], 24.0, tint);
+            ui.set_cursor_pos([text_x, text_top]);
+            ui.text_colored(muted, if invalid { "Invite invalid" } else { "Couldn't load invite" });
+            ui.set_cursor_pos([text_x, text_top + line]);
+            ui.set_window_font_scale(0.85);
+            ui.text_colored(
+                muted,
+                if invalid { "This invite may be expired, or you might not have permission to join." } else { "Try again in a few minutes." },
+            );
+            ui.set_window_font_scale(1.0);
+        }
+        Some(InviteState::Ready(resolved)) => {
+            let guild = resolved.invite.guild.as_ref();
+            let guild_id = guild.map(|g| g.id.as_str()).unwrap_or_default();
+            let member = state.guilds.iter().any(|g| g.id == guild_id);
+            let voice = resolved.invite.channel.as_ref().filter(|c| c.is_voice());
+            match voice {
+                Some(channel) => {
+                    ui.get_window_draw_list().add_rect(icon_min, icon_max, [accent[0], accent[1], accent[2], 0.18]).filled(true).rounding(12.0).build();
+                    draw_icon_at(ui, textures, crate::icons::Icon::Volume, [icon_min[0] + 12.0, icon_min[1] + 12.0], 24.0, text_color);
+                    ui.set_cursor_pos([text_x, text_top]);
+                    ui.text(&resolved.channel_name);
+                    ui.set_cursor_pos([text_x, text_top + line]);
+                    ui.set_window_font_scale(0.85);
+                    if member {
+                        let occupants = state.members_in_voice_channel(guild_id, &channel.id).len();
+                        if occupants == 0 {
+                            ui.text_colored(muted, "No one is currently in voice");
+                        } else {
+                            ui.text_colored(call_green, format!("{occupants} in voice"));
+                        }
+                    } else {
+                        ui.text_colored(muted, "Only server members can see who's in voice");
+                    }
+                    ui.set_window_font_scale(1.0);
+                    let in_channel = state.connected_voice_channel.as_ref().is_some_and(|(_, id)| *id == channel.id);
+                    ui.set_cursor_pos([start[0] + width - 108.0, button_y]);
+                    let _green = ui.push_style_color(imgui::StyleColor::Button, call_green);
+                    let disabled = ui.begin_disabled(in_channel || state.voice_connecting);
+                    if ui.button_with_size(if in_channel { "Connected" } else { "Join Voice" }, [96.0, 0.0]) {
+                        action = Some(InviteAction::JoinVoice { guild_id: guild_id.to_string(), channel_id: channel.id.clone(), member });
+                    }
+                    drop(disabled);
+                }
+                None => {
+                    match resolved.icon_url.as_deref().and_then(|url| textures.get(url).map(|t| (url, t))) {
+                        Some((_, (texture, _))) => {
+                            ui.get_window_draw_list().add_image_rounded(texture, icon_min, icon_max, 12.0).build();
+                        }
+                        None => {
+                            if let Some(url) = resolved.icon_url.as_deref() {
+                                textures.request(url, cmd_tx);
+                            }
+                            let dl = ui.get_window_draw_list();
+                            dl.add_rect(icon_min, icon_max, accent).filled(true).rounding(12.0).build();
+                            let size = ui.calc_text_size(&resolved.initials);
+                            dl.add_text(
+                                [icon_min[0] + (INVITE_ICON_SIZE - size[0]) / 2.0, icon_min[1] + (INVITE_ICON_SIZE - size[1]) / 2.0],
+                                text_color,
+                                &resolved.initials,
+                            );
+                        }
+                    }
+                    ui.set_cursor_pos([text_x, text_top]);
+                    let name = guild.map(|g| g.name.as_str()).unwrap_or("Unknown server");
+                    ui.text(name);
+                    ui.set_cursor_pos([text_x, text_top + line]);
+                    ui.set_window_font_scale(0.85);
+                    ui.text_colored(muted, &resolved.counts);
+                    ui.set_window_font_scale(1.0);
+                    ui.set_cursor_pos([start[0] + width - 88.0, button_y]);
+                    if member {
+                        let disabled = ui.begin_disabled(true);
+                        ui.button_with_size("Joined", [76.0, 0.0]);
+                        drop(disabled);
+                    } else {
+                        let _green = ui.push_style_color(imgui::StyleColor::Button, call_green);
+                        if ui.button_with_size("Join", [76.0, 0.0]) {
+                            action = Some(InviteAction::JoinGuild);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match action {
+        Some(InviteAction::JoinGuild) => {
+            let _ = cmd_tx.send(UiCommand::JoinGuildByInvite { invite_code: code.to_string() });
+        }
+        Some(InviteAction::JoinVoice { guild_id, channel_id, member: true }) => {
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
+            state.pending_voice_channel = Some((Some(guild_id), channel_id));
+        }
+        Some(InviteAction::JoinVoice { guild_id, channel_id, member: false }) => {
+            let _ = cmd_tx.send(UiCommand::JoinGuildByInvite { invite_code: code.to_string() });
+            state.pending_invite_voice = Some((guild_id, channel_id));
+        }
+        None => {}
+    }
+    ui.set_cursor_pos(start);
+    ui.dummy([width, INVITE_CARD_HEIGHT]);
+}
 
 fn draw_system_row(
     ui: &Ui,
@@ -3104,7 +3496,7 @@ fn draw_system_row(
     use crate::message_rows::{SystemAction, Tone};
     let theme = &state.theme;
     let tint = match system.tone {
-        Tone::CallActive => theme.call_active(),
+        Tone::CallActive | Tone::Positive => theme.call_active(),
         Tone::CallMissed => theme.call_missed(),
         Tone::Muted => theme.text_muted,
     };

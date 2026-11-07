@@ -52,6 +52,7 @@ pub fn starts_group(prev: Option<(&Message, &Stamp)>, msg: &Message, stamp: &Sta
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tone {
     Muted,
+    Positive,
     CallActive,
     CallMissed,
 }
@@ -109,7 +110,7 @@ fn log_unsupported_once(kind: u8) {
     }
 }
 
-pub fn system_row(msg: &Message, me: &str) -> SystemRow {
+pub fn system_row(msg: &Message, me: &str, peer: Option<&str>) -> SystemRow {
     let author = display_name(&msg.author);
     let target = msg.mentions.first();
     let bold = |text: String| (text, true);
@@ -173,6 +174,17 @@ pub fn system_row(msg: &Message, me: &str) -> SystemRow {
             }
         }
         7 => row(Icon::UserPlus, vec![bold(author), plain(" joined the server.")]),
+        67 => {
+            let parts = if msg.author.id == me {
+                match target.map(display_name).or_else(|| peer.map(str::to_string)) {
+                    Some(other) => vec![plain("You accepted "), bold(other), plain("'s friend request.")],
+                    None => vec![plain("You accepted their friend request.")],
+                }
+            } else {
+                vec![bold(author), plain(" accepted your friend request.")]
+            };
+            SystemRow { icon: Icon::UserPlus, tone: Tone::Positive, parts, action: None, tooltip: None }
+        }
         kind => {
             log_unsupported_once(kind);
             SystemRow {
@@ -231,6 +243,7 @@ pub struct MessageRow {
     pub followed_by_system: bool,
     pub times: Times,
     pub system: Option<SystemRow>,
+    pub invites: Vec<String>,
 }
 
 pub struct ChannelRows {
@@ -240,7 +253,14 @@ pub struct ChannelRows {
 }
 
 impl ChannelRows {
-    pub fn build<Tz: TimeZone>(messages: &[Arc<Message>], tz: &Tz, today: NaiveDate, format: TimeFormat, me: &str) -> Self
+    pub fn build<Tz: TimeZone>(
+        messages: &[Arc<Message>],
+        tz: &Tz,
+        today: NaiveDate,
+        format: TimeFormat,
+        me: &str,
+        peer: Option<&str>,
+    ) -> Self
     where
         Tz::Offset: std::fmt::Display,
     {
@@ -266,7 +286,8 @@ impl ChannelRows {
                 ends_group: true,
                 followed_by_system: false,
                 times: Times::of(msg, stamp, tz, today, format),
-                system: is_system(msg).then(|| system_row(msg, me)),
+                system: is_system(msg).then(|| system_row(msg, me, peer)),
+                invites: if is_system(msg) { Vec::new() } else { crate::invites::invite_codes(&msg.content) },
             });
         }
         Self { rows, today, format }
@@ -311,11 +332,24 @@ mod tests {
 
     fn build(messages: Vec<Message>, tz: &FixedOffset) -> ChannelRows {
         let messages: Vec<Arc<Message>> = messages.into_iter().map(Arc::new).collect();
-        ChannelRows::build(&messages, tz, today(), US, "me")
+        ChannelRows::build(&messages, tz, today(), US, "me", None)
     }
 
     fn starts(messages: Vec<Message>, tz: &FixedOffset) -> Vec<bool> {
         build(messages, tz).rows.iter().map(|r| r.starts_group).collect()
+    }
+
+    fn system_row_test(msg: &Message, me: &str) -> SystemRow {
+        system_row(msg, me, Some("peer"))
+    }
+
+    #[test]
+    fn accepted_friend_requests_name_the_other_side() {
+        let mine = with_kind(msg("1", "me", "2026-10-28T12:12:00+00:00"), 67);
+        assert_eq!(system_row_test(&mine, "me").plain_text(), "You accepted peer's friend request.");
+        let theirs = with_kind(msg("1", "lunatest", "2026-10-28T12:12:00+00:00"), 67);
+        assert_eq!(system_row_test(&theirs, "me").plain_text(), "lunatest accepted your friend request.");
+        assert_eq!(system_row_test(&theirs, "me").tone, Tone::Positive);
     }
 
     fn call(author: &str, start: &str, end: Option<&str>, participants: &[&str]) -> Message {
@@ -340,15 +374,15 @@ mod tests {
 
     #[test]
     fn completed_missed_and_ongoing_calls() {
-        let done = system_row(&call("me", "2026-10-28T12:13:00+00:00", Some("2026-10-28T12:14:00+00:00"), &["me"]), "me");
+        let done = system_row_test(&call("me", "2026-10-28T12:13:00+00:00", Some("2026-10-28T12:14:00+00:00"), &["me"]), "me");
         assert_eq!(done.plain_text(), "me started a call that lasted a minute.");
         assert_eq!((done.icon, done.tone), (Icon::Phone, Tone::CallActive));
 
-        let missed = system_row(&call("them", "2026-10-28T12:14:00+00:00", Some("2026-10-28T12:16:00+00:00"), &["them"]), "me");
+        let missed = system_row_test(&call("them", "2026-10-28T12:14:00+00:00", Some("2026-10-28T12:16:00+00:00"), &["them"]), "me");
         assert_eq!(missed.plain_text(), "You missed a call from them that lasted 2 minutes.");
         assert_eq!((missed.icon, missed.tone), (Icon::PhoneMissed, Tone::CallMissed));
 
-        let ongoing = system_row(&call("them", "2026-10-28T12:14:00+00:00", None, &["them"]), "me");
+        let ongoing = system_row_test(&call("them", "2026-10-28T12:14:00+00:00", None, &["them"]), "me");
         assert_eq!(ongoing.plain_text(), "them started a call.");
         assert_eq!(ongoing.action, Some(SystemAction::JoinCall));
     }
@@ -359,20 +393,20 @@ mod tests {
         added.mentions = vec![added.author.clone()];
         added.mentions[0].id = "b".into();
         added.mentions[0].username = "b".into();
-        assert_eq!(system_row(&added, "me").plain_text(), "a added b to the group.");
+        assert_eq!(system_row_test(&added, "me").plain_text(), "a added b to the group.");
 
         let mut left = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 2);
         left.mentions = vec![left.author.clone()];
-        assert_eq!(system_row(&left, "me").plain_text(), "a left the group.");
+        assert_eq!(system_row_test(&left, "me").plain_text(), "a left the group.");
 
         let mut renamed = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 4);
         renamed.content = "new name".into();
-        assert_eq!(system_row(&renamed, "me").plain_text(), "a changed the channel name: new name.");
+        assert_eq!(system_row_test(&renamed, "me").plain_text(), "a changed the channel name: new name.");
     }
 
     #[test]
     fn unknown_types_fall_back_to_readable_text() {
-        let row = system_row(&with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 250), "me");
+        let row = system_row_test(&with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 250), "me");
         assert_eq!(row.plain_text(), "a performed an unsupported action.");
         assert_eq!(row.tooltip.as_deref(), Some("Unsupported message type 250"));
     }
@@ -382,7 +416,7 @@ mod tests {
         for kind in 1..=60u8 {
             let m = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), kind);
             if is_system(&m) {
-                assert!(!system_row(&m, "me").plain_text().trim().is_empty(), "type {kind}");
+                assert!(!system_row_test(&m, "me").plain_text().trim().is_empty(), "type {kind}");
             }
         }
     }
@@ -534,7 +568,7 @@ mod tests {
         .into_iter()
         .map(Arc::new)
         .collect();
-        let ends: Vec<bool> = ChannelRows::build(&messages, &utc(), today(), US, "me").rows.iter().map(|r| r.ends_group).collect();
+        let ends: Vec<bool> = ChannelRows::build(&messages, &utc(), today(), US, "me", None).rows.iter().map(|r| r.ends_group).collect();
         assert_eq!(ends, [false, true, true]);
     }
 }

@@ -24,6 +24,46 @@ pub struct Guild {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Invite {
+    pub code: String,
+    #[serde(default)]
+    pub guild: Option<InviteGuild>,
+    #[serde(default)]
+    pub channel: Option<InviteChannel>,
+    #[serde(default)]
+    pub approximate_member_count: Option<u64>,
+    #[serde(default)]
+    pub approximate_presence_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InviteGuild {
+    pub id: Snowflake,
+    pub name: String,
+    pub icon: Option<String>,
+}
+
+impl InviteGuild {
+    pub fn to_guild(&self) -> Guild {
+        Guild { id: self.id.clone(), name: self.name.clone(), icon: self.icon.clone(), unavailable: false }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InviteChannel {
+    pub id: Snowflake,
+    pub name: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: ChannelType,
+}
+
+impl InviteChannel {
+    pub fn is_voice(&self) -> bool {
+        matches!(self.kind, ChannelType::GuildVoice | ChannelType::GuildStageVoice)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Emoji {
     pub id: Snowflake,
     pub name: String,
@@ -145,6 +185,8 @@ pub struct Channel {
     #[serde(default)]
     pub recipients: Vec<User>,
     pub last_message_id: Option<Snowflake>,
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub permission_overwrites: Vec<PermissionOverwrite>,
 }

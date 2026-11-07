@@ -242,7 +242,7 @@ pub struct AppState {
     pub mic_gain: f32,
     pub denoise: bool,
     pub user_volumes: HashMap<String, f32>,
-    pub history_exhausted: std::collections::HashSet<String>,
+    pub reached_start: std::collections::HashSet<String>,
     pub incoming_calls: Vec<String>,
     pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub pending_attachment: Option<std::path::PathBuf>,
@@ -319,6 +319,11 @@ pub struct AppState {
     pub rebinding_action: Option<crate::keybinds::Action>,
     pub mic_test_running: bool,
     pub clock_24h: Option<bool>,
+    pub invites: HashMap<String, crate::invites::InviteEntry>,
+    pub pending_invite_voice: Option<(String, String)>,
+    pub relationship_busy: std::collections::HashSet<String>,
+    pub relationship_confirm: Option<(crate::backend::RelationshipAction, String, String)>,
+    pub mutual_server_labels: HashMap<String, String>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -880,6 +885,37 @@ impl AppState {
         }
     }
 
+    pub fn ensure_invite(&mut self, code: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let now = std::time::Instant::now();
+        if self.invites.get(code).is_some_and(|entry| !entry.needs_fetch(now)) {
+            return;
+        }
+        self.invites.insert(
+            code.to_string(),
+            crate::invites::InviteEntry { state: crate::invites::InviteState::Loading, updated: now },
+        );
+        let _ = cmd_tx.send(crate::backend::UiCommand::ResolveInvite { code: code.to_string() });
+    }
+
+    pub fn add_joined_guild(&mut self, guild: Guild) {
+        if !self.guilds.iter().any(|g| g.id == guild.id) {
+            self.guilds.push(guild);
+            self.reconcile_rail_order();
+        }
+    }
+
+    pub fn relationship_with(&self, user_id: &str) -> Option<RelationshipType> {
+        self.relationships.iter().find(|r| r.id == user_id || r.user.id == user_id).map(|r| r.kind)
+    }
+
+    pub fn note_history_page(&mut self, channel_id: &str, fetched: usize) {
+        if fetched < crate::backend::HISTORY_PAGE_SIZE as usize {
+            self.reached_start.insert(channel_id.to_string());
+        } else {
+            self.reached_start.remove(channel_id);
+        }
+    }
+
     pub fn rows_for(&mut self, channel_id: &str) -> std::sync::Arc<crate::message_rows::ChannelRows> {
         let today = crate::timefmt::local_today();
         let format = crate::timefmt::TimeFormat::resolve(self.clock_24h);
@@ -888,7 +924,13 @@ impl AppState {
         }
         let messages = self.messages.get(channel_id).map(Vec::as_slice).unwrap_or(&[]);
         let me = self.current_user.as_ref().map(|u| u.id.as_str()).unwrap_or_default();
-        let rows = std::sync::Arc::new(crate::message_rows::ChannelRows::build(messages, &chrono::Local, today, format, me));
+        let peer = self
+            .dm_channels
+            .iter()
+            .find(|c| c.id == channel_id && c.kind == ChannelType::Dm)
+            .and_then(|c| c.recipients.first())
+            .map(|u| u.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&u.username));
+        let rows = std::sync::Arc::new(crate::message_rows::ChannelRows::build(messages, &chrono::Local, today, format, me, peer));
         self.message_rows.insert(channel_id.to_string(), rows.clone());
         rows
     }
@@ -1455,6 +1497,7 @@ mod tests {
             parent_id: None,
             recipients: Vec::new(),
             last_message_id: Some("999".into()),
+            icon: None,
             permission_overwrites: Vec::new(),
         }
     }
@@ -1474,6 +1517,7 @@ mod tests {
             parent_id: None,
             recipients: Vec::new(),
             last_message_id: None,
+            icon: None,
             permission_overwrites: Vec::new(),
         }
     }
@@ -1763,6 +1807,7 @@ mod tests {
                 bot: false,
             }],
             last_message_id: None,
+            icon: None,
             permission_overwrites: Vec::new(),
         });
 

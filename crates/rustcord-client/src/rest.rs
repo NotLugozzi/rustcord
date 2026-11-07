@@ -186,8 +186,12 @@ impl RestClient {
         self.get(&format!("/users/@me/guilds/{guild_id}/member")).await
     }
 
-    pub async fn join_guild_by_invite(&self, invite_code: &str) -> Result<Guild, ClientError> {
+    pub async fn join_guild_by_invite(&self, invite_code: &str) -> Result<crate::models::Invite, ClientError> {
         self.post(&format!("/invites/{invite_code}"), &serde_json::json!({})).await
+    }
+
+    pub async fn invite(&self, code: &str) -> Result<crate::models::Invite, ClientError> {
+        self.get(&format!("/invites/{code}?with_counts=true")).await
     }
 
     pub async fn create_guild(&self, name: &str) -> Result<Guild, ClientError> {
@@ -284,6 +288,18 @@ impl RestClient {
 
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
         self.send_empty(|| self.http.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))).await
+    }
+
+    pub async fn put_relationship(&self, user_id: &str, kind: Option<u8>) -> Result<(), ClientError> {
+        let body = match kind {
+            Some(kind) => serde_json::json!({ "type": kind }),
+            None => serde_json::json!({}),
+        };
+        self.send_empty(|| self.http.put(format!("{API_BASE}/users/@me/relationships/{user_id}")).json(&body)).await
+    }
+
+    pub async fn delete_relationship(&self, user_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/users/@me/relationships/{user_id}"))).await
     }
 
     pub async fn kick_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
