@@ -239,6 +239,13 @@ impl AppWindow {
         for (url, image) in media.images {
             self.textures.ingest(url, image, &self.device, &self.queue, &mut self.imgui.renderer);
         }
+        #[cfg(feature = "screenshare")]
+        {
+            for (user_id, image) in media.remote_videos {
+                self.textures.ingest_live_video(user_id, &image, &self.device, &self.queue, &mut self.imgui.renderer);
+            }
+            self.textures.expire_live_videos(&mut self.imgui.renderer);
+        }
         #[cfg(feature = "video")]
         {
             for batch in media.videos {

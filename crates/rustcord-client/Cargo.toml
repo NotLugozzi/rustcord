@@ -31,3 +31,24 @@ ghash = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+ashpd = { version = "0.13", features = ["screencast"], optional = true }
+pipewire = { version = "0.10", optional = true }
+libspa-sys = { version = "0.10", optional = true }
+[target.'cfg(target_os = "linux")'.dependencies]
+flexaudio-core = { version = "0.3.1", optional = true }
+flexaudio-os-linux = { version = "0.3.1", optional = true }
+ffmpeg-next = { version = "9", optional = true, default-features = false, features = ["codec", "format", "software-scaling"] }
+
+[features]
+screenshare = ["dep:ashpd", "dep:pipewire", "dep:libspa-sys", "dep:ffmpeg-next", "dep:flexaudio-core", "dep:flexaudio-os-linux"]
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "capture_probe"
+required-features = ["screenshare"]
+
+[[example]]
+name = "encode_probe"
+required-features = ["screenshare"]

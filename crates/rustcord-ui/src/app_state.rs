@@ -275,16 +275,32 @@ pub struct AppState {
     pub mention_autocomplete_selected: usize,
     pub gateway_connected: bool,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
+    pub active_streams: HashMap<String, String>,
+    pub watching_stream: Option<String>,
+    pub unwatching_stream: Option<String>,
+    pub server_call_minimized: bool,
+    pub server_call_focus_stream: bool,
     pub voice_speaking_users: std::collections::HashSet<String>,
     pub connected_voice_channel: Option<(Option<String>, String)>,
     pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
+    pub screen_sharing: bool,
+    pub share_system_audio: bool,
+    pub screen_audio_sources: Vec<(u32, String, bool)>,
+    pub screen_audio_sources_loaded: bool,
+    pub screen_audio_sources_error: Option<String>,
+    pub selected_screen_audio_pid: Option<u32>,
+    pub screen_share_max_height: u32,
+    pub screen_share_fps: u32,
+    pub show_screen_share_setup: bool,
     pub self_muted: bool,
     pub self_deafened: bool,
     pub voice_input_devices: Vec<String>,
     pub voice_output_devices: Vec<String>,
     pub voice_stats: rustcord_client::voice_gateway::VoiceStats,
     pub voice_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
+    pub screen_share_stats: rustcord_client::voice_gateway::VoiceStats,
+    pub screen_share_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
     pub show_voice_info: bool,
     pub voice_joined_at: Option<std::time::Instant>,
     pub selected_input_device: Option<String>,
@@ -917,9 +933,21 @@ impl AppState {
     }
 
     pub fn dm_display_name(dm: &Channel) -> String {
+        if dm.kind == ChannelType::GroupDm {
+            if let Some(name) = dm.name.as_deref().filter(|name| !name.trim().is_empty()) {
+                return name.to_string();
+            }
+            let participants = dm.recipients.iter()
+                .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
+                .collect::<Vec<_>>();
+            if !participants.is_empty() {
+                return participants.join(", ");
+            }
+        }
         dm.recipients
             .first()
             .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
+            .or_else(|| dm.name.clone().filter(|name| !name.trim().is_empty()))
             .unwrap_or_else(|| dm.id.clone())
     }
 
@@ -928,7 +956,14 @@ impl AppState {
         let mut dms: Vec<&Channel> = self
             .dm_channels
             .iter()
-            .filter(|dm| query.is_empty() || Self::dm_display_name(dm).to_lowercase().contains(&query))
+            .filter(|dm| {
+                query.is_empty()
+                    || Self::dm_display_name(dm).to_lowercase().contains(&query)
+                    || dm.recipients.iter().any(|u| {
+                        u.username.to_lowercase().contains(&query)
+                            || u.global_name.as_deref().is_some_and(|name| name.to_lowercase().contains(&query))
+                    })
+            })
             .collect();
         dms.sort_by_key(|dm| {
             std::cmp::Reverse(dm.last_message_id.as_deref().map(snowflake_value).unwrap_or(0))
@@ -1001,6 +1036,20 @@ impl AppState {
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
         if let Some(user) = voice_state.member.as_ref().and_then(|m| m.user.clone()) {
             self.known_users.insert(voice_state.user_id.clone(), user);
+        }
+        #[cfg(feature = "screenshare")]
+        {
+            if voice_state.channel_id.is_none() || voice_state.self_stream == Some(false) {
+                self.active_streams.remove(&voice_state.user_id);
+                if self.unwatching_stream.as_deref().is_some_and(|key| key.ends_with(&format!(":{}", voice_state.user_id))) {
+                    self.unwatching_stream = None;
+                }
+            } else if voice_state.self_stream == Some(true) {
+                if let (Some(guild_id), Some(channel_id)) = (&voice_state.guild_id, &voice_state.channel_id) {
+                    let stream_key = format!("guild:{guild_id}:{channel_id}:{}", voice_state.user_id);
+                    self.active_streams.insert(voice_state.user_id.clone(), stream_key);
+                }
+            }
         }
         let Some(guild_id) = voice_state.guild_id.clone().or_else(|| voice_state.channel_id.clone()) else {
             for states in self.voice_channel_states.values_mut() {

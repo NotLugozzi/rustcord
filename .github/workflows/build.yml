@@ -34,7 +34,7 @@ jobs:
       matrix:
         include:
           - variant: video
-            features: --features video
+            features: --features video,screenshare
             suffix: ""
           - variant: novideo
             features: ""
@@ -55,6 +55,7 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libssl-dev \
             libopus-dev \
+            libpipewire-0.3-dev \
             pkg-config \
             cmake
 
