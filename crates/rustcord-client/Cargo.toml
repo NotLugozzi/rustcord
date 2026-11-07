@@ -31,10 +31,10 @@ ghash = "0.5"
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+[target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.13", features = ["screencast"], optional = true }
 pipewire = { version = "0.10", optional = true }
 libspa-sys = { version = "0.10", optional = true }
-[target.'cfg(target_os = "linux")'.dependencies]
 flexaudio-core = { version = "0.3.1", optional = true }
 flexaudio-os-linux = { version = "0.3.1", optional = true }
 ffmpeg-next = { version = "9", optional = true, default-features = false, features = ["codec", "filter", "format", "software-scaling"] }
