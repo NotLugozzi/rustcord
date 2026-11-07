@@ -176,6 +176,10 @@ fn run_pipewire(
 
     let format_state = state.clone();
     let frame_state = state.clone();
+    let mut capture_stats_started = std::time::Instant::now();
+    let mut capture_stats_frames = 0u64;
+    let mut capture_stats_total = std::time::Duration::ZERO;
+    let mut capture_stats_max = std::time::Duration::ZERO;
     let _listener = stream
         .add_local_listener_with_user_data(())
         .param_changed(move |_, _, id, param| {
@@ -199,6 +203,7 @@ fn run_pipewire(
             tracing::info!("screen capture negotiated {}x{}", size.width, size.height);
         })
         .process(move |stream, _| {
+            let callback_started = std::time::Instant::now();
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
             let datas = buffer.datas_mut();
             if datas.is_empty() {
@@ -235,6 +240,25 @@ fn run_pipewire(
                 if state.dropped % 60 == 1 {
                     tracing::debug!("screen capture dropped {} frames, consumer is behind", state.dropped);
                 }
+            }
+            let elapsed = callback_started.elapsed();
+            capture_stats_frames += 1;
+            capture_stats_total += elapsed;
+            capture_stats_max = capture_stats_max.max(elapsed);
+            let window = capture_stats_started.elapsed();
+            if window >= std::time::Duration::from_secs(2) {
+                tracing::info!(
+                    capture_fps = capture_stats_frames as f32 / window.as_secs_f32(),
+                    capture_avg_ms = capture_stats_total.as_secs_f64() * 1000.0 / capture_stats_frames as f64,
+                    capture_max_ms = capture_stats_max.as_secs_f64() * 1000.0,
+                    width,
+                    height,
+                    "screen capture callback timing"
+                );
+                capture_stats_started = std::time::Instant::now();
+                capture_stats_frames = 0;
+                capture_stats_total = std::time::Duration::ZERO;
+                capture_stats_max = std::time::Duration::ZERO;
             }
         })
         .register()

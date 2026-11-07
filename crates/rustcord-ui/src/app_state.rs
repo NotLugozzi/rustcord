@@ -286,6 +286,10 @@ pub struct AppState {
     pub voice_connecting: bool,
     pub screen_sharing: bool,
     pub share_system_audio: bool,
+    pub screen_audio_sources: Vec<(u32, String, bool)>,
+    pub screen_audio_sources_loaded: bool,
+    pub screen_audio_sources_error: Option<String>,
+    pub selected_screen_audio_pid: Option<u32>,
     pub screen_share_max_height: u32,
     pub screen_share_fps: u32,
     pub show_screen_share_setup: bool,
@@ -929,9 +933,21 @@ impl AppState {
     }
 
     pub fn dm_display_name(dm: &Channel) -> String {
+        if dm.kind == ChannelType::GroupDm {
+            if let Some(name) = dm.name.as_deref().filter(|name| !name.trim().is_empty()) {
+                return name.to_string();
+            }
+            let participants = dm.recipients.iter()
+                .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
+                .collect::<Vec<_>>();
+            if !participants.is_empty() {
+                return participants.join(", ");
+            }
+        }
         dm.recipients
             .first()
             .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
+            .or_else(|| dm.name.clone().filter(|name| !name.trim().is_empty()))
             .unwrap_or_else(|| dm.id.clone())
     }
 
@@ -940,7 +956,14 @@ impl AppState {
         let mut dms: Vec<&Channel> = self
             .dm_channels
             .iter()
-            .filter(|dm| query.is_empty() || Self::dm_display_name(dm).to_lowercase().contains(&query))
+            .filter(|dm| {
+                query.is_empty()
+                    || Self::dm_display_name(dm).to_lowercase().contains(&query)
+                    || dm.recipients.iter().any(|u| {
+                        u.username.to_lowercase().contains(&query)
+                            || u.global_name.as_deref().is_some_and(|name| name.to_lowercase().contains(&query))
+                    })
+            })
             .collect();
         dms.sort_by_key(|dm| {
             std::cmp::Reverse(dm.last_message_id.as_deref().map(snowflake_value).unwrap_or(0))

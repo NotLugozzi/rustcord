@@ -2222,11 +2222,15 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         if shown.is_some() && ui.is_item_hovered() {
                             ui.tooltip_text(&label);
                         }
-                        if clicked && !is_connected && !state.voice_connecting {
-                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
-                            state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
-                            state.server_call_minimized = false;
-                            state.server_call_focus_stream = false;
+                        if clicked {
+                            if is_connected {
+                                state.server_call_minimized = false;
+                            } else if !state.voice_connecting {
+                                let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
+                                state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
+                                state.server_call_minimized = false;
+                                state.server_call_focus_stream = false;
+                            }
                         }
                         let member_ids: Vec<String> = state.members_in_voice_channel(&guild_id, channel_id).into_iter().map(|m| m.user_id.clone()).collect();
                         for member_id in member_ids {
@@ -3799,7 +3803,7 @@ fn draw_server_call_controls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSe
     if draw_server_call_button(ui, "server_call_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
         if sharing {
             state.screen_sharing = false;
-            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
+            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
         } else {
             state.show_screen_share_setup = true;
         }
@@ -3844,7 +3848,7 @@ fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedS
     if draw_server_call_button(ui, "server_call_sidebar_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
         if sharing {
             state.screen_sharing = false;
-            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
+            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
         } else {
             state.show_screen_share_setup = true;
         }
@@ -4026,10 +4030,43 @@ fn draw_screen_share_setup_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unboun
             if state.show_screen_share_setup {
                 ui.open_popup("Start screen share");
                 state.show_screen_share_setup = false;
+                if !state.screen_audio_sources_loaded {
+                    let _ = cmd_tx.send(UiCommand::LoadScreenAudioSources);
+                }
             }
             if let Some(_popup) = ui.modal_popup_config("Start screen share").always_auto_resize(true).begin_popup() {
                 ui.text("Choose stream quality and audio before sharing.");
-                ui.checkbox("Share system audio", &mut state.share_system_audio);
+                ui.checkbox("Share audio", &mut state.share_system_audio);
+                if state.share_system_audio {
+                    let selected_audio = state.selected_screen_audio_pid
+                        .and_then(|pid| state.screen_audio_sources.iter().find(|(source_pid, _, _)| *source_pid == pid))
+                        .map(|(_, name, _)| name.as_str())
+                        .unwrap_or("System audio (exclude RustCord)");
+                    ui.set_next_item_width(260.0);
+                    if let Some(_combo) = ui.begin_combo("Audio source", selected_audio) {
+                        if ui.selectable_config("System audio (exclude RustCord)")
+                            .selected(state.selected_screen_audio_pid.is_none()).build()
+                        {
+                            state.selected_screen_audio_pid = None;
+                        }
+                        for (pid, name, active) in &state.screen_audio_sources {
+                            let label = if *active { format!("{name} (playing)##{pid}") } else { format!("{name}##{pid}") };
+                            if ui.selectable_config(&label).selected(state.selected_screen_audio_pid == Some(*pid)).build() {
+                                state.selected_screen_audio_pid = Some(*pid);
+                            }
+                        }
+                    }
+                    if let Some(error) = &state.screen_audio_sources_error {
+                        ui.text_colored([1.0, 0.55, 0.35, 1.0], format!("App audio sources unavailable: {error}"));
+                    } else if state.screen_audio_sources_loaded && state.screen_audio_sources.is_empty() {
+                        ui.text_disabled("No other apps with audio output found.");
+                    }
+                    if ui.small_button("Refresh audio sources") {
+                        state.screen_audio_sources_loaded = false;
+                        state.screen_audio_sources_error = None;
+                        let _ = cmd_tx.send(UiCommand::LoadScreenAudioSources);
+                    }
+                }
                 let quality = format!("{}p / {} fps", state.screen_share_max_height, state.screen_share_fps);
                 ui.set_next_item_width(180.0);
                 if let Some(_combo) = ui.begin_combo("Stream quality", &quality) {
@@ -4048,6 +4085,7 @@ fn draw_screen_share_setup_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unboun
                         let _ = cmd_tx.send(UiCommand::SetScreenSharing {
                             enabled: true,
                             include_system_audio: state.share_system_audio,
+                            audio_source_pid: state.selected_screen_audio_pid,
                             max_height: state.screen_share_max_height,
                             framerate: state.screen_share_fps,
                             guild_id,
@@ -4124,7 +4162,7 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
         if emoji_button(ui, textures, "vc_screenshare", '\u{1F5A5}', if active { "Stop screen sharing" } else { "Share your screen" }, active.then_some(GREEN)) {
             if active {
                 state.screen_sharing = false;
-                let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
+                let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
             } else {
                 state.show_screen_share_setup = true;
             }
@@ -4526,7 +4564,7 @@ fn draw_channel_header(
                 if clicked && is_connected {
                     if state.screen_sharing {
                         state.screen_sharing = false;
-                        let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: None, channel_id: channel_id.clone() });
+                        let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: None, channel_id: channel_id.clone() });
                     } else {
                         state.show_screen_share_setup = true;
                     }
@@ -4753,7 +4791,10 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         .filtered_dm_channels()
         .into_iter()
         .filter(|dm| group.is_none_or(|g| state.groups[g].channels.contains(&dm.id)))
-        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned(), dm.last_message_id.clone()))
+        .map(|dm| {
+            let recipient = (dm.kind == rustcord_client::models::ChannelType::Dm).then(|| dm.recipients.first().cloned()).flatten();
+            (dm.id.clone(), AppState::dm_display_name(dm), recipient, dm.last_message_id.clone())
+        })
         .collect();
     if dms.is_empty() {
         ui.text_disabled(if group.is_some() { "Empty group. Right-click a DM to add it." } else { "No direct messages." });

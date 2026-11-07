@@ -25,6 +25,7 @@ pub struct VoiceMediaState {
     pub user_volumes: Arc<std::sync::Mutex<HashMap<String, f32>>>,
     pub screen_sharing: Arc<AtomicBool>,
     pub system_audio_enabled: Arc<AtomicBool>,
+    pub system_audio_pid: Arc<std::sync::atomic::AtomicU32>,
     pub screen_share_max_height: Arc<std::sync::atomic::AtomicU32>,
     pub screen_share_fps: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -397,29 +398,33 @@ impl VoiceGateway {
                     }));
                 }
                 _ = device_check.tick(), if media_connected => {
-                    let input_device = self.media_state.input_device.lock().unwrap().clone();
-                    if attempted_input_device.as_ref() != Some(&input_device) {
-                        attempted_input_device = Some(input_device.clone());
-                        match MicCapture::start(input_device.as_deref(), self.media_state.muted.clone(), self.media_state.mic.clone(), {
-                            let mic_frame_tx = mic_frame_tx.clone();
-                            move |frame| { let _ = mic_frame_tx.send(frame); }
-                        }) {
-                            Ok(new_mic) => {
-                                mic = Some(new_mic);
-                                tracing::debug!("voice: microphone switched to {}", input_device.as_deref().unwrap_or("Default"));
+                    if !self.stream_media {
+                        let input_device = self.media_state.input_device.lock().unwrap().clone();
+                        if attempted_input_device.as_ref() != Some(&input_device) {
+                            attempted_input_device = Some(input_device.clone());
+                            match MicCapture::start(input_device.as_deref(), self.media_state.muted.clone(), self.media_state.mic.clone(), {
+                                let mic_frame_tx = mic_frame_tx.clone();
+                                move |frame| { let _ = mic_frame_tx.send(frame); }
+                            }) {
+                                Ok(new_mic) => {
+                                    mic = Some(new_mic);
+                                    tracing::debug!("voice: microphone switched to {}", input_device.as_deref().unwrap_or("Default"));
+                                }
+                                Err(error) => tracing::warn!("voice: failed to switch microphone to {}: {error}", input_device.as_deref().unwrap_or("Default")),
                             }
-                            Err(error) => tracing::warn!("voice: failed to switch microphone to {}: {error}", input_device.as_deref().unwrap_or("Default")),
                         }
                     }
-                    let output_device = self.media_state.output_device.lock().unwrap().clone();
-                    if attempted_output_device.as_ref() != Some(&output_device) {
-                        attempted_output_device = Some(output_device.clone());
-                        match SpeakerPlayback::start(output_device.as_deref(), self.media_state.deafened.clone()) {
-                            Ok(new_speaker) => {
-                                speaker = Some(new_speaker);
-                                tracing::debug!("voice: speaker switched to {}", output_device.as_deref().unwrap_or("Default"));
+                    if !self.stream_media {
+                        let output_device = self.media_state.output_device.lock().unwrap().clone();
+                        if attempted_output_device.as_ref() != Some(&output_device) {
+                            attempted_output_device = Some(output_device.clone());
+                            match SpeakerPlayback::start(output_device.as_deref(), self.media_state.deafened.clone()) {
+                                Ok(new_speaker) => {
+                                    speaker = Some(new_speaker);
+                                    tracing::debug!("voice: speaker switched to {}", output_device.as_deref().unwrap_or("Default"));
+                                }
+                                Err(error) => tracing::warn!("voice: failed to switch speaker to {}: {error}", output_device.as_deref().unwrap_or("Default")),
                             }
-                            Err(error) => tracing::warn!("voice: failed to switch speaker to {}: {error}", output_device.as_deref().unwrap_or("Default")),
                         }
                     }
                 }
@@ -467,8 +472,9 @@ impl VoiceGateway {
                             if self.media_state.system_audio_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                 let audio = system_audio_tx.clone();
                                 let sharing = self.media_state.screen_sharing.clone();
+                                let source_pid = self.media_state.system_audio_pid.load(std::sync::atomic::Ordering::Relaxed);
                                 tokio::task::spawn_blocking(move || {
-                                    if let Err(error) = crate::screen_audio::capture_system_audio(audio, sharing) {
+                                    if let Err(error) = crate::screen_audio::capture_system_audio(audio, sharing, source_pid) {
                                         tracing::warn!("system audio capture stopped: {error}");
                                     }
                                 });
@@ -1002,14 +1008,16 @@ impl VoiceGateway {
                                     Err(e) => tracing::warn!("voice: failed to start mic capture: {e}"),
                                 }
                             }
-                            let output_device = self.media_state.output_device.lock().unwrap().clone();
-                            attempted_output_device = Some(output_device.clone());
-                            match SpeakerPlayback::start(output_device.as_deref(), self.media_state.deafened.clone()) {
-                                Ok(s) => {
-                                    tracing::debug!("voice: speaker playback started");
-                                    speaker = Some(s);
+                            if !self.stream_media {
+                                let output_device = self.media_state.output_device.lock().unwrap().clone();
+                                attempted_output_device = Some(output_device.clone());
+                                match SpeakerPlayback::start(output_device.as_deref(), self.media_state.deafened.clone()) {
+                                    Ok(s) => {
+                                        tracing::debug!("voice: speaker playback started");
+                                        speaker = Some(s);
+                                    }
+                                    Err(e) => tracing::warn!("voice: failed to start speaker playback: {e}"),
                                 }
-                                Err(e) => tracing::warn!("voice: failed to start speaker playback: {e}"),
                             }
 
                             let _ = tx.send(VoiceGatewayEvent::MediaConnected);
@@ -1180,7 +1188,7 @@ impl VoiceGateway {
                         }
                     }
                 }
-                Some(pcm_frame) = mic_frame_rx.recv() => {
+                Some(pcm_frame) = mic_frame_rx.recv(), if !self.stream_media => {
                     let now = Instant::now();
                     if let Some(prev) = last_select_entry {
                         let gap = now.duration_since(prev);
@@ -1353,9 +1361,12 @@ fn encode_screen_frames(
     max_height: u32,
     framerate: u32,
 ) -> Result<(), String> {
-    use crate::screen_encode::{EncoderSettings, Vp8Encoder};
+    use crate::screen_encode::{EncodeTimingSample, EncoderSettings, Vp8Encoder};
 
     let mut encoder: Option<Vp8Encoder> = None;
+    let mut timing_started = Instant::now();
+    let mut timing = EncodeTimingSample::default();
+    let mut queue_drops = 0u64;
     while sharing.load(std::sync::atomic::Ordering::Relaxed) {
         let Some(frame) = capture.blocking_next_frame() else { break };
         if encoder.as_ref().is_none_or(|current| !current.matches_source(frame.width, frame.height, frame.layout)) {
@@ -1384,9 +1395,30 @@ fn encode_screen_frames(
             .expect("encoder initialized")
             .encode(&frame)
             .map_err(|error| error.to_string())?;
+        let sample = encoder.as_mut().expect("encoder initialized").take_timing_sample();
+        timing.frames += sample.frames;
+        timing.copy += sample.copy;
+        timing.convert += sample.convert;
+        timing.encode += sample.encode;
+        let elapsed = timing_started.elapsed();
+        if elapsed >= Duration::from_secs(2) {
+            let frames = timing.frames.max(1) as f64;
+            tracing::info!(
+                encode_fps = timing.frames as f32 / elapsed.as_secs_f32(),
+                copy_avg_ms = timing.copy.as_secs_f64() * 1000.0 / frames,
+                convert_avg_ms = timing.convert.as_secs_f64() * 1000.0 / frames,
+                encode_avg_ms = timing.encode.as_secs_f64() * 1000.0 / frames,
+                queue_drops,
+                "screen share VP8 stage timing"
+            );
+            timing_started = Instant::now();
+            timing = EncodeTimingSample::default();
+            queue_drops = 0;
+        }
         let (encoded_width, encoded_height) = encoder.as_ref().expect("encoder initialized").target_size();
         for frame in encoded {
             if frames.try_send(EncodedVideoFrame { data: frame.data, timestamp: frame.timestamp, keyframe: frame.keyframe, width: encoded_width, height: encoded_height }).is_err() {
+                queue_drops += 1;
                 tracing::trace!("screen share: dropping encoded frame because the RTP queue is full");
             }
         }

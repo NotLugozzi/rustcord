@@ -147,7 +147,9 @@ pub enum UiCommand {
     DeclineCall { channel_id: String },
     LeaveVoiceChannel { guild_id: Option<String> },
     SetVoiceMuteDeaf { guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
-    SetScreenSharing { enabled: bool, include_system_audio: bool, max_height: u32, framerate: u32, guild_id: Option<String>, channel_id: String },
+    SetScreenSharing { enabled: bool, include_system_audio: bool, audio_source_pid: Option<u32>, max_height: u32, framerate: u32, guild_id: Option<String>, channel_id: String },
+    #[cfg(feature = "screenshare")]
+    LoadScreenAudioSources,
     WatchStream { stream_key: String },
     StopWatchingStream { stream_key: String },
     SetVoiceInputDevice { device: Option<String> },
@@ -196,6 +198,8 @@ pub enum BackendEvent {
     VoiceConnected,
     VoiceDisconnected,
     ScreenShareStopped,
+    #[cfg(feature = "screenshare")]
+    ScreenAudioSourcesLoaded { sources: Vec<(u32, String, bool)>, error: Option<String> },
     VoiceSpeaking { user_id: String, speaking: bool },
     VoiceStats(rustcord_client::voice_gateway::VoiceStats),
     #[cfg(feature = "screenshare")]
@@ -687,9 +691,21 @@ pub fn spawn(
                         media_state.deafened.store(self_deaf, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                UiCommand::SetScreenSharing { enabled, include_system_audio, max_height, framerate, guild_id, channel_id } => {
+                #[cfg(feature = "screenshare")]
+                UiCommand::LoadScreenAudioSources => {
+                    let events = event_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let (sources, error) = match rustcord_client::screen_audio::list_sources() {
+                            Ok(sources) => (sources, None),
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
+                        let _ = events.send(BackendEvent::ScreenAudioSourcesLoaded { sources, error });
+                    });
+                }
+                UiCommand::SetScreenSharing { enabled, include_system_audio, audio_source_pid, max_height, framerate, guild_id, channel_id } => {
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
                         media_state.system_audio_enabled.store(include_system_audio, std::sync::atomic::Ordering::Relaxed);
+                        media_state.system_audio_pid.store(audio_source_pid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
                         media_state.screen_share_max_height.store(max_height.clamp(720, 1080), std::sync::atomic::Ordering::Relaxed);
                         media_state.screen_share_fps.store(framerate.clamp(15, 60), std::sync::atomic::Ordering::Relaxed);
                         media_state.screen_sharing.store(enabled, std::sync::atomic::Ordering::Relaxed);

@@ -1,110 +1,68 @@
-use pipewire as pw;
-use pw::{properties::properties, spa};
-use spa::param::format::{MediaSubtype, MediaType};
-use spa::param::format_utils;
-use spa::pod::Pod;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-struct AudioState {
-    info: spa::param::audio::AudioInfoRaw,
-    sender: mpsc::Sender<Vec<i16>>,
+/// Available app audio output sources as `(pid, display name, currently playing)`.
+#[cfg(target_os = "linux")]
+pub fn list_sources() -> Result<Vec<(u32, String, bool)>, String> {
+    flexaudio_os_linux::list_processes()
+        .map(|sources| sources.into_iter().map(|s| (s.pid, s.name, s.is_output_active.unwrap_or(false))).collect())
+        .map_err(|error| error.to_string())
 }
 
-/// Captures the default PipeWire sink monitor and forwards downmixed 48 kHz
-/// mono PCM chunks. Runs until the matching screen share is stopped.
-pub fn capture_system_audio(sender: mpsc::Sender<Vec<i16>>, sharing: Arc<AtomicBool>) -> Result<(), String> {
-    pw::init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None).map_err(|e| e.to_string())?;
-    let context = pw::context::ContextRc::new(&mainloop, None).map_err(|e| e.to_string())?;
-    let core = context.connect_rc(None).map_err(|e| e.to_string())?;
-    let state = Rc::new(RefCell::new(AudioState { info: Default::default(), sender }));
+/// Process-specific capture currently requires PipeWire's per-process stream support.
+#[cfg(not(target_os = "linux"))]
+pub fn list_sources() -> Result<Vec<(u32, String, bool)>, String> {
+    Err("per-app audio capture is currently available on Linux with PipeWire".into())
+}
 
-    let stream = pw::stream::StreamRc::new(
-        core,
-        "rustcord-share-audio",
-        properties! {
-            *pw::keys::MEDIA_TYPE => "Audio",
-            *pw::keys::MEDIA_CATEGORY => "Capture",
-            *pw::keys::MEDIA_ROLE => "Music",
-            *pw::keys::STREAM_CAPTURE_SINK => "true",
-        },
-    ).map_err(|e| e.to_string())?;
+/// Captures 48 kHz mono PCM until screen sharing stops. PID zero captures system
+/// output excluding RustCord; a nonzero PID captures only that application's output.
+pub fn capture_system_audio(sender: mpsc::Sender<Vec<i16>>, sharing: Arc<AtomicBool>, source_pid: u32) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use flexaudio_core::{raw_ring, CaptureBackend, RawSink};
+        use flexaudio_core::types::ProcessMode;
+        use flexaudio_os_linux::PwProcessBackend;
 
-    let format_state = state.clone();
-    let frame_state = state.clone();
-    let _listener = stream.add_local_listener_with_user_data(())
-        .param_changed(move |_, _, id, param| {
-            let Some(param) = param else { return };
-            if id != spa::param::ParamType::Format.as_raw() { return; }
-            let Ok((media_type, media_subtype)) = format_utils::parse_format(param) else { return };
-            if media_type != MediaType::Audio || media_subtype != MediaSubtype::Raw { return; }
-            let mut state = format_state.borrow_mut();
-            if let Err(error) = state.info.parse(param) {
-                tracing::warn!("screen audio: could not parse PipeWire format: {error}");
-            } else {
-                tracing::info!("screen audio: capturing default output at {} Hz, {} channels", state.info.rate(), state.info.channels());
+        let (producer, mut consumer) = raw_ring(48_000 * 2 * 2);
+        let mut backend = if source_pid == 0 {
+            PwProcessBackend::new(std::process::id(), ProcessMode::Exclude)
+        } else {
+            PwProcessBackend::new(source_pid, ProcessMode::Include)
+        };
+        let sink = RawSink::new(producer, 48_000, 2);
+        backend.start(sink).map_err(|error| error.to_string())?;
+        tracing::info!(source_pid, "screen audio capture started");
+
+        let mut scratch = vec![0.0f32; 4096];
+        let mut pending = VecDeque::with_capacity(4096);
+        while sharing.load(Ordering::Relaxed) {
+            let read = consumer.pop_slice(&mut scratch);
+            if read == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
             }
-        })
-        .process(move |stream, _| {
-            let Some(mut buffer) = stream.dequeue_buffer() else { return };
-            let state = frame_state.borrow();
-            let channels = state.info.channels() as usize;
-            if channels == 0 { return; }
-            let Some(data) = buffer.datas_mut().first_mut() else { return };
-            let bytes = data.chunk().size() as usize;
-            if bytes < 4 * channels { return; }
-            let Some(samples) = data.data() else { return };
-            let sample_count = (bytes / 4).min(samples.len() / 4);
-            let frames = sample_count / channels;
-            if frames == 0 { return; }
-            let mut mono = Vec::with_capacity(frames);
-            for frame in 0..frames {
-                let base = frame * channels;
-                let left = f32::from_le_bytes(samples[base * 4..base * 4 + 4].try_into().unwrap());
-                let right = if channels > 1 {
-                    f32::from_le_bytes(samples[(base + 1) * 4..(base + 1) * 4 + 4].try_into().unwrap())
-                } else { left };
-                let sample = ((left + right) * 0.5 * i16::MAX as f32).round()
-                    .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                mono.push(sample);
+            pending.extend(scratch[..read].iter().copied());
+            while pending.len() >= 1920 {
+                let mut mono = Vec::with_capacity(960);
+                for _ in 0..960 {
+                    let left = pending.pop_front().unwrap_or_default();
+                    let right = pending.pop_front().unwrap_or_default();
+                    mono.push((((left + right) * 0.5 * i16::MAX as f32)
+                        .round()
+                        .clamp(i16::MIN as f32, i16::MAX as f32)) as i16);
+                }
+                let _ = sender.try_send(mono);
             }
-            let _ = state.sender.try_send(mono);
-        })
-        .register()
-        .map_err(|e| e.to_string())?;
-
-    let mut info = spa::param::audio::AudioInfoRaw::new();
-    info.set_format(spa::param::audio::AudioFormat::F32LE);
-    info.set_rate(48_000);
-    info.set_channels(2);
-    let object = spa::pod::Object {
-        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
-        id: spa::param::ParamType::EnumFormat.as_raw(),
-        properties: info.into(),
-    };
-    let values: Vec<u8> = spa::pod::serialize::PodSerializer::serialize(
-        std::io::Cursor::new(Vec::new()),
-        &spa::pod::Value::Object(object),
-    ).map_err(|e| e.to_string())?.0.into_inner();
-    let mut params = [Pod::from_bytes(&values).ok_or_else(|| "could not build the audio format descriptor".to_string())?];
-    stream.connect(
-        spa::utils::Direction::Input,
-        None,
-        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS,
-        &mut params,
-    ).map_err(|e| e.to_string())?;
-    tracing::debug!("screen audio: connected to the default PipeWire output monitor");
-
-    let loop_ref = mainloop.clone();
-    let _timer = mainloop.loop_().add_timer(move |_| {
-        if !sharing.load(Ordering::Relaxed) { loop_ref.quit(); }
-    });
-    _timer.update_timer(Some(std::time::Duration::from_millis(100)), Some(std::time::Duration::from_millis(100)))
-        .into_result().map_err(|e| format!("could not arm system-audio stop timer: {e}"))?;
-    mainloop.run();
-    Ok(())
+        }
+        backend.stop();
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (sender, sharing, source_pid);
+        Err("per-app audio capture is currently available on Linux with PipeWire".into())
+    }
 }

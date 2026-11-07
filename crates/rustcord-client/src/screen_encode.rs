@@ -34,6 +34,14 @@ pub struct EncodedFrame {
     pub timestamp: u32,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EncodeTimingSample {
+    pub frames: u64,
+    pub copy: std::time::Duration,
+    pub convert: std::time::Duration,
+    pub encode: std::time::Duration,
+}
+
 pub fn scaled_size(width: u32, height: u32, max_height: u32) -> (u32, u32) {
     let even = |v: u32| v.max(2) & !1;
     if height <= max_height {
@@ -53,11 +61,14 @@ fn source_pixel(layout: PixelLayout) -> Pixel {
 pub struct Vp8Encoder {
     encoder: ffmpeg::encoder::Video,
     scaler: scaling::Context,
+    source_frame: VideoFrame,
+    converted_frame: VideoFrame,
     settings: EncoderSettings,
     source: (u32, u32, PixelLayout),
     target: (u32, u32),
     frames_sent: i64,
     started: Option<std::time::Instant>,
+    timing: EncodeTimingSample,
 }
 
 impl Vp8Encoder {
@@ -106,15 +117,20 @@ impl Vp8Encoder {
             scaling::Flags::FAST_BILINEAR,
         )
         .map_err(|e| ClientError::ScreenCapture(format!("could not build the scaler: {e}")))?;
+        let source_frame = VideoFrame::new(source_pixel(layout), width, height);
+        let converted_frame = VideoFrame::new(Pixel::YUV420P, target_w, target_h);
 
         Ok(Self {
             encoder,
             scaler,
+            source_frame,
+            converted_frame,
             settings,
             source: (width, height, layout),
             target: (target_w, target_h),
             frames_sent: 0,
             started: None,
+            timing: EncodeTimingSample::default(),
         })
     }
 
@@ -138,20 +154,27 @@ impl Vp8Encoder {
         let pts = (elapsed.as_secs_f64() * TIMEBASE_HZ as f64).round() as i64;
         let pts = pts.max(self.frames_sent);
 
-        let mut source = VideoFrame::new(source_pixel(frame.layout), frame.width, frame.height);
-        copy_into_plane(&mut source, &frame.pixels, frame.stride());
-
-        let mut converted = VideoFrame::empty();
+        let copy_started = std::time::Instant::now();
+        make_writable(&mut self.source_frame)?;
+        copy_into_plane(&mut self.source_frame, &frame.pixels, frame.stride());
+        make_writable(&mut self.converted_frame)?;
+        self.timing.copy += copy_started.elapsed();
+        let convert_started = std::time::Instant::now();
         self.scaler
-            .run(&source, &mut converted)
+            .run(&self.source_frame, &mut self.converted_frame)
             .map_err(|e| ClientError::ScreenCapture(format!("scaling failed: {e}")))?;
-        converted.set_pts(Some(pts));
+        self.timing.convert += convert_started.elapsed();
+        self.converted_frame.set_pts(Some(pts));
 
+        let encode_started = std::time::Instant::now();
         self.encoder
-            .send_frame(&converted)
+            .send_frame(&self.converted_frame)
             .map_err(|e| ClientError::ScreenCapture(format!("encoder rejected a frame: {e}")))?;
         self.frames_sent = pts + 1;
-        Ok(self.drain())
+        let output = self.drain();
+        self.timing.encode += encode_started.elapsed();
+        self.timing.frames += 1;
+        Ok(output)
     }
 
     pub fn finish(&mut self) -> Result<Vec<EncodedFrame>, ClientError> {
@@ -178,6 +201,18 @@ impl Vp8Encoder {
     pub fn settings(&self) -> EncoderSettings {
         self.settings
     }
+
+    pub fn take_timing_sample(&mut self) -> EncodeTimingSample {
+        std::mem::take(&mut self.timing)
+    }
+}
+
+fn make_writable(frame: &mut VideoFrame) -> Result<(), ClientError> {
+    let result = unsafe { ffmpeg::ffi::av_frame_make_writable(frame.as_mut_ptr()) };
+    if result < 0 {
+        return Err(ClientError::ScreenCapture(format!("could not reuse a video frame buffer: {}", ffmpeg::Error::from(result))));
+    }
+    Ok(())
 }
 
 fn copy_into_plane(frame: &mut VideoFrame, pixels: &[u8], src_stride: usize) {

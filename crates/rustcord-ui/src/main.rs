@@ -353,6 +353,12 @@ pub fn drain_backend_events(
                 state.screen_share_stats = Default::default();
                 state.screen_share_history.clear();
             }
+            #[cfg(feature = "screenshare")]
+            BackendEvent::ScreenAudioSourcesLoaded { sources, error } => {
+                state.screen_audio_sources = sources;
+                state.screen_audio_sources_error = error;
+                state.screen_audio_sources_loaded = true;
+            }
             BackendEvent::VoiceSpeaking { user_id, speaking } => {
                 state.set_voice_speaking(user_id, speaking);
             }
