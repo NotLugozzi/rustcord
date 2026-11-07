@@ -193,6 +193,16 @@ impl FrameCrypto {
         Some(output)
     }
 
+    pub fn encrypt_h264(&mut self, frame: &[u8], ranges: &[(usize, usize)]) -> Option<Vec<u8>> {
+        for _ in 0..10 {
+            let encrypted = self.encrypt_with_unencrypted_ranges(frame, ranges)?;
+            if !has_unexpected_h264_start_code(&encrypted, ranges) {
+                return Some(encrypted);
+            }
+        }
+        None
+    }
+
     pub fn decrypt(&mut self, sender_id: u64, frame: &[u8]) -> Option<Vec<u8>> {
         if frame.len() < TAG_LEN + 1 + 1 + 2 || frame.get(frame.len() - 2..)? != MARKER { return None; }
         let marker_offset = frame.len() - 2;
@@ -246,6 +256,87 @@ impl FrameCrypto {
         }
         None
     }
+}
+
+pub fn normalize_h264_annex_b(frame: &[u8]) -> Option<Vec<u8>> {
+    let (first_start, _) = find_h264_start_code(frame, 0)?;
+    if first_start != 0 {
+        return None;
+    }
+    let mut output = Vec::with_capacity(frame.len() + 16);
+    let mut cursor = 0;
+    while let Some((start, prefix_len)) = find_h264_start_code(frame, cursor) {
+        if start != cursor {
+            return None;
+        }
+        let nal_start = start.checked_add(prefix_len)?;
+        if nal_start >= frame.len() {
+            return None;
+        }
+        let next = find_h264_start_code(frame, nal_start);
+        let nal_end = next.map(|(offset, _)| offset).unwrap_or(frame.len());
+        if nal_end <= nal_start {
+            return None;
+        }
+        output.extend_from_slice(&[0, 0, 0, 1]);
+        output.extend_from_slice(frame.get(nal_start..nal_end)?);
+        cursor = nal_end;
+        if next.is_none() {
+            break;
+        }
+    }
+    (!output.is_empty()).then_some(output)
+}
+
+pub fn h264_unencrypted_ranges(frame: &[u8]) -> Option<Vec<(usize, usize)>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while let Some((start, prefix_len)) = find_h264_start_code(frame, cursor) {
+        if start != cursor {
+            return None;
+        }
+        let nal_start = start.checked_add(prefix_len)?;
+        if nal_start >= frame.len() {
+            return None;
+        }
+        let next = find_h264_start_code(frame, nal_start + 1);
+        let nal_end = next.map(|(offset, _)| offset).unwrap_or(frame.len());
+        let nal_type = frame[nal_start] & 0x1f;
+        let clear_end = if matches!(nal_type, 7 | 8) { nal_end } else { nal_start + 1 };
+        ranges.push((start, clear_end - start));
+        cursor = nal_end;
+        if cursor == frame.len() {
+            break;
+        }
+    }
+    (!ranges.is_empty()).then_some(ranges)
+}
+
+fn find_h264_start_code(frame: &[u8], from: usize) -> Option<(usize, usize)> {
+    let bytes = frame.get(from..)?;
+    for (offset, window) in bytes.windows(4).enumerate() {
+        if window == [0, 0, 0, 1] {
+            return Some((from + offset, 4));
+        }
+    }
+    for (offset, window) in bytes.windows(3).enumerate() {
+        if window == [0, 0, 1] {
+            return Some((from + offset, 3));
+        }
+    }
+    None
+}
+
+fn has_unexpected_h264_start_code(frame: &[u8], ranges: &[(usize, usize)]) -> bool {
+    let expected = ranges.iter().map(|(offset, _)| *offset).collect::<std::collections::HashSet<_>>();
+    let mut cursor = 0;
+    while let Some((offset, length)) = find_h264_start_code(frame, cursor) {
+        if !expected.contains(&offset) {
+            return true;
+        }
+        cursor = offset + length;
+    }
+    false
 }
 
 fn try_decrypt(

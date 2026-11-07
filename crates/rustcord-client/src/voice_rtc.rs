@@ -13,6 +13,8 @@ use tokio::net::UdpSocket;
 pub const OPUS_PT: u8 = 120;
 #[cfg(feature = "screenshare")]
 const VP8_PT: u8 = 107;
+#[cfg(feature = "screenshare")]
+const H264_PT: u8 = 105;
 const OPUS_FRAME_SAMPLES: u32 = 960;
 
 #[derive(Default, Clone)]
@@ -74,14 +76,7 @@ impl VoiceRtc {
             Default::default(),
         );
         #[cfg(feature = "screenshare")]
-        config.codec_config().add_config(
-            Pt::from(105),
-            Some(Pt::from(106)),
-            Codec::H264,
-            Frequency::NINETY_KHZ,
-            None,
-            Default::default(),
-        );
+        config.codec_config().add_h264(Pt::from(105), Some(Pt::from(106)), true, 0x42e033);
         let mut rtc = config.set_stats_interval(Some(std::time::Duration::from_secs(1))).build(Instant::now());
 
         let local_ice = {
@@ -162,7 +157,11 @@ impl VoiceRtc {
     }
 
     #[cfg(feature = "screenshare")]
-    pub fn send_video_frame(&mut self, frame: &crate::screen_encode::EncodedFrame) -> Result<(), ClientError> {
+    pub fn send_video_frame(
+        &mut self,
+        frame: &crate::screen_encode::EncodedFrame,
+        codec: crate::screen_encode::VideoCodec,
+    ) -> Result<(), ClientError> {
         let media_time = MediaTime::new(frame.timestamp as u64, Frequency::NINETY_KHZ);
         let writer = self
             .rtc
@@ -170,7 +169,15 @@ impl VoiceRtc {
             .ok_or_else(|| ClientError::GatewayClosed("voice rtc: no writer for video mid".into()))?;
         writer
             .rid(str0m::media::Rid::from("100"))
-            .write(Pt::from(VP8_PT), Instant::now(), media_time, frame.data.clone())
+            .write(
+                Pt::from(match codec {
+                    crate::screen_encode::VideoCodec::Vp8 => VP8_PT,
+                    crate::screen_encode::VideoCodec::H264 => H264_PT,
+                }),
+                Instant::now(),
+                media_time,
+                frame.data.clone(),
+            )
             .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: video write failed: {e}")))
     }
 

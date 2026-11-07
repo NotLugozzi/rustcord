@@ -37,7 +37,7 @@ libspa-sys = { version = "0.10", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 flexaudio-core = { version = "0.3.1", optional = true }
 flexaudio-os-linux = { version = "0.3.1", optional = true }
-ffmpeg-next = { version = "9", optional = true, default-features = false, features = ["codec", "format", "software-scaling"] }
+ffmpeg-next = { version = "9", optional = true, default-features = false, features = ["codec", "filter", "format", "software-scaling"] }
 
 [features]
 screenshare = ["dep:ashpd", "dep:pipewire", "dep:libspa-sys", "dep:ffmpeg-next", "dep:flexaudio-core", "dep:flexaudio-os-linux"]

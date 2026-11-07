@@ -178,6 +178,7 @@ fn run_pipewire(
     let frame_state = state.clone();
     let mut capture_stats_started = std::time::Instant::now();
     let mut capture_stats_frames = 0u64;
+    let mut capture_stats_drops = 0u64;
     let mut capture_stats_total = std::time::Duration::ZERO;
     let mut capture_stats_max = std::time::Duration::ZERO;
     let _listener = stream
@@ -237,6 +238,7 @@ fn run_pipewire(
             };
             if state.sender.try_send(frame).is_err() {
                 state.dropped += 1;
+                capture_stats_drops += 1;
                 if state.dropped % 60 == 1 {
                     tracing::debug!("screen capture dropped {} frames, consumer is behind", state.dropped);
                 }
@@ -251,12 +253,14 @@ fn run_pipewire(
                     capture_fps = capture_stats_frames as f32 / window.as_secs_f32(),
                     capture_avg_ms = capture_stats_total.as_secs_f64() * 1000.0 / capture_stats_frames as f64,
                     capture_max_ms = capture_stats_max.as_secs_f64() * 1000.0,
+                    capture_queue_drops = capture_stats_drops,
                     width,
                     height,
                     "screen capture callback timing"
                 );
                 capture_stats_started = std::time::Instant::now();
                 capture_stats_frames = 0;
+                capture_stats_drops = 0;
                 capture_stats_total = std::time::Duration::ZERO;
                 capture_stats_max = std::time::Duration::ZERO;
             }
@@ -363,7 +367,7 @@ fn format_pod(framerate: u32) -> Result<Vec<u8>, ClientError> {
                     ChoiceEnum::Range {
                         default: Fraction { num: framerate, denom: 1 },
                         min: Fraction { num: 0, denom: 1 },
-                        max: Fraction { num: 120, denom: 1 },
+                        max: Fraction { num: framerate, denom: 1 },
                     },
                 ))),
             },

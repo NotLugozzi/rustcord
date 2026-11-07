@@ -1,9 +1,11 @@
 use crate::error::ClientError;
 use crate::screen_capture::{CapturedFrame, PixelLayout};
 use ffmpeg_next as ffmpeg;
+use ffmpeg::codec::profile::{H264 as H264Profile, Profile};
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::video::Video as VideoFrame;
+pub use crate::screen_decode::VideoCodec;
 
 pub const TIMEBASE_HZ: i64 = 90_000;
 const DEFAULT_MAX_HEIGHT: u32 = 1080;
@@ -15,6 +17,7 @@ pub struct EncoderSettings {
     pub max_height: u32,
     pub bitrate_bps: usize,
     pub keyframe_interval: u32,
+    pub frame_rate: u32,
 }
 
 impl Default for EncoderSettings {
@@ -23,6 +26,7 @@ impl Default for EncoderSettings {
             max_height: DEFAULT_MAX_HEIGHT,
             bitrate_bps: DEFAULT_BITRATE_BPS,
             keyframe_interval: KEYFRAME_INTERVAL_FRAMES,
+            frame_rate: 30,
         }
     }
 }
@@ -39,7 +43,149 @@ pub struct EncodeTimingSample {
     pub frames: u64,
     pub copy: std::time::Duration,
     pub convert: std::time::Duration,
+    pub upload: std::time::Duration,
     pub encode: std::time::Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncoderChoice {
+    pub codec: VideoCodec,
+    backend: EncoderBackend,
+}
+
+impl EncoderChoice {
+    pub fn backend_name(&self) -> &'static str {
+        match &self.backend {
+            EncoderBackend::SoftwareVp8 => "libvpx",
+            EncoderBackend::Vaapi { .. } => "VAAPI",
+            EncoderBackend::Qsv { .. } => "QSV",
+            EncoderBackend::Cuda { .. } => "NVENC",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum EncoderBackend {
+    SoftwareVp8,
+    Vaapi { device: String },
+    Qsv { device: String },
+    Cuda { device: String },
+}
+
+pub enum ScreenEncoder {
+    SoftwareVp8(Vp8Encoder),
+    Hardware(HardwareEncoder),
+}
+
+impl ScreenEncoder {
+    pub fn new(
+        choice: &EncoderChoice,
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        settings: EncoderSettings,
+    ) -> Result<Self, ClientError> {
+        match &choice.backend {
+            EncoderBackend::SoftwareVp8 => Ok(Self::SoftwareVp8(Vp8Encoder::new(width, height, layout, settings)?)),
+            backend @ (EncoderBackend::Vaapi { .. } | EncoderBackend::Qsv { .. } | EncoderBackend::Cuda { .. }) => Ok(Self::Hardware(HardwareEncoder::new(
+                backend, choice.codec, width, height, layout, settings,
+            )?)),
+        }
+    }
+
+    pub fn target_size(&self) -> (u32, u32) {
+        match self {
+            Self::SoftwareVp8(encoder) => encoder.target_size(),
+            Self::Hardware(encoder) => encoder.target_size(),
+        }
+    }
+
+    pub fn conversion_name(&self) -> &'static str {
+        match self {
+            Self::SoftwareVp8(_) => "CPU",
+            Self::Hardware(encoder) => encoder.conversion_name(),
+        }
+    }
+
+    pub fn matches_source(&self, width: u32, height: u32, layout: PixelLayout) -> bool {
+        match self {
+            Self::SoftwareVp8(encoder) => encoder.matches_source(width, height, layout),
+            Self::Hardware(encoder) => encoder.source == (width, height, layout),
+        }
+    }
+
+    pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedFrame>, ClientError> {
+        match self {
+            Self::SoftwareVp8(encoder) => encoder.encode(frame),
+            Self::Hardware(encoder) => encoder.encode(frame),
+        }
+    }
+
+    pub fn take_timing_sample(&mut self) -> EncodeTimingSample {
+        match self {
+            Self::SoftwareVp8(encoder) => encoder.take_timing_sample(),
+            Self::Hardware(encoder) => encoder.take_timing_sample(),
+        }
+    }
+}
+
+pub fn probe_encoder() -> EncoderChoice {
+    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+        let mut devices = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("renderD")))
+            .collect::<Vec<_>>();
+        devices.sort();
+        for device in &devices {
+            let device = device.to_string_lossy().into_owned();
+            for codec in [VideoCodec::Vp8, VideoCodec::H264] {
+                if probe_hardware_encoder(&EncoderBackend::Vaapi { device: device.clone() }, codec) {
+                    tracing::info!(?codec, %device, "selected VAAPI screen-share encoder");
+                    return EncoderChoice { codec, backend: EncoderBackend::Vaapi { device } };
+                }
+            }
+        }
+        for device in &devices {
+            let device = device.to_string_lossy().into_owned();
+            if probe_hardware_encoder(&EncoderBackend::Qsv { device: device.clone() }, VideoCodec::H264) {
+                tracing::info!(%device, "selected Intel QSV H.264 screen-share encoder");
+                return EncoderChoice { codec: VideoCodec::H264, backend: EncoderBackend::Qsv { device } };
+            }
+        }
+    }
+    for index in 0..4 {
+        let device = index.to_string();
+        if probe_hardware_encoder(&EncoderBackend::Cuda { device: device.clone() }, VideoCodec::H264) {
+            tracing::info!(%device, "selected NVENC H.264 screen-share encoder");
+            return EncoderChoice { codec: VideoCodec::H264, backend: EncoderBackend::Cuda { device } };
+        }
+    }
+    tracing::info!("no usable hardware video encoder found; using software VP8");
+    EncoderChoice { codec: VideoCodec::Vp8, backend: EncoderBackend::SoftwareVp8 }
+}
+
+fn probe_hardware_encoder(backend: &EncoderBackend, codec: VideoCodec) -> bool {
+    let width = 1920;
+    let height = 1080;
+    let Ok(mut encoder) = HardwareEncoder::new(
+        backend,
+        codec,
+        width,
+        height,
+        PixelLayout::Bgrx,
+        EncoderSettings::default(),
+    ) else {
+        return false;
+    };
+    let frame = CapturedFrame {
+        width,
+        height,
+        layout: PixelLayout::Bgrx,
+        pixels: vec![0; (width * height * 4) as usize],
+        captured_at: std::time::Instant::now(),
+    };
+    encoder.encode(&frame).is_ok()
 }
 
 pub fn scaled_size(width: u32, height: u32, max_height: u32) -> (u32, u32) {
@@ -185,17 +331,7 @@ impl Vp8Encoder {
     }
 
     fn drain(&mut self) -> Vec<EncodedFrame> {
-        let mut out = Vec::new();
-        let mut packet = ffmpeg::Packet::empty();
-        while self.encoder.receive_packet(&mut packet).is_ok() {
-            let Some(data) = packet.data() else { continue };
-            out.push(EncodedFrame {
-                data: data.to_vec(),
-                keyframe: packet.is_key(),
-                timestamp: packet.pts().unwrap_or(0) as u32,
-            });
-        }
-        out
+        drain_packets(&mut self.encoder)
     }
 
     pub fn settings(&self) -> EncoderSettings {
@@ -203,6 +339,373 @@ impl Vp8Encoder {
     }
 
     pub fn take_timing_sample(&mut self) -> EncodeTimingSample {
+        std::mem::take(&mut self.timing)
+    }
+}
+
+fn drain_packets(encoder: &mut ffmpeg::encoder::Video) -> Vec<EncodedFrame> {
+    let mut out = Vec::new();
+    let mut packet = ffmpeg::Packet::empty();
+    while encoder.receive_packet(&mut packet).is_ok() {
+        let Some(data) = packet.data() else { continue };
+        out.push(EncodedFrame {
+            data: data.to_vec(),
+            keyframe: packet.is_key(),
+            timestamp: packet.pts().unwrap_or(0) as u32,
+        });
+    }
+    out
+}
+
+pub struct HardwareEncoder {
+    encoder: ffmpeg::encoder::Video,
+    scaler: Option<scaling::Context>,
+    source_frame: VideoFrame,
+    converted_frame: Option<VideoFrame>,
+    hardware_frame: VideoFrame,
+    vaapi_filter: Option<VaapiGpuFilter>,
+    hardware: HardwareFrames,
+    source: (u32, u32, PixelLayout),
+    target: (u32, u32),
+    frames_sent: i64,
+    started: Option<std::time::Instant>,
+    timing: EncodeTimingSample,
+}
+
+struct VaapiGpuFilter {
+    _graph: ffmpeg::filter::Graph,
+    source: ffmpeg::filter::Context,
+    sink: ffmpeg::filter::Context,
+}
+
+impl VaapiGpuFilter {
+    fn new(
+        device: *mut ffmpeg::ffi::AVBufferRef,
+        width: u32,
+        height: u32,
+        target_w: u32,
+        target_h: u32,
+        layout: PixelLayout,
+    ) -> Result<(Self, *mut ffmpeg::ffi::AVBufferRef), ClientError> {
+        let pixel_format = match layout {
+            PixelLayout::Bgrx => ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_BGRA,
+            PixelLayout::Rgbx => ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_RGBA,
+        };
+        let mut graph = ffmpeg::filter::Graph::new();
+        let source_args = format!(
+            "video_size={width}x{height}:pix_fmt={}:time_base=1/{TIMEBASE_HZ}:pixel_aspect=1/1",
+            pixel_format as i32,
+        );
+        let mut source = graph
+            .add(&ffmpeg::filter::find("buffer").ok_or_else(|| ClientError::ScreenCapture("FFmpeg buffer filter is unavailable".into()))?, "capture", &source_args)
+            .map_err(|e| ClientError::ScreenCapture(format!("could not create the GPU conversion input: {e}")))?;
+        let mut upload = graph
+            .add(&ffmpeg::filter::find("hwupload").ok_or_else(|| ClientError::ScreenCapture("FFmpeg hwupload filter is unavailable".into()))?, "upload", "")
+            .map_err(|e| ClientError::ScreenCapture(format!("could not create the GPU upload filter: {e}")))?;
+        unsafe {
+            (*upload.as_mut_ptr()).hw_device_ctx = ffmpeg::ffi::av_buffer_ref(device);
+            if (*upload.as_mut_ptr()).hw_device_ctx.is_null() {
+                return Err(ClientError::ScreenCapture("could not attach the VAAPI device to the upload filter".into()));
+            }
+            (*upload.as_mut_ptr()).extra_hw_frames = 16;
+        }
+        let mut scale = graph
+            .add(
+                &ffmpeg::filter::find("scale_vaapi").ok_or_else(|| ClientError::ScreenCapture("FFmpeg scale_vaapi filter is unavailable".into()))?,
+                "scale",
+                &format!("w={target_w}:h={target_h}:format=nv12"),
+            )
+            .map_err(|e| ClientError::ScreenCapture(format!("could not create the VAAPI scale filter: {e}")))?;
+        let mut sink = graph
+            .add(&ffmpeg::filter::find("buffersink").ok_or_else(|| ClientError::ScreenCapture("FFmpeg buffersink filter is unavailable".into()))?, "encoded_input", "")
+            .map_err(|e| ClientError::ScreenCapture(format!("could not create the GPU conversion output: {e}")))?;
+        source.link(0, &mut upload, 0);
+        upload.link(0, &mut scale, 0);
+        scale.link(0, &mut sink, 0);
+        graph
+            .validate()
+            .map_err(|e| ClientError::ScreenCapture(format!("VAAPI GPU conversion is unavailable for this capture format: {e}")))?;
+
+        let frames = unsafe {
+            let sink_ptr = sink.as_mut_ptr();
+            if (*sink_ptr).nb_inputs == 0 || (*sink_ptr).inputs.is_null() {
+                std::ptr::null_mut()
+            } else {
+                ffmpeg::ffi::avfilter_link_get_hw_frames_ctx(*(*sink_ptr).inputs)
+            }
+        };
+        if frames.is_null() {
+            return Err(ClientError::ScreenCapture("VAAPI conversion did not provide hardware frames to the encoder".into()));
+        }
+        Ok((Self { _graph: graph, source, sink }, frames))
+    }
+
+    fn convert(&mut self, frame: &VideoFrame, output: &mut VideoFrame) -> Result<(), ClientError> {
+        let input = frame.clone();
+        self.source
+            .source()
+            .add(&input)
+            .map_err(|e| ClientError::ScreenCapture(format!("could not submit a frame to VAAPI conversion: {e}")))?;
+        self.sink
+            .sink()
+            .frame(output)
+            .map_err(|e| ClientError::ScreenCapture(format!("could not receive a VAAPI converted frame: {e}")))
+    }
+}
+
+struct HardwareFrames {
+    device: *mut ffmpeg::ffi::AVBufferRef,
+    frames: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+fn allocate_hardware_frames(
+    device: *mut ffmpeg::ffi::AVBufferRef,
+    hw_pixel: Pixel,
+    width: u32,
+    height: u32,
+) -> Result<*mut ffmpeg::ffi::AVBufferRef, ClientError> {
+    let mut frames_ref = unsafe { ffmpeg::ffi::av_hwframe_ctx_alloc(device) };
+    if frames_ref.is_null() {
+        return Err(ClientError::ScreenCapture("could not allocate a hardware frames context".into()));
+    }
+    let frames = unsafe { &mut *(*frames_ref).data.cast::<ffmpeg::ffi::AVHWFramesContext>() };
+    frames.format = match hw_pixel {
+        Pixel::VAAPI => ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI,
+        Pixel::QSV => ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_QSV,
+        Pixel::CUDA => ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_CUDA,
+        _ => unreachable!(),
+    };
+    frames.sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+    frames.width = width as i32;
+    frames.height = height as i32;
+    frames.initial_pool_size = 16;
+    let result = unsafe { ffmpeg::ffi::av_hwframe_ctx_init(frames_ref) };
+    if result < 0 {
+        unsafe { ffmpeg::ffi::av_buffer_unref(&mut frames_ref) };
+        return Err(ClientError::ScreenCapture(format!("could not initialize hardware frame pool: {}", ffmpeg::Error::from(result))));
+    }
+    Ok(frames_ref)
+}
+
+impl Drop for HardwareFrames {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(&mut self.frames);
+            ffmpeg::ffi::av_buffer_unref(&mut self.device);
+        }
+    }
+}
+
+impl HardwareEncoder {
+    fn conversion_name(&self) -> &'static str {
+        if self.vaapi_filter.is_some() { "VAAPI VPP" } else { "CPU" }
+    }
+
+    fn new(
+        backend: &EncoderBackend,
+        codec_kind: VideoCodec,
+        width: u32,
+        height: u32,
+        layout: PixelLayout,
+        settings: EncoderSettings,
+    ) -> Result<Self, ClientError> {
+        ffmpeg::init().map_err(|e| ClientError::ScreenCapture(format!("ffmpeg init failed: {e}")))?;
+        let (target_w, target_h) = scaled_size(width, height, settings.max_height);
+        let (device_type, hw_pixel, codec_name, device_name) = match backend {
+            EncoderBackend::Vaapi { device } => (
+                ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                Pixel::VAAPI,
+                match codec_kind { VideoCodec::Vp8 => "vp8_vaapi", VideoCodec::H264 => "h264_vaapi" },
+                device.as_str(),
+            ),
+            EncoderBackend::Qsv { device } => (
+                ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_QSV,
+                Pixel::QSV,
+                "h264_qsv",
+                device.as_str(),
+            ),
+            EncoderBackend::Cuda { device } => (
+                ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+                Pixel::CUDA,
+                "h264_nvenc",
+                device.as_str(),
+            ),
+            EncoderBackend::SoftwareVp8 => unreachable!("software encoder does not create hardware frames"),
+        };
+        let device = std::ffi::CString::new(device_name)
+            .map_err(|e| ClientError::ScreenCapture(format!("invalid hardware device name: {e}")))?;
+        let mut device_ref = std::ptr::null_mut();
+        let result = unsafe {
+            ffmpeg::ffi::av_hwdevice_ctx_create(
+                &mut device_ref,
+                device_type,
+                device.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result < 0 {
+            return Err(ClientError::ScreenCapture(format!("could not open VAAPI device: {}", ffmpeg::Error::from(result))));
+        }
+        let (frames_ref, vaapi_filter) = if matches!(backend, EncoderBackend::Vaapi { .. }) {
+            match VaapiGpuFilter::new(device_ref, width, height, target_w, target_h, layout) {
+                Ok((filter, frames)) => {
+                    tracing::info!("VAAPI GPU upload, scaling, and color conversion enabled");
+                    (frames, Some(filter))
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "VAAPI GPU conversion unavailable; using CPU conversion before hardware encoding");
+                    let frames = match allocate_hardware_frames(device_ref, hw_pixel, target_w, target_h) {
+                        Ok(frames) => frames,
+                        Err(error) => {
+                            unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ref) };
+                            return Err(error);
+                        }
+                    };
+                    (frames, None)
+                }
+            }
+        } else {
+            let frames = match allocate_hardware_frames(device_ref, hw_pixel, target_w, target_h) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    unsafe { ffmpeg::ffi::av_buffer_unref(&mut device_ref) };
+                    return Err(error);
+                }
+            };
+            (frames, None)
+        };
+        let hardware = HardwareFrames { device: device_ref, frames: frames_ref };
+
+        let codec = ffmpeg::encoder::find_by_name(codec_name)
+            .ok_or_else(|| ClientError::ScreenCapture(format!("this ffmpeg build has no {codec_name} encoder")))?;
+        let mut context = ffmpeg::codec::context::Context::new_with_codec(codec)
+            .encoder()
+            .video()
+            .map_err(|e| ClientError::ScreenCapture(format!("could not create {codec_name} context: {e}")))?;
+        context.set_width(target_w);
+        context.set_height(target_h);
+        context.set_format(hw_pixel);
+        context.set_time_base(ffmpeg::Rational::new(1, TIMEBASE_HZ as i32));
+        context.set_frame_rate(Some(ffmpeg::Rational::new(settings.frame_rate as i32, 1)));
+        context.set_bit_rate(settings.bitrate_bps);
+        context.set_gop(settings.keyframe_interval);
+        context.set_max_b_frames(0);
+        unsafe {
+            let context_ptr = context.as_mut_ptr();
+            (*context_ptr).hw_frames_ctx = ffmpeg::ffi::av_buffer_ref(hardware.frames);
+            if (*context_ptr).hw_frames_ctx.is_null() {
+                return Err(ClientError::ScreenCapture("could not attach VAAPI frames to encoder".into()));
+            }
+            if codec_kind == VideoCodec::H264 {
+                (*context_ptr).profile = Profile::H264(H264Profile::ConstrainedBaseline).into();
+            }
+        }
+        let mut options = ffmpeg::Dictionary::new();
+        if codec_kind == VideoCodec::H264 {
+            options.set("level", "51");
+        }
+        let encoder = context
+            .open_with(options)
+            .map_err(|e| ClientError::ScreenCapture(format!("could not open {codec_name}: {e}")))?;
+
+        let scaler = if vaapi_filter.is_none() {
+            Some(scaling::Context::get(
+                source_pixel(layout),
+                width,
+                height,
+                Pixel::NV12,
+                target_w,
+                target_h,
+                scaling::Flags::FAST_BILINEAR,
+            )
+            .map_err(|e| ClientError::ScreenCapture(format!("could not build the hardware encoder input scaler: {e}")))?)
+        } else {
+            None
+        };
+        let source_frame = VideoFrame::new(source_pixel(layout), width, height);
+        let converted_frame = vaapi_filter.is_none().then(|| VideoFrame::new(Pixel::NV12, target_w, target_h));
+
+        Ok(Self {
+            encoder,
+            scaler,
+            source_frame,
+            converted_frame,
+            hardware_frame: VideoFrame::empty(),
+            vaapi_filter,
+            hardware,
+            source: (width, height, layout),
+            target: (target_w, target_h),
+            frames_sent: 0,
+            started: None,
+            timing: EncodeTimingSample::default(),
+        })
+    }
+
+    fn target_size(&self) -> (u32, u32) {
+        self.target
+    }
+
+    fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedFrame>, ClientError> {
+        if self.source != (frame.width, frame.height, frame.layout) {
+            return Err(ClientError::ScreenCapture("the capture format changed; rebuild the VAAPI encoder".into()));
+        }
+        let started = *self.started.get_or_insert(frame.captured_at);
+        let elapsed = frame.captured_at.saturating_duration_since(started);
+        let pts = ((elapsed.as_secs_f64() * TIMEBASE_HZ as f64).round() as i64).max(self.frames_sent);
+
+        let stage = std::time::Instant::now();
+        make_writable(&mut self.source_frame)?;
+        copy_into_plane(&mut self.source_frame, &frame.pixels, frame.stride());
+        self.source_frame.set_pts(Some(pts));
+        self.timing.copy += stage.elapsed();
+
+        let stage = std::time::Instant::now();
+        if let Some(filter) = self.vaapi_filter.as_mut() {
+            filter.convert(&self.source_frame, &mut self.hardware_frame)?;
+        } else {
+            let scaler = self.scaler.as_mut().expect("CPU scaler exists when GPU conversion is disabled");
+            let converted_frame = self.converted_frame.as_mut().expect("CPU conversion buffer exists");
+            make_writable(converted_frame)?;
+            scaler
+                .run(&self.source_frame, converted_frame)
+                .map_err(|e| ClientError::ScreenCapture(format!("hardware encoder input conversion failed: {e}")))?;
+        }
+        self.timing.convert += stage.elapsed();
+
+        if self.vaapi_filter.is_none() {
+            let stage = std::time::Instant::now();
+            unsafe {
+                ffmpeg::ffi::av_frame_unref(self.hardware_frame.as_mut_ptr());
+                let result = ffmpeg::ffi::av_hwframe_get_buffer(self.hardware.frames, self.hardware_frame.as_mut_ptr(), 0);
+                if result < 0 {
+                    return Err(ClientError::ScreenCapture(format!("could not allocate a hardware surface: {}", ffmpeg::Error::from(result))));
+                }
+                let result = ffmpeg::ffi::av_hwframe_transfer_data(
+                    self.hardware_frame.as_mut_ptr(),
+                    self.converted_frame.as_ref().expect("CPU conversion buffer exists").as_ptr(),
+                    0,
+                );
+                if result < 0 {
+                    return Err(ClientError::ScreenCapture(format!("could not upload a frame to the hardware encoder: {}", ffmpeg::Error::from(result))));
+                }
+            }
+            self.timing.upload += stage.elapsed();
+        }
+        self.hardware_frame.set_pts(Some(pts));
+
+        let stage = std::time::Instant::now();
+        self.encoder
+            .send_frame(&self.hardware_frame)
+            .map_err(|e| ClientError::ScreenCapture(format!("VAAPI encoder rejected a frame: {e}")))?;
+        self.frames_sent = pts + 1;
+        let output = drain_packets(&mut self.encoder);
+        self.timing.encode += stage.elapsed();
+        self.timing.frames += 1;
+        Ok(output)
+    }
+
+    fn take_timing_sample(&mut self) -> EncodeTimingSample {
         std::mem::take(&mut self.timing)
     }
 }

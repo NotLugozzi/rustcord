@@ -42,6 +42,8 @@ struct EncodedVideoFrame {
     width: u32,
     #[cfg(feature = "screenshare")]
     height: u32,
+    #[cfg(feature = "screenshare")]
+    codec: crate::screen_encode::VideoCodec,
 }
 
 struct IncomingVideoPacket {
@@ -153,6 +155,14 @@ impl VoiceGateway {
         tx: mpsc::UnboundedSender<VoiceGatewayEvent>,
         mut outgoing: mpsc::UnboundedReceiver<String>,
     ) -> Result<(), ClientError> {
+        #[cfg(feature = "screenshare")]
+        let encoder_choice = if self.publish_stream {
+            Some(tokio::task::spawn_blocking(crate::screen_encode::probe_encoder).await.map_err(|e| {
+                ClientError::GatewayClosed(format!("screen encoder probe failed: {e}"))
+            })?)
+        } else {
+            None
+        };
         let _ = tx.send(VoiceGatewayEvent::Connecting);
 
         if self.stream_media {
@@ -213,6 +223,10 @@ impl VoiceGateway {
         let mut ready_video_ssrcs: Option<(u32, u32)> = None;
         #[cfg(feature = "screenshare")]
         let mut negotiated_video_codec = crate::screen_decode::VideoCodec::Vp8;
+        #[cfg(feature = "screenshare")]
+        if let Some(choice) = &encoder_choice {
+            negotiated_video_codec = choice.codec;
+        }
         #[cfg(feature = "screenshare")]
         let mut video_announced = false;
         let mut media_connected = false;
@@ -461,13 +475,26 @@ impl VoiceGateway {
                         (false, true) => {
                             let frames = video_frame_tx.clone();
                             let sharing = self.media_state.screen_sharing.clone();
+                            #[cfg(feature = "screenshare")]
+                            let encoder_choice = encoder_choice.clone().unwrap_or_else(|| crate::screen_encode::probe_encoder());
                             let max_height = self.media_state.screen_share_max_height.load(std::sync::atomic::Ordering::Relaxed);
                             let framerate = self.media_state.screen_share_fps.load(std::sync::atomic::Ordering::Relaxed);
-                            screen_share_task = Some(tokio::spawn(async move {
-                                if let Err(error) = capture_and_encode_screen(frames, sharing, max_height, framerate).await {
-                                    tracing::warn!("screen share stopped: {error}");
-                                }
-                            }));
+                            #[cfg(feature = "screenshare")]
+                            {
+                                screen_share_task = Some(tokio::spawn(async move {
+                                    if let Err(error) = capture_and_encode_screen(frames, sharing, max_height, framerate, encoder_choice).await {
+                                        tracing::warn!("screen share stopped: {error}");
+                                    }
+                                }));
+                            }
+                            #[cfg(not(feature = "screenshare"))]
+                            {
+                                screen_share_task = Some(tokio::spawn(async move {
+                                    if let Err(error) = capture_and_encode_screen(frames, sharing, max_height, framerate).await {
+                                        tracing::warn!("screen share stopped: {error}");
+                                    }
+                                }));
+                            }
                             #[cfg(feature = "screenshare")]
                             if self.media_state.system_audio_enabled.load(std::sync::atomic::Ordering::Relaxed) {
                                 let audio = system_audio_tx.clone();
@@ -529,6 +556,10 @@ impl VoiceGateway {
                 Some(frame) = video_frame_rx.recv() => {
                     #[cfg(feature = "screenshare")]
                     if let Some(active_rtc) = rtc.as_mut() {
+                        if frame.codec != negotiated_video_codec {
+                            tracing::warn!(encoded = ?frame.codec, negotiated = ?negotiated_video_codec, "voice: dropping screen-share frame after codec negotiation mismatch");
+                            continue;
+                        }
                         if !video_announced {
                             let active = video_state_frame(active_rtc.audio_ssrc(), active_rtc.video_ssrc(), active_rtc.video_rtx_ssrc(), true);
                             if let Err(error) = write.send(WsMessage::Text(active)).await {
@@ -537,9 +568,25 @@ impl VoiceGateway {
                             video_announced = true;
                         }
                         let data = if dave_enabled {
-                            let clear_header = if frame.keyframe { 10 } else { 1 };
-                            let Some(encrypted) = frame_crypto.encrypt_with_unencrypted_ranges(&frame.data, &[(0, clear_header)]) else {
-                                tracing::debug!("voice: DAVE encryption failed; dropping VP8 frame");
+                            let encrypted = match frame.codec {
+                                crate::screen_encode::VideoCodec::Vp8 => {
+                                    let clear_header = if frame.keyframe { 10 } else { 1 };
+                                    frame_crypto.encrypt_with_unencrypted_ranges(&frame.data, &[(0, clear_header)])
+                                }
+                                crate::screen_encode::VideoCodec::H264 => {
+                                    let Some(normalized) = crate::dave_frame_crypto::normalize_h264_annex_b(&frame.data) else {
+                                        tracing::debug!("voice: invalid H264 Annex-B frame; dropping");
+                                        continue;
+                                    };
+                                    let Some(ranges) = crate::dave_frame_crypto::h264_unencrypted_ranges(&normalized) else {
+                                        tracing::debug!("voice: could not parse H264 frame headers; dropping");
+                                        continue;
+                                    };
+                                    frame_crypto.encrypt_h264(&normalized, &ranges)
+                                }
+                            };
+                            let Some(encrypted) = encrypted else {
+                                tracing::debug!(codec = ?frame.codec, "voice: DAVE encryption failed; dropping video frame");
                                 continue;
                             };
                             encrypted
@@ -549,7 +596,7 @@ impl VoiceGateway {
                         let frame_bytes = data.len() as u64;
                         bytes_sent = bytes_sent.saturating_add(frame_bytes);
                         let rtc_frame = crate::screen_encode::EncodedFrame { data, timestamp: frame.timestamp, keyframe: frame.keyframe };
-                        if let Err(error) = active_rtc.send_video_frame(&rtc_frame) {
+                        if let Err(error) = active_rtc.send_video_frame(&rtc_frame, frame.codec) {
                             tracing::debug!("voice: failed to send VP8 frame: {error}");
                         } else {
                             video_up_interval_frames += 1;
@@ -650,7 +697,18 @@ impl VoiceGateway {
                                 let offer = voice_sdp::build_offer(&params);
                                 rtc_socket = Some(new_rtc.socket_handle());
                                 rtc = Some(new_rtc);
-                                let select_protocol = select_protocol_frame(&offer, self.publish_stream);
+                                #[cfg(feature = "screenshare")]
+                                let publish_codec = encoder_choice.as_ref().map(|choice| match choice.codec {
+                                    crate::screen_encode::VideoCodec::Vp8 => "VP8",
+                                    crate::screen_encode::VideoCodec::H264 => "H264",
+                                });
+                                #[cfg(not(feature = "screenshare"))]
+                                let publish_codec: Option<&str> = None;
+                                let select_protocol = select_protocol_frame(
+                                    &offer,
+                                    self.publish_stream,
+                                    publish_codec,
+                                );
                                 if let Err(e) = write.send(WsMessage::Text(select_protocol)).await {
                                     break Err(e.into());
                                 }
@@ -660,7 +718,15 @@ impl VoiceGateway {
                                     #[cfg(feature = "screenshare")]
                                     if let Some(codec) = data["video_codec"].as_str() {
                                         negotiated_video_codec = crate::screen_decode::VideoCodec::from_gateway(codec);
-                                        tracing::debug!("voice: negotiated remote video codec {codec}");
+                                        if self.publish_stream {
+                                            let requested = encoder_choice.as_ref().map(|choice| choice.codec);
+                                            tracing::info!(requested = ?requested, selected = ?negotiated_video_codec, "voice: screen-share codec negotiated");
+                                            if requested.is_some_and(|requested| requested != negotiated_video_codec) {
+                                                tracing::warn!("voice: gateway selected a screen-share codec different from the advertised encoder");
+                                            }
+                                        } else {
+                                            tracing::debug!("voice: negotiated remote video codec {codec}");
+                                        }
                                     }
                                     target_dave_version = data["dave_protocol_version"].as_u64().unwrap_or(0) as u32;
                                     if target_dave_version > 0 {
@@ -1254,13 +1320,14 @@ async fn capture_and_encode_screen(
     sharing: Arc<AtomicBool>,
     max_height: u32,
     framerate: u32,
+    #[cfg(feature = "screenshare")] encoder_choice: crate::screen_encode::EncoderChoice,
 ) -> Result<(), String> {
     #[cfg(feature = "screenshare")]
     {
         let capture = crate::screen_capture::ScreenCapture::start(framerate)
             .await
             .map_err(|error| error.to_string())?;
-        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, sharing, max_height, framerate))
+        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, sharing, max_height, framerate, encoder_choice))
             .await
             .map_err(|error| format!("screen encoder worker failed: {error}"))?
     }
@@ -1360,10 +1427,11 @@ fn encode_screen_frames(
     sharing: Arc<AtomicBool>,
     max_height: u32,
     framerate: u32,
+    encoder_choice: crate::screen_encode::EncoderChoice,
 ) -> Result<(), String> {
-    use crate::screen_encode::{EncodeTimingSample, EncoderSettings, Vp8Encoder};
+    use crate::screen_encode::{EncodeTimingSample, EncoderSettings, ScreenEncoder};
 
-    let mut encoder: Option<Vp8Encoder> = None;
+    let mut encoder: Option<ScreenEncoder> = None;
     let mut timing_started = Instant::now();
     let mut timing = EncodeTimingSample::default();
     let mut queue_drops = 0u64;
@@ -1376,8 +1444,13 @@ fn encode_screen_frames(
                 (false, true) => 2_500_000,
                 (false, false) => 1_500_000,
             };
-            let settings = EncoderSettings { max_height, bitrate_bps, keyframe_interval: framerate.saturating_mul(2) };
-            let new_encoder = Vp8Encoder::new(frame.width, frame.height, frame.layout, settings)
+            let settings = EncoderSettings {
+                max_height,
+                bitrate_bps,
+                keyframe_interval: framerate.saturating_mul(2),
+                frame_rate: framerate,
+            };
+            let new_encoder = ScreenEncoder::new(&encoder_choice, frame.width, frame.height, frame.layout, settings)
                 .map_err(|error| error.to_string())?;
             let (target_width, target_height) = new_encoder.target_size();
             tracing::info!(
@@ -1386,7 +1459,10 @@ fn encode_screen_frames(
                 encoded_width = target_width,
                 encoded_height = target_height,
                 bitrate_bps = settings.bitrate_bps,
-                "screen share VP8 encoder configured"
+                backend = encoder_choice.backend_name(),
+                codec = ?encoder_choice.codec,
+                conversion = new_encoder.conversion_name(),
+                "screen share encoder configured"
             );
             encoder = Some(new_encoder);
         }
@@ -1399,6 +1475,7 @@ fn encode_screen_frames(
         timing.frames += sample.frames;
         timing.copy += sample.copy;
         timing.convert += sample.convert;
+        timing.upload += sample.upload;
         timing.encode += sample.encode;
         let elapsed = timing_started.elapsed();
         if elapsed >= Duration::from_secs(2) {
@@ -1407,9 +1484,12 @@ fn encode_screen_frames(
                 encode_fps = timing.frames as f32 / elapsed.as_secs_f32(),
                 copy_avg_ms = timing.copy.as_secs_f64() * 1000.0 / frames,
                 convert_avg_ms = timing.convert.as_secs_f64() * 1000.0 / frames,
+                upload_avg_ms = timing.upload.as_secs_f64() * 1000.0 / frames,
                 encode_avg_ms = timing.encode.as_secs_f64() * 1000.0 / frames,
                 queue_drops,
-                "screen share VP8 stage timing"
+                backend = encoder_choice.backend_name(),
+                codec = ?encoder_choice.codec,
+                "screen share encoder stage timing"
             );
             timing_started = Instant::now();
             timing = EncodeTimingSample::default();
@@ -1417,7 +1497,14 @@ fn encode_screen_frames(
         }
         let (encoded_width, encoded_height) = encoder.as_ref().expect("encoder initialized").target_size();
         for frame in encoded {
-            if frames.try_send(EncodedVideoFrame { data: frame.data, timestamp: frame.timestamp, keyframe: frame.keyframe, width: encoded_width, height: encoded_height }).is_err() {
+            if frames.try_send(EncodedVideoFrame {
+                data: frame.data,
+                timestamp: frame.timestamp,
+                keyframe: frame.keyframe,
+                width: encoded_width,
+                height: encoded_height,
+                codec: encoder_choice.codec,
+            }).is_err() {
                 queue_drops += 1;
                 tracing::trace!("screen share: dropping encoded frame because the RTP queue is full");
             }
@@ -1555,10 +1642,21 @@ fn random_uuid_v4() -> String {
     )
 }
 
-pub fn select_protocol_frame(offer: &str, publish_stream: bool) -> String {
+pub fn select_protocol_frame(
+    offer: &str,
+    publish_stream: bool,
+    publish_codec: Option<&str>,
+) -> String {
     let mut codecs = vec![json!({ "name": "opus", "type": "audio", "priority": 1000, "payload_type": 120, "rtx_payload_type": null })];
     if publish_stream {
-        codecs.push(json!({ "name": "VP8", "type": "video", "priority": 1000, "payload_type": 107, "rtx_payload_type": 108 }));
+        match publish_codec.unwrap_or("VP8") {
+            "H264" => {
+                codecs.push(json!({ "name": "H264", "type": "video", "priority": 3000, "payload_type": 105, "rtx_payload_type": 106 }));
+            }
+            _ => {
+                codecs.push(json!({ "name": "VP8", "type": "video", "priority": 1000, "payload_type": 107, "rtx_payload_type": 108 }));
+            }
+        }
     } else {
         codecs.push(json!({ "name": "H264", "type": "video", "priority": 3000, "payload_type": 105, "rtx_payload_type": 106 }));
         codecs.push(json!({ "name": "VP8", "type": "video", "priority": 4000, "payload_type": 107, "rtx_payload_type": 108 }));
