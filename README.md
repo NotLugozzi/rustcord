@@ -1,5 +1,6 @@
 # rustcord
-[![Build](https://github.com/NotLugozzi/rustcord/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/NotLugozzi/rustcord/actions/workflows/build.yml)
+[![Build](https://github.com/NotLugozzi/rustcord/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/NotLugozzi/rustcord/actions/workflows/build.yml) ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
+
 A native Discord client written in Rust, using Dear ImGui (via `imgui-rs`) for
 the UI, targeting Windows, macOS, and Linux.
 
