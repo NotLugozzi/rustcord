@@ -163,6 +163,9 @@ pub struct TextureCache {
     wanted: std::cell::RefCell<std::collections::HashSet<String>>,
     total_bytes: usize,
     pub animating: bool,
+    icon_scale: f32,
+    icons: HashMap<(crate::icons::Icon, u32), imgui::TextureId>,
+    icons_wanted: std::cell::RefCell<std::collections::HashSet<(crate::icons::Icon, u32)>>,
     #[cfg(feature = "video")]
     stopped_videos: std::cell::RefCell<Vec<String>>,
     #[cfg(feature = "screenshare")]
@@ -727,6 +730,38 @@ impl TextureCache {
 
     pub fn is_failed(&self, url: &str) -> bool {
         matches!(self.entries.get(url), Some(Entry::Failed))
+    }
+
+    pub fn icon(&self, icon: crate::icons::Icon, logical_size: f32) -> Option<imgui::TextureId> {
+        let px = (logical_size * self.icon_scale.max(1.0)).round().max(1.0) as u32;
+        let texture = self.icons.get(&(icon, px)).copied();
+        if texture.is_none() {
+            self.icons_wanted.borrow_mut().insert((icon, px));
+        }
+        texture
+    }
+
+    pub fn sync_icons(&mut self, scale: f32, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut imgui_wgpu::Renderer) {
+        if scale != self.icon_scale {
+            for (_, texture_id) in self.icons.drain() {
+                renderer.textures.remove(texture_id);
+            }
+            self.icons_wanted.borrow_mut().clear();
+            self.icon_scale = scale;
+        }
+        let wanted = std::mem::take(&mut *self.icons_wanted.borrow_mut());
+        for (icon, px) in wanted {
+            if self.icons.contains_key(&(icon, px)) {
+                continue;
+            }
+            if let Some(rgba) = crate::icons::rasterize(icon, px) {
+                self.icons.insert((icon, px), upload_texture(device, queue, renderer, &rgba));
+            }
+        }
+    }
+
+    pub fn has_wanted_icons(&self) -> bool {
+        !self.icons_wanted.borrow().is_empty()
     }
 }
 

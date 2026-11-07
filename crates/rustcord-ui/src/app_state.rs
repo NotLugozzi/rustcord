@@ -887,7 +887,8 @@ impl AppState {
             return rows.clone();
         }
         let messages = self.messages.get(channel_id).map(Vec::as_slice).unwrap_or(&[]);
-        let rows = std::sync::Arc::new(crate::message_rows::ChannelRows::build(messages, &chrono::Local, today, format));
+        let me = self.current_user.as_ref().map(|u| u.id.as_str()).unwrap_or_default();
+        let rows = std::sync::Arc::new(crate::message_rows::ChannelRows::build(messages, &chrono::Local, today, format, me));
         self.message_rows.insert(channel_id.to_string(), rows.clone());
         rows
     }

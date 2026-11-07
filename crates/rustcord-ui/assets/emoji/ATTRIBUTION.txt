@@ -3,7 +3,7 @@ CC-BY 4.0: https://creativecommons.org/licenses/by/4.0/
 
 Source: https://github.com/jdecked/twemoji (successor to twitter/twemoji), v15.1.0.
 
-Most emoji are downloaded on demand (72x72 PNG) and cached on disk; the few in
-assets/emoji/ui/ are bundled copies used by the UI itself. index.json is only a
-list of the single codepoints we render as emoji. No modifications were made to
+Emoji are downloaded on demand (72x72 PNG) and cached on disk. index.json is
+only a list of the single codepoints we render as emoji. UI icons are not
+emoji; see assets/icons/ATTRIBUTION.txt. No modifications were made to
 the artwork.

@@ -1,0 +1,17 @@
+<!-- original artwork for rustcord, MIT (same license as the project) -->
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <rect width="20" height="14" x="2" y="5" rx="3" />
+  <path d="M10 10H8a1.5 1.5 0 0 0-1.5 1.5v1A1.5 1.5 0 0 0 8 14h2v-2" stroke-width="1.6" />
+  <path d="M13 10v4" stroke-width="1.6" />
+  <path d="M16 14v-4h2.5M16 12h2" stroke-width="1.6" />
+</svg>

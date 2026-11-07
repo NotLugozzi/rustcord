@@ -1,3 +1,4 @@
+use crate::icons::Icon;
 use crate::timefmt::TimeFormat;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use rustcord_client::models::Message;
@@ -48,6 +49,143 @@ pub fn starts_group(prev: Option<(&Message, &Stamp)>, msg: &Message, stamp: &Sta
     prev.webhook_id.is_some() || webhook_identity_differs(prev, msg)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tone {
+    Muted,
+    CallActive,
+    CallMissed,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SystemAction {
+    JumpTo { channel_id: String, message_id: String },
+    JoinCall,
+}
+
+pub struct SystemRow {
+    pub icon: Icon,
+    pub tone: Tone,
+    pub parts: Vec<(String, bool)>,
+    pub action: Option<SystemAction>,
+    pub tooltip: Option<String>,
+}
+
+impl SystemRow {
+    pub fn plain_text(&self) -> String {
+        self.parts.iter().map(|(text, _)| text.as_str()).collect()
+    }
+}
+
+fn display_name(user: &rustcord_client::models::User) -> String {
+    user.global_name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| user.username.clone())
+}
+
+pub fn humanize_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    let minutes = (secs as f64 / 60.0).round() as i64;
+    let hours = (minutes as f64 / 60.0).round() as i64;
+    match secs {
+        ..45 => "a few seconds".into(),
+        45..90 => "a minute".into(),
+        _ if minutes < 45 => format!("{minutes} minutes"),
+        _ if minutes < 90 => "an hour".into(),
+        _ => format!("{hours} hours"),
+    }
+}
+
+fn call_duration(msg: &Message) -> Option<String> {
+    let end = msg.call.as_ref()?.ended_timestamp.as_deref()?;
+    let start = DateTime::parse_from_rfc3339(&msg.timestamp).ok()?;
+    let end = DateTime::parse_from_rfc3339(end).ok()?;
+    Some(humanize_duration((end - start).num_seconds()))
+}
+
+fn log_unsupported_once(kind: u8) {
+    static LOGGED: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+    let Ok(mut logged) = LOGGED.lock() else { return };
+    if !logged.contains(&kind) {
+        logged.push(kind);
+        tracing::info!("unsupported system message type {kind}");
+    }
+}
+
+pub fn system_row(msg: &Message, me: &str) -> SystemRow {
+    let author = display_name(&msg.author);
+    let target = msg.mentions.first();
+    let bold = |text: String| (text, true);
+    let plain = |text: &str| (text.to_string(), false);
+    let row = |icon, parts| SystemRow { icon, tone: Tone::Muted, parts, action: None, tooltip: None };
+    match msg.kind {
+        1 => {
+            let target = target.map(display_name).unwrap_or_else(|| "someone".into());
+            row(Icon::UserPlus, vec![bold(author), plain(" added "), bold(target), plain(" to the group.")])
+        }
+        2 => match target.filter(|t| t.id != msg.author.id) {
+            Some(target) => row(Icon::UserMinus, vec![bold(author), plain(" removed "), bold(display_name(target)), plain(" from the group.")]),
+            None => row(Icon::UserMinus, vec![bold(author), plain(" left the group.")]),
+        },
+        3 => {
+            let ongoing = msg.call.as_ref().is_some_and(|c| c.ended_timestamp.is_none());
+            let participated = msg.call.as_ref().is_some_and(|c| c.participants.iter().any(|p| p == me));
+            let missed = !participated && msg.author.id != me;
+            let lasted = call_duration(msg).map(|d| format!(" that lasted {d}.")).unwrap_or_else(|| ".".into());
+            if ongoing {
+                SystemRow {
+                    icon: Icon::PhoneCall,
+                    tone: Tone::CallActive,
+                    parts: vec![bold(author), plain(" started a call.")],
+                    action: Some(SystemAction::JoinCall),
+                    tooltip: None,
+                }
+            } else if missed {
+                SystemRow {
+                    icon: Icon::PhoneMissed,
+                    tone: Tone::CallMissed,
+                    parts: vec![plain("You missed a call from "), bold(author), (lasted, false)],
+                    action: None,
+                    tooltip: None,
+                }
+            } else {
+                SystemRow {
+                    icon: Icon::Phone,
+                    tone: Tone::CallActive,
+                    parts: vec![bold(author), (format!(" started a call{lasted}"), false)],
+                    action: None,
+                    tooltip: None,
+                }
+            }
+        }
+        4 => row(Icon::Pencil, vec![bold(author), plain(" changed the channel name: "), bold(msg.content.clone()), plain(".")]),
+        5 => row(Icon::Image, vec![bold(author), plain(" changed the channel icon.")]),
+        6 => {
+            let action = msg.message_reference.as_ref().and_then(|r| {
+                Some(SystemAction::JumpTo {
+                    channel_id: r.channel_id.clone().unwrap_or_else(|| msg.channel_id.clone()),
+                    message_id: r.message_id.clone()?,
+                })
+            });
+            SystemRow {
+                icon: Icon::Pin,
+                tone: Tone::Muted,
+                parts: vec![bold(author), plain(" pinned a message to this channel.")],
+                action,
+                tooltip: None,
+            }
+        }
+        7 => row(Icon::UserPlus, vec![bold(author), plain(" joined the server.")]),
+        kind => {
+            log_unsupported_once(kind);
+            SystemRow {
+                icon: Icon::CircleHelp,
+                tone: Tone::Muted,
+                parts: vec![bold(author), plain(" performed an unsupported action.")],
+                action: None,
+                tooltip: Some(format!("Unsupported message type {kind}")),
+            }
+        }
+    }
+}
+
 pub struct Times {
     pub header: String,
     pub short: String,
@@ -90,7 +228,9 @@ pub struct MessageRow {
     pub divider: Option<String>,
     pub starts_group: bool,
     pub ends_group: bool,
+    pub followed_by_system: bool,
     pub times: Times,
+    pub system: Option<SystemRow>,
 }
 
 pub struct ChannelRows {
@@ -100,7 +240,7 @@ pub struct ChannelRows {
 }
 
 impl ChannelRows {
-    pub fn build<Tz: TimeZone>(messages: &[Arc<Message>], tz: &Tz, today: NaiveDate, format: TimeFormat) -> Self
+    pub fn build<Tz: TimeZone>(messages: &[Arc<Message>], tz: &Tz, today: NaiveDate, format: TimeFormat, me: &str) -> Self
     where
         Tz::Offset: std::fmt::Display,
     {
@@ -112,6 +252,7 @@ impl ChannelRows {
             let starts = starts_group(prev, msg, stamp);
             if let Some(last) = rows.last_mut() {
                 last.ends_group = starts;
+                last.followed_by_system = is_system(msg) && stamp.local_date == prev.and_then(|(_, s)| s.local_date);
             }
             let prev_date = prev.and_then(|(_, s)| s.local_date);
             let divider = match stamp.local_date {
@@ -123,7 +264,9 @@ impl ChannelRows {
                 divider,
                 starts_group: starts,
                 ends_group: true,
+                followed_by_system: false,
                 times: Times::of(msg, stamp, tz, today, format),
+                system: is_system(msg).then(|| system_row(msg, me)),
             });
         }
         Self { rows, today, format }
@@ -168,11 +311,94 @@ mod tests {
 
     fn build(messages: Vec<Message>, tz: &FixedOffset) -> ChannelRows {
         let messages: Vec<Arc<Message>> = messages.into_iter().map(Arc::new).collect();
-        ChannelRows::build(&messages, tz, today(), US)
+        ChannelRows::build(&messages, tz, today(), US, "me")
     }
 
     fn starts(messages: Vec<Message>, tz: &FixedOffset) -> Vec<bool> {
         build(messages, tz).rows.iter().map(|r| r.starts_group).collect()
+    }
+
+    fn call(author: &str, start: &str, end: Option<&str>, participants: &[&str]) -> Message {
+        let mut m = with_kind(msg("1", author, start), 3);
+        m.call = Some(rustcord_client::models::CallInfo {
+            participants: participants.iter().map(|p| p.to_string()).collect(),
+            ended_timestamp: end.map(str::to_string),
+        });
+        m
+    }
+
+    #[test]
+    fn duration_buckets() {
+        assert_eq!(humanize_duration(10), "a few seconds");
+        assert_eq!(humanize_duration(44), "a few seconds");
+        assert_eq!(humanize_duration(60), "a minute");
+        assert_eq!(humanize_duration(120), "2 minutes");
+        assert_eq!(humanize_duration(44 * 60), "44 minutes");
+        assert_eq!(humanize_duration(60 * 60), "an hour");
+        assert_eq!(humanize_duration(3 * 3600), "3 hours");
+    }
+
+    #[test]
+    fn completed_missed_and_ongoing_calls() {
+        let done = system_row(&call("me", "2026-10-28T12:13:00+00:00", Some("2026-10-28T12:14:00+00:00"), &["me"]), "me");
+        assert_eq!(done.plain_text(), "me started a call that lasted a minute.");
+        assert_eq!((done.icon, done.tone), (Icon::Phone, Tone::CallActive));
+
+        let missed = system_row(&call("them", "2026-10-28T12:14:00+00:00", Some("2026-10-28T12:16:00+00:00"), &["them"]), "me");
+        assert_eq!(missed.plain_text(), "You missed a call from them that lasted 2 minutes.");
+        assert_eq!((missed.icon, missed.tone), (Icon::PhoneMissed, Tone::CallMissed));
+
+        let ongoing = system_row(&call("them", "2026-10-28T12:14:00+00:00", None, &["them"]), "me");
+        assert_eq!(ongoing.plain_text(), "them started a call.");
+        assert_eq!(ongoing.action, Some(SystemAction::JoinCall));
+    }
+
+    #[test]
+    fn recipient_changes_and_channel_edits() {
+        let mut added = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 1);
+        added.mentions = vec![added.author.clone()];
+        added.mentions[0].id = "b".into();
+        added.mentions[0].username = "b".into();
+        assert_eq!(system_row(&added, "me").plain_text(), "a added b to the group.");
+
+        let mut left = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 2);
+        left.mentions = vec![left.author.clone()];
+        assert_eq!(system_row(&left, "me").plain_text(), "a left the group.");
+
+        let mut renamed = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 4);
+        renamed.content = "new name".into();
+        assert_eq!(system_row(&renamed, "me").plain_text(), "a changed the channel name: new name.");
+    }
+
+    #[test]
+    fn unknown_types_fall_back_to_readable_text() {
+        let row = system_row(&with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 250), "me");
+        assert_eq!(row.plain_text(), "a performed an unsupported action.");
+        assert_eq!(row.tooltip.as_deref(), Some("Unsupported message type 250"));
+    }
+
+    #[test]
+    fn every_system_row_has_text() {
+        for kind in 1..=60u8 {
+            let m = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), kind);
+            if is_system(&m) {
+                assert!(!system_row(&m, "me").plain_text().trim().is_empty(), "type {kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_system_rows_stay_compact() {
+        let rows = build(
+            vec![
+                with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 3),
+                with_kind(msg("2", "a", "2026-11-06T10:01:00+00:00"), 3),
+                msg("3", "a", "2026-11-06T10:02:00+00:00"),
+            ],
+            &utc(),
+        );
+        let compact: Vec<bool> = rows.rows.iter().map(|r| r.followed_by_system).collect();
+        assert_eq!(compact, [true, false, false]);
     }
 
     #[test]
@@ -308,7 +534,7 @@ mod tests {
         .into_iter()
         .map(Arc::new)
         .collect();
-        let ends: Vec<bool> = ChannelRows::build(&messages, &utc(), today(), US).rows.iter().map(|r| r.ends_group).collect();
+        let ends: Vec<bool> = ChannelRows::build(&messages, &utc(), today(), US, "me").rows.iter().map(|r| r.ends_group).collect();
         assert_eq!(ends, [false, true, true]);
     }
 }

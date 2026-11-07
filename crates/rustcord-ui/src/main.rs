@@ -3,6 +3,7 @@ mod build_info;
 mod backend;
 mod clipboard;
 mod emoji;
+mod icons;
 mod images;
 mod ipc;
 mod keybinds;
