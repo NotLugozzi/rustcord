@@ -222,6 +222,7 @@ pub struct AppState {
     pub guild_members_requested: std::collections::HashSet<String>,
     pub show_members_panel: bool,
     pub messages: HashMap<String, Vec<std::sync::Arc<Message>>>,
+    pub message_rows: HashMap<String, std::sync::Arc<crate::message_rows::ChannelRows>>,
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
     pub compose_buf: String,
@@ -241,7 +242,7 @@ pub struct AppState {
     pub mic_gain: f32,
     pub denoise: bool,
     pub user_volumes: HashMap<String, f32>,
-    pub history_exhausted: std::collections::HashSet<String>,
+    pub reached_start: std::collections::HashSet<String>,
     pub incoming_calls: Vec<String>,
     pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub pending_attachment: Option<std::path::PathBuf>,
@@ -275,16 +276,32 @@ pub struct AppState {
     pub mention_autocomplete_selected: usize,
     pub gateway_connected: bool,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
+    pub active_streams: HashMap<String, String>,
+    pub watching_stream: Option<String>,
+    pub unwatching_stream: Option<String>,
+    pub server_call_minimized: bool,
+    pub server_call_focus_stream: bool,
     pub voice_speaking_users: std::collections::HashSet<String>,
     pub connected_voice_channel: Option<(Option<String>, String)>,
     pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
+    pub screen_sharing: bool,
+    pub share_system_audio: bool,
+    pub screen_audio_sources: Vec<(u32, String, bool)>,
+    pub screen_audio_sources_loaded: bool,
+    pub screen_audio_sources_error: Option<String>,
+    pub selected_screen_audio_pid: Option<u32>,
+    pub screen_share_max_height: u32,
+    pub screen_share_fps: u32,
+    pub show_screen_share_setup: bool,
     pub self_muted: bool,
     pub self_deafened: bool,
     pub voice_input_devices: Vec<String>,
     pub voice_output_devices: Vec<String>,
     pub voice_stats: rustcord_client::voice_gateway::VoiceStats,
     pub voice_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
+    pub screen_share_stats: rustcord_client::voice_gateway::VoiceStats,
+    pub screen_share_history: std::collections::VecDeque<rustcord_client::voice_gateway::VoiceStats>,
     pub show_voice_info: bool,
     pub voice_joined_at: Option<std::time::Instant>,
     pub selected_input_device: Option<String>,
@@ -301,6 +318,34 @@ pub struct AppState {
     pub keybinds: crate::keybinds::Keybinds,
     pub rebinding_action: Option<crate::keybinds::Action>,
     pub mic_test_running: bool,
+    pub clock_24h: Option<bool>,
+    pub invites: HashMap<String, crate::invites::InviteEntry>,
+    pub pending_invite_voice: Option<(String, String)>,
+    pub relationship_busy: std::collections::HashSet<String>,
+    pub relationship_confirm: Option<(crate::backend::RelationshipAction, String, String)>,
+    pub mutual_server_labels: HashMap<String, String>,
+    pub muted_before_deafen: bool,
+    pub drafts: HashMap<String, String>,
+    pub draft_channel: Option<String>,
+    pub compose_placeholder: String,
+    pub uploads: Vec<PendingUpload>,
+    pub next_upload_id: u64,
+    pub pins: HashMap<String, PinsState>,
+    pub show_profile_panel: bool,
+    pub add_people_selected: std::collections::HashSet<String>,
+    pub add_people_filter: String,
+}
+
+pub enum PinsState {
+    Loading,
+    Ready(Vec<Message>),
+    Failed,
+}
+
+pub struct PendingUpload {
+    pub id: u64,
+    pub filename: String,
+    pub progress: std::sync::Arc<rustcord_client::rest::UploadProgress>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -498,6 +543,17 @@ impl AppState {
         acts.iter().find(|a| a.kind != 4).or_else(|| acts.first()).map(|a| a.summary_title()).filter(|s| !s.is_empty())
     }
 
+    pub fn status_line_for(&self, user_id: &str) -> Option<(Option<rustcord_client::models::ActivityEmoji>, String)> {
+        let activities = &self.presences.get(user_id)?.activities;
+        if let Some(custom) = activities.iter().find(|a| a.kind == 4) {
+            let text = custom.state.clone().unwrap_or_default();
+            if !text.is_empty() || custom.emoji.is_some() {
+                return Some((custom.emoji.clone(), text));
+            }
+        }
+        activities.iter().find(|a| a.kind != 4).map(|a| (None, a.summary_title())).filter(|(_, s)| !s.is_empty())
+    }
+
     pub fn platform_for(&self, user_id: &str) -> Option<&'static str> {
         let presence = self.presences.get(user_id)?;
         let cs = &presence.client_status;
@@ -555,6 +611,7 @@ impl AppState {
                 }
             }
         }
+        self.message_rows.remove(&message.channel_id);
         let list = self.messages.entry(message.channel_id.clone()).or_default();
         let new_id = snowflake_value(&message.id);
         let insert_at = list.partition_point(|m| snowflake_value(&m.id) <= new_id);
@@ -652,6 +709,7 @@ impl AppState {
 
     fn forget_channel(&mut self, channel_id: &str) {
         self.messages.remove(channel_id);
+        self.message_rows.remove(channel_id);
         self.typing_users.remove(channel_id);
         self.last_read_message_id.remove(channel_id);
         if self.selected_channel.as_deref() == Some(channel_id) {
@@ -677,6 +735,7 @@ impl AppState {
         added: bool,
     ) {
         let is_me = self.current_user.as_ref().is_some_and(|u| u.id == user_id);
+        self.message_rows.remove(channel_id);
         let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) else {
             return;
         };
@@ -684,6 +743,7 @@ impl AppState {
     }
 
     pub fn clear_reactions(&mut self, channel_id: &str, message_id: &str) {
+        self.message_rows.remove(channel_id);
         if let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) {
             std::sync::Arc::make_mut(msg).reactions.clear();
         }
@@ -816,15 +876,160 @@ impl AppState {
 
     pub fn set_message_history(&mut self, channel_id: String, mut messages: Vec<Message>) {
         messages.sort_by_key(|m| snowflake_value(&m.id));
+        self.message_rows.remove(&channel_id);
         self.messages.insert(channel_id, messages.into_iter().map(std::sync::Arc::new).collect());
     }
 
     pub fn prepend_message_history(&mut self, channel_id: String, mut older: Vec<Message>) {
         older.sort_by_key(|m| snowflake_value(&m.id));
+        self.message_rows.remove(&channel_id);
         let existing = self.messages.entry(channel_id).or_default();
         let mut combined: Vec<_> = older.into_iter().map(std::sync::Arc::new).collect();
         combined.append(existing);
         *existing = combined;
+    }
+
+    pub fn update_message(
+        &mut self,
+        channel_id: &str,
+        id: &str,
+        content: Option<String>,
+        edited_timestamp: Option<String>,
+        call: Option<rustcord_client::models::CallInfo>,
+    ) {
+        let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) else { return };
+        self.message_rows.remove(channel_id);
+        let msg = std::sync::Arc::make_mut(msg);
+        if let Some(content) = content {
+            msg.content = content;
+        }
+        if edited_timestamp.is_some() {
+            msg.edited_timestamp = edited_timestamp;
+        }
+        if call.is_some() {
+            msg.call = call;
+        }
+    }
+
+    pub fn delete_message(&mut self, channel_id: &str, id: &str) {
+        if let Some(list) = self.messages.get_mut(channel_id) {
+            list.retain(|m| m.id != id);
+            self.message_rows.remove(channel_id);
+        }
+    }
+
+    pub fn ensure_invite(&mut self, code: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let now = std::time::Instant::now();
+        if self.invites.get(code).is_some_and(|entry| !entry.needs_fetch(now)) {
+            return;
+        }
+        self.invites.insert(
+            code.to_string(),
+            crate::invites::InviteEntry { state: crate::invites::InviteState::Loading, updated: now },
+        );
+        let _ = cmd_tx.send(crate::backend::UiCommand::ResolveInvite { code: code.to_string() });
+    }
+
+    pub fn add_joined_guild(&mut self, guild: Guild) {
+        if !self.guilds.iter().any(|g| g.id == guild.id) {
+            self.guilds.push(guild);
+            self.reconcile_rail_order();
+        }
+    }
+
+    pub fn sync_draft_channel(&mut self) {
+        if self.draft_channel == self.selected_channel {
+            return;
+        }
+        if let Some((_, draft)) = self.editing.take() {
+            self.compose_buf = draft;
+        }
+        let current = std::mem::take(&mut self.compose_buf);
+        if let Some(previous) = self.draft_channel.take() {
+            if current.is_empty() {
+                self.drafts.remove(&previous);
+            } else {
+                self.drafts.insert(previous, current);
+            }
+        }
+        self.compose_buf = self.selected_channel.as_ref().and_then(|id| self.drafts.remove(id)).unwrap_or_default();
+        self.reply_target = None;
+        self.draft_channel = self.selected_channel.clone();
+        self.compose_placeholder = self.placeholder_for_selected();
+    }
+
+    fn placeholder_for_selected(&self) -> String {
+        let Some(channel_id) = self.selected_channel.as_deref() else { return String::new() };
+        if let Some(dm) = self.dm_channels.iter().find(|c| c.id == channel_id) {
+            return match (dm.kind, dm.recipients.first()) {
+                (ChannelType::Dm, Some(user)) => {
+                    format!("Message @{}", user.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&user.username))
+                }
+                _ => format!("Message {}", Self::dm_display_name(dm)),
+            };
+        }
+        match self.guild_channels.values().flatten().find(|c| c.id == channel_id).and_then(|c| c.name.as_deref()) {
+            Some(name) => format!("Message #{name}"),
+            None => "Message".to_string(),
+        }
+    }
+
+    pub fn start_upload(&mut self, filename: String) -> (u64, std::sync::Arc<rustcord_client::rest::UploadProgress>) {
+        self.next_upload_id += 1;
+        let progress = std::sync::Arc::new(rustcord_client::rest::UploadProgress::default());
+        self.uploads.push(PendingUpload { id: self.next_upload_id, filename, progress: progress.clone() });
+        (self.next_upload_id, progress)
+    }
+
+    pub fn toggle_mute(&mut self) {
+        if self.self_deafened {
+            self.self_deafened = false;
+            self.self_muted = false;
+        } else {
+            self.self_muted = !self.self_muted;
+        }
+    }
+
+    pub fn toggle_deafen(&mut self) {
+        if self.self_deafened {
+            self.self_deafened = false;
+            self.self_muted = self.muted_before_deafen;
+        } else {
+            self.muted_before_deafen = self.self_muted;
+            self.self_deafened = true;
+            self.self_muted = true;
+        }
+    }
+
+    pub fn relationship_with(&self, user_id: &str) -> Option<RelationshipType> {
+        self.relationships.iter().find(|r| r.id == user_id || r.user.id == user_id).map(|r| r.kind)
+    }
+
+    pub fn note_history_page(&mut self, channel_id: &str, fetched: usize) {
+        if fetched < crate::backend::HISTORY_PAGE_SIZE as usize {
+            self.reached_start.insert(channel_id.to_string());
+        } else {
+            self.reached_start.remove(channel_id);
+        }
+    }
+
+    pub fn rows_for(&mut self, channel_id: &str) -> std::sync::Arc<crate::message_rows::ChannelRows> {
+        let today = crate::timefmt::local_today();
+        let format = crate::timefmt::TimeFormat::resolve(self.clock_24h);
+        if let Some(rows) = self.message_rows.get(channel_id).filter(|rows| !rows.is_stale(today, format)) {
+            return rows.clone();
+        }
+        let messages = self.messages.get(channel_id).map(Vec::as_slice).unwrap_or(&[]);
+        let me = self.current_user.as_ref().map(|u| u.id.as_str()).unwrap_or_default();
+        let peer = self
+            .dm_channels
+            .iter()
+            .find(|c| c.id == channel_id && c.kind == ChannelType::Dm)
+            .and_then(|c| c.recipients.first())
+            .map(|u| u.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&u.username));
+        let rows = std::sync::Arc::new(crate::message_rows::ChannelRows::build(messages, &chrono::Local, today, format, me, peer));
+        self.message_rows.insert(channel_id.to_string(), rows.clone());
+        rows
     }
 
     pub fn last_message_timestamp(&self, channel_id: &str) -> Option<&str> {
@@ -917,9 +1122,21 @@ impl AppState {
     }
 
     pub fn dm_display_name(dm: &Channel) -> String {
+        if dm.kind == ChannelType::GroupDm {
+            if let Some(name) = dm.name.as_deref().filter(|name| !name.trim().is_empty()) {
+                return name.to_string();
+            }
+            let participants = dm.recipients.iter()
+                .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
+                .collect::<Vec<_>>();
+            if !participants.is_empty() {
+                return participants.join(", ");
+            }
+        }
         dm.recipients
             .first()
             .map(|u| u.global_name.clone().unwrap_or_else(|| u.username.clone()))
+            .or_else(|| dm.name.clone().filter(|name| !name.trim().is_empty()))
             .unwrap_or_else(|| dm.id.clone())
     }
 
@@ -928,7 +1145,14 @@ impl AppState {
         let mut dms: Vec<&Channel> = self
             .dm_channels
             .iter()
-            .filter(|dm| query.is_empty() || Self::dm_display_name(dm).to_lowercase().contains(&query))
+            .filter(|dm| {
+                query.is_empty()
+                    || Self::dm_display_name(dm).to_lowercase().contains(&query)
+                    || dm.recipients.iter().any(|u| {
+                        u.username.to_lowercase().contains(&query)
+                            || u.global_name.as_deref().is_some_and(|name| name.to_lowercase().contains(&query))
+                    })
+            })
             .collect();
         dms.sort_by_key(|dm| {
             std::cmp::Reverse(dm.last_message_id.as_deref().map(snowflake_value).unwrap_or(0))
@@ -958,6 +1182,9 @@ impl AppState {
             denoise: self.denoise,
             user_volumes: self.user_volumes.clone(),
             keybinds: self.keybinds.to_map(),
+            clock_24h: self.clock_24h,
+            self_mute: self.self_muted,
+            self_deaf: self.self_deafened,
             ..Default::default()
         }
     }
@@ -1001,6 +1228,20 @@ impl AppState {
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
         if let Some(user) = voice_state.member.as_ref().and_then(|m| m.user.clone()) {
             self.known_users.insert(voice_state.user_id.clone(), user);
+        }
+        #[cfg(feature = "screenshare")]
+        {
+            if voice_state.channel_id.is_none() || voice_state.self_stream == Some(false) {
+                self.active_streams.remove(&voice_state.user_id);
+                if self.unwatching_stream.as_deref().is_some_and(|key| key.ends_with(&format!(":{}", voice_state.user_id))) {
+                    self.unwatching_stream = None;
+                }
+            } else if voice_state.self_stream == Some(true) {
+                if let (Some(guild_id), Some(channel_id)) = (&voice_state.guild_id, &voice_state.channel_id) {
+                    let stream_key = format!("guild:{guild_id}:{channel_id}:{}", voice_state.user_id);
+                    self.active_streams.insert(voice_state.user_id.clone(), stream_key);
+                }
+            }
         }
         let Some(guild_id) = voice_state.guild_id.clone().or_else(|| voice_state.channel_id.clone()) else {
             for states in self.voice_channel_states.values_mut() {
@@ -1228,6 +1469,7 @@ mod tests {
             discriminator: "0".into(),
             avatar: None,
             bot: false,
+            primary_guild: None,
         }
     }
 
@@ -1297,6 +1539,81 @@ mod tests {
     }
 
     #[test]
+    fn switching_channels_keeps_each_draft() {
+        let mut state = AppState::default();
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        state.compose_buf = "half written".into();
+        state.selected_channel = Some("b".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "");
+        state.compose_buf = "other".into();
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "half written");
+        state.selected_channel = Some("b".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "other");
+    }
+
+    #[test]
+    fn switching_away_mid_edit_keeps_the_draft_not_the_edit() {
+        let mut state = AppState::default();
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        state.compose_buf = "editing text".into();
+        state.editing = Some(("m1".into(), "my draft".into()));
+        state.selected_channel = Some("b".into());
+        state.sync_draft_channel();
+        assert!(state.editing.is_none());
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "my draft");
+    }
+
+    #[test]
+    fn dm_placeholders_use_the_display_name() {
+        let mut state = AppState::default();
+        let mut dm = test_channel("dm", "dm");
+        dm.kind = ChannelType::Dm;
+        dm.recipients = vec![test_user("2", "olbiaphleet", Some("lunatest"))];
+        state.dm_channels.push(dm);
+        state.selected_channel = Some("dm".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_placeholder, "Message @lunatest");
+    }
+
+    #[test]
+    fn deafening_mutes_and_undeafening_restores_the_previous_mute() {
+        let mut state = AppState::default();
+        state.toggle_deafen();
+        assert!(state.self_deafened && state.self_muted);
+        state.toggle_deafen();
+        assert!(!state.self_deafened && !state.self_muted);
+
+        state.toggle_mute();
+        state.toggle_deafen();
+        state.toggle_deafen();
+        assert!(state.self_muted && !state.self_deafened);
+    }
+
+    #[test]
+    fn unmuting_while_deafened_undeafens_too() {
+        let mut state = AppState::default();
+        state.toggle_deafen();
+        state.toggle_mute();
+        assert!(!state.self_muted && !state.self_deafened);
+    }
+
+    #[test]
+    fn mute_state_round_trips_through_settings() {
+        let mut state = AppState::default();
+        state.toggle_deafen();
+        let saved = state.audio_settings();
+        assert!(saved.self_mute && saved.self_deaf);
+    }
+
+    #[test]
     fn a_remote_mention_count_is_adopted() {
         let mut state = AppState::default();
         state.apply_remote_read_state(&[remote_with_mentions("c", "100", 4)]);
@@ -1355,6 +1672,7 @@ mod tests {
             parent_id: None,
             recipients: Vec::new(),
             last_message_id: Some("999".into()),
+            icon: None,
             permission_overwrites: Vec::new(),
         }
     }
@@ -1374,6 +1692,7 @@ mod tests {
             parent_id: None,
             recipients: Vec::new(),
             last_message_id: None,
+            icon: None,
             permission_overwrites: Vec::new(),
         }
     }
@@ -1661,8 +1980,10 @@ mod tests {
                 discriminator: "0".into(),
                 avatar: None,
                 bot: false,
+                primary_guild: None,
             }],
             last_message_id: None,
+            icon: None,
             permission_overwrites: Vec::new(),
         });
 

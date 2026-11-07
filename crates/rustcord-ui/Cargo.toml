@@ -50,6 +50,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 open = "5"
 notify-rust = "4"
 chrono = "0.4"
+resvg = { version = "0.45", default-features = false }
 arboard = { version = "3", features = ["wayland-data-control"] }
 
 [dev-dependencies]
@@ -58,3 +59,4 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 [features]
 default = []
 video = ["dep:ffmpeg-next", "dep:cpal"]
+screenshare = ["rustcord-client/screenshare", "video"]

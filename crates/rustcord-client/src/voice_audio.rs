@@ -342,10 +342,58 @@ pub fn play_ringtone(stop: Arc<AtomicBool>) {
 }
 
 pub fn play_notification_sound() {
-    let stop = Arc::new(AtomicBool::new(false));
-    play_ringtone(stop.clone());
-    std::thread::sleep(std::time::Duration::from_millis(850));
-    stop.store(true, Ordering::Relaxed);
+    std::thread::spawn(|| {
+        let host = audio_host();
+        let Some(device) = find_device(&host, None, false) else { return };
+        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
+        let first_note = SAMPLE_RATE as u64 * 85 / 1000;
+        let gap = SAMPLE_RATE as u64 * 35 / 1000;
+        let second_note = SAMPLE_RATE as u64 * 85 / 1000;
+        let total = first_note + gap + second_note;
+        let fade = SAMPLE_RATE as u64 * 5 / 1000;
+        let mut sample_index = 0u64;
+        let finished = Arc::new(AtomicBool::new(false));
+        let callback_finished = finished.clone();
+        let Ok(stream) = device.build_output_stream(
+            config,
+            move |out: &mut [i16], _| {
+                for sample in out.iter_mut() {
+                    let index = sample_index;
+                    sample_index = sample_index.saturating_add(1);
+                    let (frequency, note_index, note_len) = if index < first_note {
+                        (660.0, index, first_note)
+                    } else if index < first_note + gap {
+                        (0.0, 0, 0)
+                    } else if index < total {
+                        (880.0, index - first_note - gap, second_note)
+                    } else {
+                        callback_finished.store(true, Ordering::Relaxed);
+                        (0.0, 0, 0)
+                    };
+                    if frequency == 0.0 {
+                        *sample = 0;
+                        continue;
+                    }
+                    let envelope = (note_index as f32 / fade as f32)
+                        .min((note_len - note_index) as f32 / fade as f32)
+                        .clamp(0.0, 1.0);
+                    let phase = note_index as f32 * frequency * std::f32::consts::TAU / SAMPLE_RATE as f32;
+                    *sample = (phase.sin() * 3200.0 * envelope) as i16;
+                }
+            },
+            |e: cpal::Error| tracing::warn!("notification stream error: {e}"),
+            None,
+        ) else {
+            return;
+        };
+        if stream.play().is_err() {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while !finished.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
 }
 
 pub fn run_mic_test(input_device: Option<String>, output_device: Option<String>, duration: std::time::Duration) {

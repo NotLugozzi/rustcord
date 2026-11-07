@@ -11,6 +11,10 @@ use str0m::{Candidate, Event, IceConnectionState, IceCreds, Input, Output, Rtc, 
 use tokio::net::UdpSocket;
 
 pub const OPUS_PT: u8 = 120;
+#[cfg(feature = "screenshare")]
+const VP8_PT: u8 = 107;
+#[cfg(feature = "screenshare")]
+const H264_PT: u8 = 105;
 const OPUS_FRAME_SAMPLES: u32 = 960;
 
 #[derive(Default, Clone)]
@@ -25,6 +29,8 @@ pub enum RtcEvent {
     Connected,
     Disconnected,
     AudioData { ssrc: u32, payload: Vec<u8> },
+    #[cfg(feature = "screenshare")]
+    VideoData { ssrc: u32, payload: Vec<u8> },
 }
 
 pub struct VoiceRtc {
@@ -32,7 +38,15 @@ pub struct VoiceRtc {
     socket: std::sync::Arc<UdpSocket>,
     audio_mid: Mid,
     audio_ssrc: Ssrc,
+    #[cfg(feature = "screenshare")]
+    video_mid: Mid,
+    #[cfg(feature = "screenshare")]
+    video_ssrc: Ssrc,
+    #[cfg(feature = "screenshare")]
+    video_rtx_ssrc: Ssrc,
     remote_audio_mids: Vec<(Mid, u32)>,
+    #[cfg(feature = "screenshare")]
+    remote_video_mids: Vec<(Mid, u32)>,
     rtp_timestamp: u32,
     rtp_packets_sent: u64,
     rtp_packets_received: u64,
@@ -42,11 +56,27 @@ pub struct VoiceRtc {
 }
 
 impl VoiceRtc {
-    pub async fn new() -> Result<(Self, LocalIceParams), ClientError> {
+    pub async fn new(
+        ready_audio_ssrc: Option<u32>,
+        ready_video_ssrcs: Option<(u32, u32)>,
+    ) -> Result<(Self, LocalIceParams), ClientError> {
+        #[cfg(not(feature = "screenshare"))]
+        let _ = ready_video_ssrcs;
         let mut config = RtcConfig::new().clear_codecs();
         config
             .codec_config()
             .add_config(Pt::from(OPUS_PT), None, Codec::Opus, Frequency::FORTY_EIGHT_KHZ, Some(2), Default::default());
+        #[cfg(feature = "screenshare")]
+        config.codec_config().add_config(
+            Pt::from(VP8_PT),
+            Some(Pt::from(108)),
+            Codec::Vp8,
+            Frequency::NINETY_KHZ,
+            None,
+            Default::default(),
+        );
+        #[cfg(feature = "screenshare")]
+        config.codec_config().add_h264(Pt::from(105), Some(Pt::from(106)), true, 0x42e033);
         let mut rtc = config.set_stats_interval(Some(std::time::Duration::from_secs(1))).build(Instant::now());
 
         let local_ice = {
@@ -65,9 +95,22 @@ impl VoiceRtc {
         let audio_ssrc = {
             let mut api = rtc.direct_api();
             api.declare_media(audio_mid, MediaKind::Audio);
-            let ssrc = api.new_ssrc();
+            let ssrc = ready_audio_ssrc.map(Ssrc::from).unwrap_or_else(|| api.new_ssrc());
             api.declare_stream_tx(ssrc, None, audio_mid, None);
             ssrc
+        };
+
+        #[cfg(feature = "screenshare")]
+        let (video_mid, video_ssrc, video_rtx_ssrc) = {
+            let mid = Mid::new();
+            let mut api = rtc.direct_api();
+            api.declare_media(mid, MediaKind::Video);
+            let (ssrc, rtx_ssrc) = ready_video_ssrcs
+                .map(|(ssrc, rtx)| (Ssrc::from(ssrc), Ssrc::from(rtx)))
+                .unwrap_or_else(|| (api.new_ssrc(), api.new_ssrc()));
+            let rid = str0m::media::Rid::from("100");
+            api.declare_stream_tx(ssrc, Some(rtx_ssrc), mid, Some(rid));
+            (mid, ssrc, rtx_ssrc)
         };
 
         let socket = std::sync::Arc::new(
@@ -76,11 +119,66 @@ impl VoiceRtc {
                 .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: udp bind failed: {e}")))?,
         );
 
-        Ok((Self { rtc, socket, audio_mid, audio_ssrc, remote_audio_mids: Vec::new(), rtp_timestamp: 0, rtp_packets_sent: 0, rtp_packets_received: 0, media_data_events: 0, stats: RtcStats::default(), jitter_by_mid: Default::default() }, local_ice))
+        Ok((Self {
+            rtc,
+            socket,
+            audio_mid,
+            audio_ssrc,
+            #[cfg(feature = "screenshare")]
+            video_mid,
+            #[cfg(feature = "screenshare")]
+            video_ssrc,
+            #[cfg(feature = "screenshare")]
+            video_rtx_ssrc,
+            remote_audio_mids: Vec::new(),
+            #[cfg(feature = "screenshare")]
+            remote_video_mids: Vec::new(),
+            rtp_timestamp: 0,
+            rtp_packets_sent: 0,
+            rtp_packets_received: 0,
+            media_data_events: 0,
+            stats: RtcStats::default(),
+            jitter_by_mid: Default::default(),
+        }, local_ice))
     }
 
     pub fn audio_ssrc(&self) -> u32 {
         *self.audio_ssrc
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn video_ssrc(&self) -> u32 {
+        *self.video_ssrc
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn video_rtx_ssrc(&self) -> u32 {
+        *self.video_rtx_ssrc
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn send_video_frame(
+        &mut self,
+        frame: &crate::screen_encode::EncodedFrame,
+        codec: crate::screen_encode::VideoCodec,
+    ) -> Result<(), ClientError> {
+        let media_time = MediaTime::new(frame.timestamp as u64, Frequency::NINETY_KHZ);
+        let writer = self
+            .rtc
+            .writer(self.video_mid)
+            .ok_or_else(|| ClientError::GatewayClosed("voice rtc: no writer for video mid".into()))?;
+        writer
+            .rid(str0m::media::Rid::from("100"))
+            .write(
+                Pt::from(match codec {
+                    crate::screen_encode::VideoCodec::Vp8 => VP8_PT,
+                    crate::screen_encode::VideoCodec::H264 => H264_PT,
+                }),
+                Instant::now(),
+                media_time,
+                frame.data.clone(),
+            )
+            .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: video write failed: {e}")))
     }
 
     pub fn expect_remote_audio(&mut self, ssrc: u32) {
@@ -90,6 +188,29 @@ impl VoiceRtc {
         api.declare_media(mid, MediaKind::Audio);
         api.expect_stream_rx(Ssrc::from(ssrc), None, mid, None);
         self.remote_audio_mids.push((mid, ssrc));
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn expect_remote_video(&mut self, ssrc: u32) {
+        if self.remote_video_mids.iter().any(|(_, existing)| *existing == ssrc) {
+            return;
+        }
+        let mid = Mid::new();
+        let mut api = self.rtc.direct_api();
+        api.declare_media(mid, MediaKind::Video);
+        api.expect_stream_rx(Ssrc::from(ssrc), None, mid, None);
+        self.remote_video_mids.push((mid, ssrc));
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn forget_remote_video(&mut self, ssrc: u32) {
+        let Some(index) = self.remote_video_mids.iter().position(|(_, existing)| *existing == ssrc) else {
+            return;
+        };
+        let (mid, _) = self.remote_video_mids.remove(index);
+        let mut api = self.rtc.direct_api();
+        api.remove_stream_rx(Ssrc::from(ssrc));
+        api.remove_media(mid);
     }
 
     pub fn forget_remote_audio(&mut self, ssrc: u32) {
@@ -201,6 +322,10 @@ impl VoiceRtc {
                         }
                         if let Some((_, ssrc)) = self.remote_audio_mids.iter().find(|(mid, _)| *mid == data.mid) {
                             return Ok(PollOutcome::Event(RtcEvent::AudioData { ssrc: *ssrc, payload: data.data.to_vec() }));
+                        }
+                        #[cfg(feature = "screenshare")]
+                        if let Some((_, ssrc)) = self.remote_video_mids.iter().find(|(mid, _)| *mid == data.mid) {
+                            return Ok(PollOutcome::Event(RtcEvent::VideoData { ssrc: *ssrc, payload: data.data.to_vec() }));
                         }
                         tracing::warn!(
                             "voice rtc: MediaData for unregistered mid {:?}, {} bytes; known mids {:?}",

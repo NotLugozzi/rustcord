@@ -24,8 +24,13 @@ pub fn build_offer(ice: &LocalIceParams) -> String {
          a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/color-space\n\
          a=extmap:10 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\n\
          a=extmap:11 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\n\
-         a=rtpmap:96 VP8/90000\n\
-         a=rtpmap:97 rtx/90000\n",
+         a=rtpmap:105 H264/90000\n\
+         a=fmtp:105 packetization-mode=1;profile-level-id=42e033;level-asymmetry-allowed=1\n\
+         a=rtpmap:106 rtx/90000\n\
+         a=fmtp:106 apt=105\n\
+         a=rtpmap:107 VP8/90000\n\
+         a=rtpmap:108 rtx/90000\n\
+         a=fmtp:108 apt=107\n",
         ice.ufrag, ice.pwd, ice.fingerprint
     )
 }

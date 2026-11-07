@@ -20,4 +20,6 @@ pub enum ClientError {
     MalformedToken,
     #[error("search index not ready, retry in {retry_after}s")]
     NotIndexed { retry_after: f64 },
+    #[error("screen capture failed: {0}")]
+    ScreenCapture(String),
 }

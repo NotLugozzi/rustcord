@@ -19,6 +19,10 @@ pub struct Theme {
     pub mention_badge: Option<[f32; 4]>,
     #[serde(default)]
     pub gradient: Option<[[f32; 4]; 2]>,
+    #[serde(default)]
+    pub call_active: Option<[f32; 4]>,
+    #[serde(default)]
+    pub call_missed: Option<[f32; 4]>,
 }
 
 fn darken(color: [f32; 4], factor: f32) -> [f32; 4] {
@@ -40,6 +44,8 @@ impl Default for Theme {
             border: [0.133, 0.141, 0.153, 1.0],  
             mention_badge: None,
             gradient: None,
+            call_active: None,
+            call_missed: None,
         }
     }
 }
@@ -47,6 +53,14 @@ impl Default for Theme {
 impl Theme {
     pub fn mention_badge(&self) -> [f32; 4] {
         self.mention_badge.unwrap_or([0.925, 0.259, 0.278, 1.0])
+    }
+
+    pub fn call_active(&self) -> [f32; 4] {
+        self.call_active.unwrap_or([0.14, 0.65, 0.37, 1.0])
+    }
+
+    pub fn call_missed(&self) -> [f32; 4] {
+        self.call_missed.unwrap_or(self.text_muted)
     }
 
     pub fn servers_bg(&self) -> [f32; 4] {

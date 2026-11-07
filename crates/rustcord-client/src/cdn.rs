@@ -22,6 +22,10 @@ pub fn guild_icon_url(guild: &Guild, size: u32) -> Option<String> {
     Some(format!("{CDN_BASE}/icons/{}/{hash}.{ext}?size={size}", guild.id))
 }
 
+pub fn channel_icon_url(channel_id: &str, hash: &str, size: u32) -> String {
+    format!("{CDN_BASE}/channel-icons/{channel_id}/{hash}.png?size={size}")
+}
+
 pub fn custom_emoji_url(emoji: &Emoji, size: u32) -> String {
     let ext = if emoji.animated { "gif" } else { "png" };
     format!("{CDN_BASE}/emojis/{}.{ext}?size={size}", emoji.id)

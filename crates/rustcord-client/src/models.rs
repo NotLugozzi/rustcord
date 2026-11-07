@@ -8,10 +8,84 @@ pub struct User {
     pub id: Snowflake,
     pub username: String,
     pub discriminator: String,
+    #[serde(default, deserialize_with = "non_blank_string")]
     pub global_name: Option<String>,
     pub avatar: Option<String>,
     #[serde(default)]
     pub bot: bool,
+    #[serde(default)]
+    pub primary_guild: Option<PrimaryGuild>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PrimaryGuild {
+    pub identity_guild_id: Option<Snowflake>,
+    #[serde(default)]
+    pub identity_enabled: Option<bool>,
+    pub tag: Option<String>,
+    pub badge: Option<String>,
+}
+
+impl PrimaryGuild {
+    pub fn visible_tag(&self) -> Option<&str> {
+        if self.identity_enabled != Some(true) {
+            return None;
+        }
+        self.tag.as_deref().filter(|t| !t.is_empty())
+    }
+
+    pub fn badge_url(&self, size: u32) -> Option<String> {
+        let guild_id = self.identity_guild_id.as_deref()?;
+        let badge = self.badge.as_deref()?;
+        Some(format!("https://cdn.discordapp.com/guild-tag-badges/{guild_id}/{badge}.png?size={size}"))
+    }
+}
+
+fn non_blank_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|s| !s.trim().is_empty()))
+}
+
+impl User {
+    pub fn display_name(&self) -> &str {
+        self.global_name.as_deref().unwrap_or(&self.username)
+    }
+
+    pub fn server_tag(&self) -> Option<&PrimaryGuild> {
+        self.primary_guild.as_ref().filter(|g| g.visible_tag().is_some())
+    }
+}
+
+#[cfg(test)]
+mod user_tests {
+    use super::*;
+
+    fn user(json: serde_json::Value) -> User {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_blank_display_name_falls_back_to_the_username() {
+        let u = user(serde_json::json!({ "id": "1", "username": "olbiaphleet", "discriminator": "0", "global_name": "  ", "avatar": null }));
+        assert_eq!(u.display_name(), "olbiaphleet");
+        let u = user(serde_json::json!({ "id": "1", "username": "olbiaphleet", "discriminator": "0", "avatar": null }));
+        assert_eq!(u.display_name(), "olbiaphleet");
+    }
+
+    #[test]
+    fn server_tags_only_show_when_identity_is_enabled() {
+        let tagged = |enabled: bool| {
+            user(serde_json::json!({
+                "id": "1", "username": "luna", "discriminator": "0", "avatar": null,
+                "primary_guild": { "identity_guild_id": "9", "identity_enabled": enabled, "tag": "BCAN", "badge": "abc" }
+            }))
+        };
+        assert_eq!(tagged(true).server_tag().and_then(|g| g.visible_tag()), Some("BCAN"));
+        assert!(tagged(false).server_tag().is_none());
+        assert_eq!(
+            tagged(true).server_tag().and_then(|g| g.badge_url(16)).as_deref(),
+            Some("https://cdn.discordapp.com/guild-tag-badges/9/abc.png?size=16")
+        );
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -21,6 +95,46 @@ pub struct Guild {
     pub icon: Option<String>,
     #[serde(default)]
     pub unavailable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Invite {
+    pub code: String,
+    #[serde(default)]
+    pub guild: Option<InviteGuild>,
+    #[serde(default)]
+    pub channel: Option<InviteChannel>,
+    #[serde(default)]
+    pub approximate_member_count: Option<u64>,
+    #[serde(default)]
+    pub approximate_presence_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InviteGuild {
+    pub id: Snowflake,
+    pub name: String,
+    pub icon: Option<String>,
+}
+
+impl InviteGuild {
+    pub fn to_guild(&self) -> Guild {
+        Guild { id: self.id.clone(), name: self.name.clone(), icon: self.icon.clone(), unavailable: false }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InviteChannel {
+    pub id: Snowflake,
+    pub name: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: ChannelType,
+}
+
+impl InviteChannel {
+    pub fn is_voice(&self) -> bool {
+        matches!(self.kind, ChannelType::GuildVoice | ChannelType::GuildStageVoice)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -103,6 +217,8 @@ pub struct VoiceState {
     #[serde(default)]
     pub self_deaf: bool,
     #[serde(default)]
+    pub self_stream: Option<bool>,
+    #[serde(default)]
     pub mute: bool,
     #[serde(default)]
     pub deaf: bool,
@@ -143,6 +259,8 @@ pub struct Channel {
     #[serde(default)]
     pub recipients: Vec<User>,
     pub last_message_id: Option<Snowflake>,
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub permission_overwrites: Vec<PermissionOverwrite>,
 }
@@ -303,6 +421,17 @@ pub struct Message {
     pub kind: u8,
     #[serde(default)]
     pub call: Option<CallInfo>,
+    #[serde(default)]
+    pub webhook_id: Option<Snowflake>,
+    #[serde(default)]
+    pub message_reference: Option<MessageReference>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageReference {
+    pub message_id: Option<Snowflake>,
+    pub channel_id: Option<Snowflake>,
+    pub guild_id: Option<Snowflake>,
 }
 
 fn lenient_embeds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Embed>, D::Error> {
@@ -481,6 +610,16 @@ pub struct Activity {
     pub application_id: Option<String>,
     #[serde(default)]
     pub assets: Option<ActivityAssets>,
+    #[serde(default)]
+    pub emoji: Option<ActivityEmoji>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ActivityEmoji {
+    pub name: Option<String>,
+    pub id: Option<Snowflake>,
+    #[serde(default)]
+    pub animated: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

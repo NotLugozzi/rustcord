@@ -200,7 +200,7 @@ impl AppWindow {
         };
         let renderer = Renderer::new(&mut context, &device, &queue, renderer_config);
 
-        let mut imgui = ImguiState {
+        let imgui = ImguiState {
             context,
             platform,
             renderer,
@@ -209,10 +209,7 @@ impl AppWindow {
             fonts,
         };
 
-        let mut textures = TextureCache::default();
-        for (ch, bytes) in crate::emoji::BUNDLED {
-            textures.ingest(crate::emoji::url(*ch), crate::images::decode(bytes), &device, &queue, &mut imgui.renderer);
-        }
+        let textures = TextureCache::default();
 
         Self {
             device,
@@ -236,8 +233,16 @@ impl AppWindow {
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
         let media = drain_backend_events(state, event_rx, cmd_tx);
+        self.textures.sync_icons(self.window.scale_factor() as f32, &self.device, &self.queue, &mut self.imgui.renderer);
         for (url, image) in media.images {
             self.textures.ingest(url, image, &self.device, &self.queue, &mut self.imgui.renderer);
+        }
+        #[cfg(feature = "screenshare")]
+        {
+            for (user_id, image) in media.remote_videos {
+                self.textures.ingest_live_video(user_id, &image, &self.device, &self.queue, &mut self.imgui.renderer);
+            }
+            self.textures.expire_live_videos(&mut self.imgui.renderer);
         }
         #[cfg(feature = "video")]
         {
@@ -359,6 +364,13 @@ impl ApplicationHandler for App {
                 self.state.window_focused = *focused;
                 self.needs_redraw = true;
             }
+            WindowEvent::DroppedFile(path) => {
+                if self.state.selected_channel.is_some() {
+                    self.state.pending_attachment = Some(path.clone());
+                    self.state.focus_compose = true;
+                }
+                self.needs_redraw = true;
+            }
             _ => {
                 self.last_input = Instant::now();
                 self.needs_redraw = true;
@@ -405,7 +417,7 @@ impl ApplicationHandler for App {
         rustcord_client::captcha::pump_main_thread();
         let Some(window) = self.window.as_mut() else { return };
         let active = self.last_input.elapsed() < Duration::from_millis(400);
-        let animating = window.textures.animating;
+        let animating = window.textures.animating || window.textures.has_wanted_icons();
         let typing = self.state.selected_channel.as_deref().is_some_and(|channel| {
             self.state.typing_users_for(channel).iter().any(|id| self.state.current_user.as_ref().is_none_or(|me| me.id != *id))
         });
@@ -413,7 +425,8 @@ impl ApplicationHandler for App {
             self.needs_redraw = true;
         }
         self.typing_active = typing;
-        if self.needs_redraw || active || animating || typing || !self.event_rx.is_empty() {
+        let uploading = !self.state.uploads.is_empty();
+        if self.needs_redraw || active || animating || typing || uploading || !self.event_rx.is_empty() {
             window.window.request_redraw();
             self.needs_redraw = false;
         }

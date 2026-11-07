@@ -28,6 +28,9 @@ pub enum GatewayEvent {
     ReactionRemoveAll { channel_id: String, message_id: String },
     VoiceStateUpdate(VoiceState),
     VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
+    StreamCreate { stream_key: String, rtc_server_id: String, rtc_channel_id: String },
+    StreamServerUpdate { stream_key: String, token: String, endpoint: Option<String> },
+    StreamDelete { stream_key: String },
     InitialVoiceStates(Vec<VoiceState>),
     GuildCreate { guild_id: String, roles: Vec<Role>, member_roles: Vec<(String, Vec<String>)> },
     GuildMembersChunk { guild_id: String, members: Vec<GuildMember>, presences: Vec<Presence> },
@@ -443,7 +446,39 @@ impl Gateway {
                 guild_id: data["guild_id"].as_str().or(data["channel_id"].as_str()).unwrap_or_default().to_string(),
                 endpoint: data["endpoint"].as_str().map(str::to_string),
             },
-            Some(other) => GatewayEvent::Unknown { op_name: other.to_string(), raw: data },
+            Some("STREAM_CREATE") => {
+                let id = |key: &str| data[key].as_str().map(str::to_string)
+                    .or_else(|| data[key].as_u64().map(|value| value.to_string()))
+                    .unwrap_or_default();
+                let stream_key = id("stream_key");
+                let rtc_server_id = id("rtc_server_id");
+                let rtc_channel_id = id("rtc_channel_id");
+                tracing::info!(
+                    has_stream_key = !stream_key.is_empty(),
+                    has_rtc_server_id = !rtc_server_id.is_empty(),
+                    has_rtc_channel_id = !rtc_channel_id.is_empty(),
+                    "received STREAM_CREATE"
+                );
+                GatewayEvent::StreamCreate {
+                    stream_key,
+                    rtc_server_id,
+                    rtc_channel_id,
+                }
+            }
+            Some("STREAM_SERVER_UPDATE") => GatewayEvent::StreamServerUpdate {
+                stream_key: data["stream_key"].as_str().unwrap_or_default().to_string(),
+                token: data["token"].as_str().unwrap_or_default().to_string(),
+                endpoint: data["endpoint"].as_str().map(str::to_string),
+            },
+            Some("STREAM_DELETE") => GatewayEvent::StreamDelete {
+                stream_key: data["stream_key"].as_str().unwrap_or_default().to_string(),
+            },
+            Some(other) => {
+                if other.starts_with("STREAM_") {
+                    tracing::warn!(event = other, "unhandled stream gateway dispatch");
+                }
+                GatewayEvent::Unknown { op_name: other.to_string(), raw: data }
+            }
             None => return Ok(()),
         };
         let _ = tx.send(event);

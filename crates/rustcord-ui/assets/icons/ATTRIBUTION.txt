@@ -1,0 +1,48 @@
+UI icons are from Lucide (https://lucide.dev), lucide-static v0.460.0, licensed
+under the ISC License (see LICENSE-lucide.txt). Fetched unmodified from
+https://unpkg.com/lucide-static@0.460.0/icons/<name>.svg
+
+Icon file            Used for
+audio-waveform.svg   noise suppression toggle
+chevron-down.svg     device dropdowns (user panel)
+circle-plus.svg      attach a file (composer)
+circle-help.svg      unsupported system message fallback
+file-text.svg        text/document attachments
+film.svg             video attachments
+folder.svg           other attachments
+gif.svg              GIF picker (composer) - ORIGINAL ARTWORK, not Lucide; MIT like the project
+headphone-off.svg    deafened (controls, voice member badge)
+headphones.svg       deafen toggle
+image.svg            channel icon change rows
+info.svg             connection info
+maximize.svg         video fullscreen
+message-circle.svg   About page logo
+mic-off.svg          muted (controls, voice member badge)
+mic.svg              mute toggle
+monitor-up.svg       screen sharing
+music.svg            audio attachments
+package.svg          archive attachments
+pause.svg            video pause
+pencil.svg           channel name change rows
+phone-call.svg       ongoing call rows
+phone-missed.svg     missed call rows
+phone-off.svg        disconnect / hang up
+phone.svg            completed call rows, start voice call
+pin.svg              pinned message rows, pinned messages popover
+play.svg             video play
+rotate-ccw.svg       video replay
+search.svg           search
+settings.svg         user settings
+smile.svg            emoji picker (composer)
+sticker.svg          sticker picker (composer)
+user-minus.svg       member removed / left rows
+user-plus.svg        member added / joined rows, add friends to DM
+user-round.svg       user profile panel toggle
+users.svg            member list
+video.svg            video call
+volume-2.svg         video volume, voice channels
+volume-x.svg         video muted
+x.svg                close settings
+
+The artwork uses stroke="currentColor"; the renderer rasterizes it as a white
+alpha mask (resvg) and tints it from theme colors at draw time.

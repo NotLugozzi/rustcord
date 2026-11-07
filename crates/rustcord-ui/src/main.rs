@@ -3,16 +3,20 @@ mod build_info;
 mod backend;
 mod clipboard;
 mod emoji;
+mod icons;
 mod images;
+mod invites;
 mod ipc;
 mod keybinds;
 mod markdown;
+mod message_rows;
 mod presence;
 mod renderer;
 mod session_store;
 mod settings;
 mod switcher;
 mod theme;
+mod timefmt;
 mod ui;
 #[cfg(feature = "video")]
 mod video;
@@ -58,6 +62,9 @@ fn main() {
         notes: app_state::load_notes(),
         mic_gain: saved_settings.mic_gain.unwrap_or(1.0),
         denoise: saved_settings.denoise,
+        share_system_audio: true,
+        screen_share_max_height: 1080,
+        screen_share_fps: 30,
         user_volumes: saved_settings.user_volumes,
         selected_input_device: saved_settings.input_device,
         selected_output_device: saved_settings.output_device,
@@ -65,6 +72,9 @@ fn main() {
         rail_folders,
         rail_order,
         last_read_message_id: app_state::load_read_state(),
+        clock_24h: saved_settings.clock_24h,
+        self_muted: saved_settings.self_mute || saved_settings.self_deaf,
+        self_deafened: saved_settings.self_deaf,
         ..Default::default()
     };
     theme::Theme::install_bundled();
@@ -131,6 +141,9 @@ pub fn drain_backend_events(
                 if let Some(user) = user {
                     state.known_users.insert(user_id.clone(), user);
                 }
+                let mutual = profile.mutual_guild_ids.len();
+                let label = format!("{mutual} Mutual Server{}", if mutual == 1 { "" } else { "s" });
+                state.mutual_server_labels.insert(user_id.clone(), label);
                 state.profiles.insert(user_id, profile);
             }
             BackendEvent::RpcApps(apps) => {
@@ -186,7 +199,7 @@ pub fn drain_backend_events(
             }
             BackendEvent::MessagesAroundLoaded { channel_id, message_id, messages } => {
                 state.set_message_history(channel_id.clone(), messages);
-                state.history_exhausted.remove(&channel_id);
+                state.reached_start.remove(&channel_id);
                 state.scroll_to_message = Some(message_id);
                 state.viewing_jumped_history = true;
             }
@@ -220,23 +233,10 @@ pub fn drain_backend_events(
                 state.presences.insert(presence.user.id.clone(), presence);
             }
             BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call }) => {
-                if let Some(msg) = state.messages.get_mut(&channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) {
-                    let msg = std::sync::Arc::make_mut(msg);
-                    if let Some(content) = content {
-                        msg.content = content;
-                    }
-                    if edited_timestamp.is_some() {
-                        msg.edited_timestamp = edited_timestamp;
-                    }
-                    if call.is_some() {
-                        msg.call = call;
-                    }
-                }
+                state.update_message(&channel_id, &id, content, edited_timestamp, call);
             }
             BackendEvent::Gateway(GatewayEvent::MessageDelete { channel_id, id }) => {
-                if let Some(list) = state.messages.get_mut(&channel_id) {
-                    list.retain(|m| m.id != id);
-                }
+                state.delete_message(&channel_id, &id);
             }
             BackendEvent::Gateway(GatewayEvent::ReactionAdd { channel_id, message_id, user_id, emoji }) => {
                 state.apply_reaction(&channel_id, &message_id, &user_id, emoji, true);
@@ -263,6 +263,30 @@ pub fn drain_backend_events(
                 state.apply_voice_state(voice_state);
             }
             BackendEvent::Gateway(GatewayEvent::VoiceServerUpdate { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::StreamCreate { stream_key, .. }) => {
+                if state.unwatching_stream.as_deref() == Some(stream_key.as_str()) {
+                    state.unwatching_stream = None;
+                }
+                if let Some(owner_id) = stream_key.rsplit(':').next() {
+                    let owner_in_voice = state.voice_channel_states.values().flatten().any(|voice| voice.user_id == owner_id);
+                    tracing::info!(owner_in_voice, "registered active screen share");
+                    state.active_streams.insert(owner_id.to_string(), stream_key);
+                }
+            }
+            BackendEvent::Gateway(GatewayEvent::StreamServerUpdate { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::StreamDelete { stream_key }) => {
+                let left_only_this_view = state.unwatching_stream.as_deref() == Some(stream_key.as_str());
+                if left_only_this_view {
+                    state.unwatching_stream = None;
+                } else {
+                    state.active_streams.retain(|_, key| key != &stream_key);
+                }
+                if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                    state.watching_stream = None;
+                    state.screen_share_stats = Default::default();
+                    state.screen_share_history.clear();
+                }
+            }
             BackendEvent::Gateway(GatewayEvent::GuildCreate { guild_id, roles, member_roles }) => {
                 state.guild_roles.insert(guild_id.clone(), roles);
                 if let Some(me) = &state.current_user {
@@ -306,16 +330,31 @@ pub fn drain_backend_events(
             }
             BackendEvent::VoiceConnected => {
                 state.voice_connecting = false;
+                state.screen_sharing = false;
             }
             BackendEvent::VoiceDisconnected => {
                 state.voice_connecting = false;
+                state.screen_sharing = false;
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
                 state.voice_speaking_users.clear();
                 state.voice_stats = Default::default();
                 state.voice_history.clear();
+                state.screen_share_stats = Default::default();
+                state.screen_share_history.clear();
                 state.show_voice_info = false;
                 state.voice_joined_at = None;
+            }
+            BackendEvent::ScreenShareStopped => {
+                state.screen_sharing = false;
+                state.screen_share_stats = Default::default();
+                state.screen_share_history.clear();
+            }
+            #[cfg(feature = "screenshare")]
+            BackendEvent::ScreenAudioSourcesLoaded { sources, error } => {
+                state.screen_audio_sources = sources;
+                state.screen_audio_sources_error = error;
+                state.screen_audio_sources_loaded = true;
             }
             BackendEvent::VoiceSpeaking { user_id, speaking } => {
                 state.set_voice_speaking(user_id, speaking);
@@ -327,9 +366,41 @@ pub fn drain_backend_events(
                 state.voice_history.push_back(stats.clone());
                 state.voice_stats = stats;
             }
+            #[cfg(feature = "screenshare")]
+            BackendEvent::ScreenShareStats(stats) => {
+                if state.screen_share_history.len() >= 120 {
+                    state.screen_share_history.pop_front();
+                }
+                state.screen_share_history.push_back(stats.clone());
+                state.screen_share_stats = stats;
+            }
             BackendEvent::VoiceDevicesLoaded { inputs, outputs } => {
                 state.voice_input_devices = inputs;
                 state.voice_output_devices = outputs;
+            }
+            BackendEvent::InviteResolved { code, result } => {
+                let state_for = match result {
+                    Ok(invite) => invites::InviteState::Ready(Box::new(invites::ResolvedInvite::new(invite))),
+                    Err(backend::InviteFailure::Invalid) => invites::InviteState::Invalid,
+                    Err(backend::InviteFailure::Unavailable) => invites::InviteState::Unavailable,
+                };
+                state.invites.insert(code, invites::InviteEntry { state: state_for, updated: std::time::Instant::now() });
+            }
+            BackendEvent::PinsLoaded { channel_id, pins } => {
+                let entry = match pins {
+                    Some(pins) => app_state::PinsState::Ready(pins),
+                    None => app_state::PinsState::Failed,
+                };
+                state.pins.insert(channel_id, entry);
+            }
+            BackendEvent::UploadFinished { upload_id } => {
+                state.uploads.retain(|u| u.id != upload_id);
+            }
+            BackendEvent::RelationshipSettled { user_id } => {
+                state.relationship_busy.remove(&user_id);
+            }
+            BackendEvent::GuildJoined(guild) => {
+                state.add_joined_guild(guild);
             }
             BackendEvent::MemberRemoved { guild_id, user_id } => {
                 if let Some(members) = state.guild_members.get_mut(&guild_id) {
@@ -364,12 +435,13 @@ pub fn drain_backend_events(
                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: newest.id.clone() });
                     }
                 }
+                state.note_history_page(&channel_id, messages.len());
                 state.set_message_history(channel_id, messages);
             }
             BackendEvent::OlderMessagesLoaded { channel_id, messages } => {
                 state.loading_older_messages = false;
-                if messages.is_empty() {
-                    state.history_exhausted.insert(channel_id.clone());
+                if messages.len() < backend::HISTORY_PAGE_SIZE as usize {
+                    state.reached_start.insert(channel_id.clone());
                 }
                 state.prepend_message_history(channel_id, messages);
             }
@@ -407,6 +479,10 @@ pub fn drain_backend_events(
             BackendEvent::ImageDownloaded { url, image } => {
                 media.images.push((url, image));
             }
+            #[cfg(feature = "screenshare")]
+            BackendEvent::RemoteVideoFrame { user_id, rgba } => {
+                media.remote_videos.push((user_id, rgba));
+            }
             #[cfg(feature = "video")]
             BackendEvent::VideoBatchReady(batch) => {
                 media.videos.push(batch);
@@ -419,6 +495,8 @@ pub fn drain_backend_events(
 #[derive(Default)]
 pub struct DrainedMedia {
     pub images: Vec<(String, images::Decoded)>,
+    #[cfg(feature = "screenshare")]
+    pub remote_videos: Vec<(String, image::RgbaImage)>,
     #[cfg(feature = "video")]
     pub videos: Vec<images::VideoBatch>,
 }

@@ -26,17 +26,31 @@ impl Fonts {
     }
 }
 
-fn format_timestamp(iso: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-        .unwrap_or_else(|_| "--:--".to_string())
+fn timestamp_text(ui: &Ui, color: [f32; 4], label: &str, full: &str, scale: f32) {
+    let token = ui.push_style_color(imgui::StyleColor::Text, color);
+    ui.set_window_font_scale(scale);
+    ui.text(label);
+    ui.set_window_font_scale(1.0);
+    token.pop();
+    if ui.is_item_hovered() {
+        ui.tooltip_text(full);
+    }
 }
 
-fn same_group_window(a: &str, b: &str) -> bool {
-    let (Ok(a), Ok(b)) = (chrono::DateTime::parse_from_rfc3339(a), chrono::DateTime::parse_from_rfc3339(b)) else {
-        return false;
-    };
-    (b - a).num_minutes().abs() < 5
+fn draw_day_divider(ui: &Ui, theme: &crate::theme::Theme, label: &str) {
+    ui.dummy([0.0, 4.0]);
+    let start = ui.cursor_screen_pos();
+    let width = ui.content_region_avail()[0];
+    ui.set_window_font_scale(0.8);
+    let text_size = ui.calc_text_size(label);
+    let line_y = start[1] + text_size[1] / 2.0;
+    let text_x = start[0] + (width - text_size[0]) / 2.0;
+    let dl = ui.get_window_draw_list();
+    dl.add_line([start[0] + 16.0, line_y], [text_x - 8.0, line_y], theme.border).thickness(1.0).build();
+    dl.add_line([text_x + text_size[0] + 8.0, line_y], [start[0] + width - 8.0, line_y], theme.border).thickness(1.0).build();
+    dl.add_text([text_x, start[1]], theme.text_muted, label);
+    ui.set_window_font_scale(1.0);
+    ui.dummy([width, text_size[1] + 8.0]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,7 +284,7 @@ fn draw_spans(
                 draw_styled_text(ui, fonts, theme, text, *style);
             }
             Span::Link { label, url } => {
-                let shown = if label == url { elide_url(label) } else { label.clone() };
+                let shown = if label == url && !crate::invites::is_invite_url(url) { elide_url(label) } else { label.clone() };
                 if clickable_text_wrapping(ui, &format!("link_{id_seed}_{block_idx}_{span_idx}"), &shown, theme.accent) {
                     let _ = open::that(url);
                 }
@@ -541,6 +555,7 @@ const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
 const SPLITTER_WIDTH: f32 = 6.0;
 const MEMBERS_PANEL_WIDTH: f32 = 240.0;
+const PROFILE_PANEL_WIDTH: f32 = 300.0;
 const SEARCH_PANEL_WIDTH: f32 = 340.0;
 
 fn draw_rail_circle(ui: &Ui, color: [f32; 4], size: [f32; 2]) {
@@ -721,6 +736,7 @@ fn draw_user_row(
     status: rustcord_client::models::PresenceStatus,
     platform: Option<&str>,
     activity: Option<&str>,
+    activity_emoji: Option<&rustcord_client::models::ActivityEmoji>,
     row_bg_color: [f32; 4],
     name_color: Option<[f32; 4]>,
 ) -> UserRowResult {
@@ -754,7 +770,8 @@ fn draw_user_row(
 
     ui.same_line();
     let text_x = ui.cursor_pos()[0];
-    let text_y = if activity.is_some() {
+    let has_subtitle = activity.is_some_and(|a| !a.is_empty()) || activity_emoji.is_some();
+    let text_y = if has_subtitle {
         row_start[1] + 3.0
     } else {
         row_start[1] + row_height / 2.0 - ui.text_line_height() / 2.0
@@ -766,6 +783,10 @@ fn draw_user_row(
         name,
         name_color.unwrap_or_else(|| ui.style_color(imgui::StyleColor::Text)),
     );
+    if let Some(tag) = user.server_tag() {
+        ui.same_line_with_spacing(0.0, 6.0);
+        draw_server_tag(ui, textures, cmd_tx, tag, tag.badge_url(32).as_deref());
+    }
     if let Some(platform) = platform {
         ui.same_line();
         let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
@@ -775,17 +796,90 @@ fn draw_user_row(
         token.pop();
     }
 
-    if let Some(activity) = activity {
+    if has_subtitle {
         ui.set_cursor_pos([text_x, text_y + ui.text_line_height()]);
+        let subtitle_size = ui.text_line_height() * 0.8;
+        if let Some(emoji) = activity_emoji {
+            draw_status_emoji(ui, textures, cmd_tx, emoji, subtitle_size);
+            ui.same_line_with_spacing(0.0, 4.0);
+        }
         let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
         ui.set_window_font_scale(0.8);
-        ui.text(activity);
+        let text = activity.unwrap_or_default();
+        let room = ui.content_region_avail()[0] - 4.0;
+        ui.text(truncate_to_width(ui, text, room).as_deref().unwrap_or(text));
         ui.set_window_font_scale(1.0);
         token.pop();
     }
 
     ui.set_cursor_pos([row_start[0], row_start[1] + row_height + ui.clone_style().item_spacing[1]]);
     UserRowResult { row_clicked, avatar_clicked: avatar_clicked || name_clicked, right_clicked }
+}
+
+fn draw_server_tag(
+    ui: &Ui,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    tag: &rustcord_client::models::PrimaryGuild,
+    badge_url: Option<&str>,
+) {
+    const BADGE: f32 = 12.0;
+    let Some(label) = tag.visible_tag() else { return };
+    let line = ui.text_line_height();
+    ui.set_window_font_scale(0.75);
+    let text_size = ui.calc_text_size(label);
+    let badge_room = if badge_url.is_some() { BADGE + 3.0 } else { 0.0 };
+    let pad = 4.0;
+    let size = [pad * 2.0 + badge_room + text_size[0], text_size[1] + 2.0];
+    let min = ui.cursor_screen_pos();
+    let min = [min[0], min[1] + (line - size[1]) / 2.0];
+    let muted = ui.style_color(imgui::StyleColor::TextDisabled);
+    let badge = badge_url.and_then(|url| match textures.get(url) {
+        Some((texture, _)) => Some(texture),
+        None => {
+            textures.request(url, cmd_tx);
+            None
+        }
+    });
+    let dl = ui.get_window_draw_list();
+    dl.add_rect(min, [min[0] + size[0], min[1] + size[1]], [muted[0], muted[1], muted[2], 0.2]).filled(true).rounding(4.0).build();
+    if let Some(texture) = badge {
+        let y = min[1] + (size[1] - BADGE) / 2.0;
+        dl.add_image(texture, [min[0] + pad, y], [min[0] + pad + BADGE, y + BADGE]).build();
+    }
+    dl.add_text([min[0] + pad + badge_room, min[1] + 1.0], ui.style_color(imgui::StyleColor::Text), label);
+    ui.set_window_font_scale(1.0);
+    ui.dummy([size[0], line]);
+}
+
+fn draw_status_emoji(
+    ui: &Ui,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    emoji: &rustcord_client::models::ActivityEmoji,
+    size: f32,
+) {
+    match (&emoji.id, &emoji.name) {
+        (Some(id), _) => {
+            let url = format!("https://cdn.discordapp.com/emojis/{id}.{}?size=32", if emoji.animated { "gif" } else { "png" });
+            match textures.get(&url) {
+                Some((texture, _)) => imgui::Image::new(texture, [size, size]).build(ui),
+                None => {
+                    textures.request(&url, cmd_tx);
+                    ui.dummy([size, size]);
+                }
+            }
+        }
+        (None, Some(name)) => match name.chars().next().filter(|c| crate::emoji::is_emoji(*c)) {
+            Some(ch) => {
+                if !draw_unicode_emoji(ui, textures, ch, [size, size]) {
+                    ui.dummy([size, size]);
+                }
+            }
+            None => ui.dummy([size, size]),
+        },
+        (None, None) => ui.dummy([size, size]),
+    }
 }
 
 fn draw_circular_image(ui: &Ui, texture_id: imgui::TextureId, size: [f32; 2]) {
@@ -1754,20 +1848,18 @@ fn draw_file_attachment(ui: &Ui, cmd_tx: &UnboundedSender<UiCommand>, textures: 
     let is_video = is_video_attachment(attachment.content_type.as_deref(), &attachment.filename);
     let is_audio = content_type.starts_with("audio/") || matches!(ext.as_str(), "mp3" | "ogg" | "wav" | "flac" | "m4a" | "opus");
     let (icon, open_label) = if is_video {
-        ('\u{1F3AC}', "Play")
+        (crate::icons::Icon::Film, "Play")
     } else if is_audio {
-        ('\u{1F3B5}', "Play")
+        (crate::icons::Icon::Music, "Play")
     } else if matches!(ext.as_str(), "zip" | "rar" | "7z" | "tar" | "gz" | "xz" | "bz2" | "zst") {
-        ('\u{1F4E6}', "Open")
+        (crate::icons::Icon::Package, "Open")
     } else if matches!(ext.as_str(), "txt" | "md" | "log" | "pdf" | "doc" | "docx") {
-        ('\u{1F4C4}', "Open")
+        (crate::icons::Icon::FileText, "Open")
     } else {
-        ('\u{1F4C1}', "Open")
+        (crate::icons::Icon::Folder, "Open")
     };
     ui.group(|| {
-        if !draw_unicode_emoji(ui, textures, icon, [28.0, 28.0]) {
-            ui.dummy([28.0, 28.0]);
-        }
+        draw_icon(ui, textures, icon, 28.0, ui.style_color(imgui::StyleColor::TextDisabled));
         ui.same_line();
         ui.group(|| {
             ui.text(&attachment.filename);
@@ -1787,11 +1879,20 @@ fn draw_file_attachment(ui: &Ui, cmd_tx: &UnboundedSender<UiCommand>, textures: 
 }
 
 #[cfg(feature = "video")]
-const VIDEO_CONTROL_ICONS: [char; 6] = ['\u{25B6}', '\u{23F8}', '\u{1F501}', '\u{1F50A}', '\u{1F507}', '\u{1F50D}'];
+const VIDEO_CONTROL_ICONS: [crate::icons::Icon; 6] = [
+    crate::icons::Icon::Play,
+    crate::icons::Icon::Pause,
+    crate::icons::Icon::Replay,
+    crate::icons::Icon::Volume,
+    crate::icons::Icon::VolumeOff,
+    crate::icons::Icon::Maximize,
+];
 
-const CHROME_ICONS: [char; 2] = ['\u{274C}', '\u{1F4AC}'];
+const CHROME_ICONS: [crate::icons::Icon; 2] = [crate::icons::Icon::Close, crate::icons::Icon::MessageCircle];
 
-const HEADER_ICONS: [char; 4] = ['\u{1F4DE}', '\u{1F4F9}', '\u{1F465}', '\u{1F50D}'];
+const HEADER_ICONS: [crate::icons::Icon; 4] =
+    [crate::icons::Icon::Phone, crate::icons::Icon::Video, crate::icons::Icon::Users, crate::icons::Icon::Search];
+const SCREENSHARE_ICON: crate::icons::Icon = crate::icons::Icon::MonitorUp;
 
 #[cfg(feature = "video")]
 fn draw_play_overlay(ui: &Ui, origin: [f32; 2], size: [f32; 2], hovered: bool) {
@@ -1851,7 +1952,7 @@ fn draw_video_controls(
     } else {
         (VIDEO_CONTROL_ICONS[0], "Play")
     };
-    if emoji_button(ui, textures, &format!("play_{id}"), play_icon, play_tip, None) {
+    if icon_button(ui, textures, &format!("play_{id}"), play_icon, play_tip, None) {
         if status.ended {
             textures.request_video_seek(url, 0.0, cmd_tx);
         } else {
@@ -1887,7 +1988,7 @@ fn draw_video_controls(
         ui.same_line_with_spacing(0.0, CONTROL_GAP);
         centre(ui, EMOJI_BUTTON_SIZE);
         let (icon, tip) = if status.muted { (VIDEO_CONTROL_ICONS[4], "Unmute") } else { (VIDEO_CONTROL_ICONS[3], "Mute") };
-        if emoji_button(ui, textures, &format!("mute_{id}"), icon, tip, None) {
+        if icon_button(ui, textures, &format!("mute_{id}"), icon, tip, None) {
             textures.toggle_video_mute(url);
         }
         ui.same_line_with_spacing(0.0, CONTROL_GAP);
@@ -1906,7 +2007,7 @@ fn draw_video_controls(
     ui.same_line_with_spacing(0.0, CONTROL_GAP);
     centre(ui, EMOJI_BUTTON_SIZE);
     let fs_tip = if status.fullscreen { "Exit fullscreen" } else { "Fullscreen" };
-    if emoji_button(ui, textures, &format!("fs_{id}"), VIDEO_CONTROL_ICONS[5], fs_tip, None) {
+    if icon_button(ui, textures, &format!("fs_{id}"), VIDEO_CONTROL_ICONS[5], fs_tip, None) {
         textures.toggle_video_fullscreen(url);
     }
 }
@@ -2060,8 +2161,20 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         state.switcher_selected = 0;
     }
     dispatch_keybinds(ui, state, cmd_tx);
+    if let Some((guild_id, channel_id)) = state.pending_invite_voice.clone() {
+        if state.guilds.iter().any(|g| g.id == guild_id) && !state.voice_connecting {
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
+            state.pending_voice_channel = Some((Some(guild_id), channel_id));
+            state.pending_invite_voice = None;
+        }
+    }
 
     let [display_w, display_h] = ui.io().display_size;
+    #[cfg(feature = "screenshare")]
+    let server_call_fullscreen = state.connected_voice_channel.as_ref().is_some_and(|(guild_id, _)| guild_id.is_some())
+        && !state.server_call_minimized;
+    #[cfg(not(feature = "screenshare"))]
+    let server_call_fullscreen = false;
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
     let surface_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.panel };
@@ -2174,6 +2287,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             if clicked {
                                 let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
                                 state.selected_channel = Some(channel_id.clone());
+                                state.server_call_minimized = true;
                                 if let Some(last_id) = last_message_id {
                                     if state.mark_channel_read(channel_id, last_id) {
                                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
@@ -2215,9 +2329,15 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         if shown.is_some() && ui.is_item_hovered() {
                             ui.tooltip_text(&label);
                         }
-                        if clicked && !is_connected && !state.voice_connecting {
-                            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
-                            state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
+                        if clicked {
+                            if is_connected {
+                                state.server_call_minimized = false;
+                            } else if !state.voice_connecting {
+                                let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
+                                state.pending_voice_channel = Some((Some(guild_id.clone()), channel_id.clone()));
+                                state.server_call_minimized = false;
+                                state.server_call_focus_stream = false;
+                            }
                         }
                         let member_ids: Vec<String> = state.members_in_voice_channel(&guild_id, channel_id).into_iter().map(|m| m.user_id.clone()).collect();
                         for member_id in member_ids {
@@ -2235,6 +2355,15 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             if ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right) {
                                 state.context_vc_member = Some(member_id.clone());
                                 ui.open_popup("vc_member_context");
+                            }
+                            #[cfg(feature = "screenshare")]
+                            if state.active_streams.contains_key(&member_id) {
+                                let is_self = state.current_user.as_ref().is_some_and(|user| user.id == member_id);
+                                if !is_self {
+                                    ui.set_cursor_screen_pos([row_pos[0] + row_width - 60.0, row_pos[1] + 7.0]);
+                                    ui.text_colored([0.95, 0.25, 0.35, 1.0], "LIVE");
+                                    ui.set_cursor_screen_pos([row_pos[0], row_pos[1] + ROW_H]);
+                                }
                             }
                             {
                                 let dl = ui.get_window_draw_list();
@@ -2255,10 +2384,16 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 }
                                 let text_color = ui.style_color(imgui::StyleColor::Text);
                                 dl.add_text([center[0] + AVATAR / 2.0 + 8.0, row_pos[1] + (ROW_H - ui.text_line_height()) / 2.0], text_color, &name);
-                                let status_icon = if member.self_deaf || member.deaf { Some('\u{1F515}') } else if member.self_mute || member.mute { Some('\u{1F507}') } else { None };
-                                if let Some(EmojiTexture::Ready(tex)) = status_icon.map(|ch| emoji_texture(textures, ch)) {
+                                let status_icon = if member.self_deaf || member.deaf {
+                                    Some(crate::icons::Icon::HeadphoneOff)
+                                } else if member.self_mute || member.mute {
+                                    Some(crate::icons::Icon::MicOff)
+                                } else {
+                                    None
+                                };
+                                if let Some(texture) = status_icon.and_then(|icon| textures.icon(icon, 16.0)) {
                                     let x = row_pos[0] + row_width - 22.0;
-                                    dl.add_image(tex, [x, center[1] - 8.0], [x + 16.0, center[1] + 8.0]).build();
+                                    dl.add_image(texture, [x, center[1] - 8.0], [x + 16.0, center[1] + 8.0]).col(state.theme.mention_badge()).build();
                                 }
                             }
                             ui.unindent();
@@ -2287,6 +2422,25 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         if ui.selectable("Message") {
                             let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: member_id.clone() });
                         }
+                        #[cfg(feature = "screenshare")]
+                        if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
+                            if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                                if ui.selectable("Open call view") {
+                                    state.server_call_minimized = false;
+                                }
+                                if ui.selectable("Stop watching") {
+                                    let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+                                    state.unwatching_stream = Some(stream_key.clone());
+                                    state.watching_stream = None;
+                                    state.server_call_minimized = false;
+                                }
+                            } else if ui.selectable("Watch screen share") {
+                                let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+                                state.watching_stream = Some(stream_key);
+                                state.server_call_minimized = false;
+                                state.server_call_focus_stream = false;
+                            }
+                        }
                         ui.separator();
                         draw_user_volume_controls(ui, state, cmd_tx, &member_id);
                     });
@@ -2299,7 +2453,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if state.connected_voice_channel.is_some() {
                 ui.separator();
                 ui.child_window("voice_status_bar").size([0.0, VOICE_STATUS_BAR_HEIGHT]).build(|| {
-                    draw_voice_status_bar(ui, state, textures, cmd_tx);
+                    if server_call_fullscreen {
+                        let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| "Voice channel".into());
+                        ui.text_colored([0.3, 0.8, 0.45, 1.0], "Voice connected");
+                        ui.text_disabled(channel_name);
+                        #[cfg(feature = "screenshare")]
+                        if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
+                            draw_sidebar_call_controls(ui, state, textures, cmd_tx, guild_id, &channel_id);
+                        }
+                    } else {
+                        let can_open_call = state.connected_voice_channel.as_ref().is_some_and(|(guild_id, _)| guild_id.is_some());
+                        draw_voice_status_bar(ui, state, textures, cmd_tx, state.server_call_minimized && can_open_call);
+                    }
                 });
             }
             ui.separator();
@@ -2323,6 +2488,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         });
 
     draw_settings_dialog(ui, state, cmd_tx, textures);
+    #[cfg(feature = "screenshare")]
+    draw_screen_share_setup_dialog(ui, state, cmd_tx);
     draw_profile_popout(ui, state, cmd_tx, textures);
 
     let mut open_emoji_picker = false;
@@ -2330,8 +2497,17 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     let role_names = state.role_name_map();
     let search_panel_open = state.search_open;
     let members_panel_open = state.show_members_panel && state.selected_guild.is_some() && !search_panel_open;
+    let profile_panel_user = (state.show_profile_panel && !search_panel_open && state.selected_guild.is_none())
+        .then(|| {
+            let channel_id = state.selected_channel.as_deref()?;
+            let dm = state.dm_channels.iter().find(|c| c.id == channel_id && c.kind == rustcord_client::models::ChannelType::Dm)?;
+            dm.recipients.first().cloned()
+        })
+        .flatten();
     let right_panel_width = if search_panel_open {
         SEARCH_PANEL_WIDTH
+    } else if profile_panel_user.is_some() {
+        PROFILE_PANEL_WIDTH
     } else if members_panel_open {
         MEMBERS_PANEL_WIDTH
     } else {
@@ -2347,12 +2523,19 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .scrollable(false)
         .draw_background(true)
         .build(|| {
+            #[cfg(feature = "screenshare")]
+            if server_call_fullscreen {
+                draw_server_call_fullscreen(ui, state, textures, cmd_tx);
+                return;
+            }
+            state.sync_draft_channel();
             let show_reconnecting = state.logged_in && !state.gateway_connected;
             let status_height = if state.status_message.is_some() || show_reconnecting { 24.0 } else { 0.0 };
-            let messages = state.active_messages().to_vec();
             let channel_key = state.selected_channel.clone().unwrap_or_default();
+            let channel_rows = state.rows_for(&channel_key);
+            let rows = &channel_rows.rows;
             let seen_count = state.last_seen_message_count.get(&channel_key).copied().unwrap_or(0);
-            let has_new_messages = messages.len() > seen_count;
+            let has_new_messages = rows.len() > seen_count;
 
             let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
             let mut header_height = if state.selected_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
@@ -2367,6 +2550,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     header_height += CALL_PANEL_HEIGHT;
                 }
             }
+            #[cfg(feature = "screenshare")]
+            if dm_channel.is_none() && state.watching_stream.is_some() {
+                header_height += draw_watched_stream_panel(ui, state, textures, cmd_tx);
+            }
 
             let line_height = ui.text_line_height_with_spacing();
             let typing_visible = !channel_key.is_empty()
@@ -2377,7 +2564,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let extra_banner_height = (typing_visible as u32 as f32
                 + state.reply_target.is_some() as u32 as f32
                 + state.pending_attachment.is_some() as u32 as f32
-                + state.editing.is_some() as u32 as f32)
+                + state.editing.is_some() as u32 as f32
+                + state.uploads.len() as f32)
                 * line_height;
 
             let _history_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
@@ -2385,7 +2573,13 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .size([0.0, display_h - 80.0 - status_height - header_height - extra_banner_height])
                 .build(|| {
                     let was_at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 40.0;
-                    if messages.is_empty() {
+                    let at_start = state.reached_start.contains(&channel_key);
+                    if at_start {
+                        if let Some(dm) = &dm_channel {
+                            draw_conversation_start(ui, state, cmd_tx, textures, fonts, dm);
+                        }
+                    }
+                    if rows.is_empty() && !at_start {
                         ui.text_disabled("No messages loaded yet.");
                     }
 
@@ -2397,39 +2591,42 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     let scroll_target = state.scroll_to_message.clone();
                     let mut scrolled_to_target = false;
 
-                    for (idx, msg) in messages.iter().enumerate() {
+                    for row in rows {
+                        let msg = &row.message;
+                        if let Some(label) = &row.divider {
+                            draw_day_divider(ui, &state.theme, label);
+                        }
                         let message_y = ui.cursor_pos()[1];
                         let is_history_anchor = state.history_scroll_anchor.as_ref().is_some_and(|(channel, id)| {
                             channel == &channel_key && id == &msg.id
                         });
                         let is_scroll_target = scroll_target.as_deref() == Some(msg.id.as_str());
                         let highlight_start = ui.cursor_screen_pos();
-                        if msg.kind == 3 {
-                            let me = state.current_user.as_ref().map(|u| u.id.as_str()).unwrap_or_default();
-                            let (text, color) = call_message_text(msg, me);
-                            let missed = color.is_none();
-                            let mut pos = ui.cursor_pos();
-                            pos[0] += 24.0 + AVATAR_SIZE[0] + 12.0 - EMOJI_SIZE - 12.0;
-                            ui.set_cursor_pos(pos);
-                            if !draw_unicode_emoji(ui, textures, if missed { '\u{1F4F5}' } else { '\u{1F4DE}' }, [EMOJI_SIZE, EMOJI_SIZE]) {
-                                ui.dummy([EMOJI_SIZE, EMOJI_SIZE]);
+                        if let Some(system) = &row.system {
+                            let in_call = state.connected_voice_channel.as_ref().is_some_and(|(_, id)| *id == msg.channel_id);
+                            match draw_system_row(ui, state, textures, fonts, row, system, in_call) {
+                                Some(crate::message_rows::SystemAction::JoinCall) if !state.voice_connecting => {
+                                    let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: msg.guild_id.clone(), channel_id: msg.channel_id.clone(), ring: false });
+                                    state.pending_voice_channel = Some((msg.guild_id.clone(), msg.channel_id.clone()));
+                                }
+                                Some(crate::message_rows::SystemAction::JumpTo { channel_id, message_id }) => {
+                                    let loaded = state.messages.get(&channel_id).is_some_and(|list| list.iter().any(|m| m.id == message_id));
+                                    if loaded && state.selected_channel.as_deref() == Some(channel_id.as_str()) {
+                                        state.scroll_to_message = Some(message_id);
+                                    } else {
+                                        let _ = cmd_tx.send(UiCommand::JumpToMessage { channel_id, message_id });
+                                    }
+                                }
+                                _ => {}
                             }
-                            ui.same_line();
-                            ui.text_colored(state.theme.text_muted, format!("{text}  {}", format_timestamp(&msg.timestamp)));
-                            ui.dummy([0.0, MESSAGE_GAP]);
+                            ui.dummy([0.0, if row.followed_by_system { 0.0 } else { MESSAGE_GAP }]);
                             if is_history_anchor {
                                 ui.set_scroll_from_pos_y_with_ratio(message_y, 0.0);
                                 state.history_scroll_anchor = None;
                             }
                             continue;
                         }
-                        let starts_group = msg.referenced_message.is_some()
-                            || match messages.get(idx.wrapping_sub(1)) {
-                                Some(prev) if idx > 0 => {
-                                    prev.author.id != msg.author.id || !same_group_window(&prev.timestamp, &msg.timestamp)
-                                }
-                                _ => true,
-                            };
+                        let starts_group = row.starts_group;
 
                         let mut row_start = ui.cursor_pos();
                         let mut row_screen_start = ui.cursor_screen_pos();
@@ -2482,18 +2679,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 if clickable_text(ui, &format!("name_{}", msg.id), &author, author_color) {
                                     state.profile_popout = Some(msg.author.clone());
                                 }
+                                if let Some(tag) = msg.author.server_tag() {
+                                    ui.same_line_with_spacing(0.0, 6.0);
+                                    draw_server_tag(ui, textures, cmd_tx, tag, row.tag_badge.as_deref());
+                                }
                                 ui.same_line();
-                                let time = format_timestamp(&msg.timestamp);
-                                let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-                                ui.set_window_font_scale(0.85);
-                                ui.text(time);
-                                ui.set_window_font_scale(1.0);
-                                token.pop();
+                                timestamp_text(ui, state.theme.text_muted, &row.times.header, &row.times.full, 0.85);
 
                                 if !msg.content.is_empty() {
                                     draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                     if msg.edited_timestamp.is_some() {
-                                        ui.text_colored(state.theme.text_muted, "(edited)");
+                                        let edited = row.times.edited_full.as_deref().unwrap_or(&row.times.full);
+                                        timestamp_text(ui, state.theme.text_muted, "(edited)", edited, 0.85);
                                     }
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
@@ -2501,6 +2698,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 }
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
+                                }
+                                for code in &row.invites {
+                                    draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
@@ -2513,7 +2713,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 if !msg.content.is_empty() {
                                     draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                     if msg.edited_timestamp.is_some() {
-                                        ui.text_colored(state.theme.text_muted, "(edited)");
+                                        let edited = row.times.edited_full.as_deref().unwrap_or(&row.times.full);
+                                        timestamp_text(ui, state.theme.text_muted, "(edited)", edited, 0.85);
                                     }
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
@@ -2522,9 +2723,20 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for attachment in &msg.attachments {
                                     draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
                                 }
+                                for code in &row.invites {
+                                    draw_invite_card(ui, state, textures, cmd_tx, code);
+                                }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
-                            ui.set_cursor_pos([row_start[0], content_top + ui.item_rect_size()[1]]);
+                            let after_group = [row_start[0], content_top + ui.item_rect_size()[1]];
+                            let mouse = ui.io().mouse_pos;
+                            let group_min = ui.item_rect_min();
+                            let group_max = ui.item_rect_max();
+                            if ui.is_window_hovered() && mouse[1] >= group_min[1] && mouse[1] <= group_max[1] && mouse[0] >= row_screen_start[0] {
+                                ui.set_cursor_pos([row_start[0], content_top + 2.0]);
+                                timestamp_text(ui, state.theme.text_muted, &row.times.short, &row.times.full, 0.75);
+                            }
+                            ui.set_cursor_pos(after_group);
                         }
 
                         let row_end_screen = ui.cursor_screen_pos();
@@ -2568,15 +2780,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             }
                         });
 
-                        let next_starts_group = match messages.get(idx + 1) {
-                            Some(next) => {
-                                next.referenced_message.is_some()
-                                    || next.author.id != msg.author.id
-                                    || !same_group_window(&msg.timestamp, &next.timestamp)
-                            }
-                            None => true,
-                        };
-                        ui.dummy([0.0, if next_starts_group { MESSAGE_GAP } else { 2.0 }]);
+                        ui.dummy([0.0, if row.ends_group { MESSAGE_GAP } else { 2.0 }]);
 
                         if is_history_anchor {
                             ui.set_scroll_from_pos_y_with_ratio(message_y, 0.0);
@@ -2611,8 +2815,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
 
                     let scroll_y = ui.scroll_y();
-                    if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages && !state.history_exhausted.contains(&channel_key) {
-                        if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), messages.first()) {
+                    if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !rows.is_empty() && !state.loading_older_messages && !state.reached_start.contains(&channel_key) {
+                        if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), rows.first().map(|r| &r.message)) {
                             state.loading_older_messages = true;
                             state.history_scroll_anchor = Some((channel_id.clone(), oldest.id.clone()));
                             let _ = cmd_tx.send(UiCommand::LoadOlderMessages {
@@ -2622,9 +2826,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                     }
                 });
-            state.last_seen_message_count.insert(channel_key.clone(), messages.len());
+            state.last_seen_message_count.insert(channel_key.clone(), rows.len());
             if state.window_focused && !channel_key.is_empty() && !state.viewing_jumped_history {
-                if let Some(newest) = messages.last() {
+                if let Some(newest) = rows.last().map(|r| &r.message) {
                     if state.mark_channel_read(&channel_key, &newest.id) {
                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_key.clone(), message_id: newest.id.clone() });
                     }
@@ -2686,6 +2890,24 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 }
             }
 
+            let mut cancelled_upload = None;
+            for upload in &state.uploads {
+                let _id = ui.push_id_usize(upload.id as usize);
+                ui.text_colored(state.theme.text_muted, &upload.filename);
+                ui.same_line();
+                let cancel_width = ui.calc_text_size("Cancel")[0] + ui.clone_style().frame_padding[0] * 2.0;
+                let bar_width = (ui.content_region_avail()[0] - cancel_width - 8.0).max(60.0);
+                imgui::ProgressBar::new(upload.progress.fraction()).size([bar_width, ui.text_line_height()]).build(ui);
+                ui.same_line();
+                if ui.small_button("Cancel") {
+                    cancelled_upload = Some(upload.id);
+                }
+            }
+            if let Some(upload_id) = cancelled_upload {
+                state.uploads.retain(|u| u.id != upload_id);
+                let _ = cmd_tx.send(UiCommand::CancelUpload { upload_id });
+            }
+
             if state.editing.is_some() {
                 ui.text_colored(state.theme.accent, "Editing message");
                 ui.same_line();
@@ -2705,21 +2927,24 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .rounding(COMPOSER_ROUNDING)
                 .build();
 
-            if ui.button("+") {
+            let composer_icon = ui.frame_height();
+            let attach_tint = state.pending_attachment.is_some().then_some(state.theme.accent);
+            if icon_button_sized(ui, textures, "compose_attach", crate::icons::Icon::CirclePlus, "Attach a file", attach_tint, composer_icon) {
                 if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("All files", &["*"])
                     .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
                     .pick_file()
                 {
                     state.pending_attachment = Some(path);
                 }
             }
-            if ui.is_item_hovered() {
-                ui.tooltip_text("Attach a file");
-            }
-            let plus_width = ui.item_rect_size()[0];
-            let right_labels = ["GIF", "Sticker", "Emoji"];
-            let right_width: f32 =
-                right_labels.iter().map(|l| ui.calc_text_size(l)[0] + 20.0 + spacing).sum();
+            let plus_width = composer_icon;
+            let right_pickers = [
+                ("compose_gif", crate::icons::Icon::Gif, "GIFs"),
+                ("compose_sticker", crate::icons::Icon::Sticker, "Stickers"),
+                ("compose_emoji", crate::icons::Icon::Smile, "Emoji"),
+            ];
+            let right_width = right_pickers.len() as f32 * (composer_icon + spacing);
             ui.same_line();
 
             if std::mem::take(&mut state.focus_compose) {
@@ -2729,6 +2954,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             ui.set_next_item_width((bar_width - plus_width - right_width - spacing).max(40.0));
             let enter_pressed_raw = ui
                 .input_text("##compose", &mut state.compose_buf)
+                .hint(&state.compose_placeholder)
                 .enter_returns_true(true)
                 .build();
             let input_focused = ui.is_item_focused();
@@ -2756,10 +2982,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 }
             }
 
-            for label in right_labels {
+            for (id, icon, tooltip) in right_pickers {
                 ui.same_line();
-                if ui.button(label) {
-                    if label == "Emoji" {
+                if icon_button_sized(ui, textures, id, icon, tooltip, None, composer_icon) {
+                    if icon == crate::icons::Icon::Smile {
                         ui.open_popup("emoji_picker");
                     } else {
                         ui.open_popup("picker_soon");
@@ -2821,7 +3047,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     let content = std::mem::take(&mut state.compose_buf);
                     let reply_to = state.reply_target.take().map(|m| m.id);
                     if let Some(path) = state.pending_attachment.take() {
-                        let _ = cmd_tx.send(UiCommand::SendAttachment { channel_id, content, path, reply_to });
+                        let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+                        let (upload_id, progress) = state.start_upload(filename);
+                        let _ = cmd_tx.send(UiCommand::SendAttachment { channel_id, content, path, reply_to, upload_id, progress });
                     } else if !content.trim().is_empty() {
                         let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to });
                     }
@@ -2840,6 +3068,19 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 draw_search_panel(ui, state, cmd_tx);
             });
         _search_bg.pop();
+    }
+
+    if let Some(user) = &profile_panel_user {
+        let _profile_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
+        ui.window("profile_panel")
+            .position([display_w - PROFILE_PANEL_WIDTH, 0.0], imgui::Condition::Always)
+            .size([PROFILE_PANEL_WIDTH, display_h], imgui::Condition::Always)
+            .no_decoration()
+            .draw_background(true)
+            .build(|| {
+                draw_profile_panel(ui, state, cmd_tx, textures, fonts, user);
+            });
+        _profile_bg.pop();
     }
 
     if members_panel_open {
@@ -2871,11 +3112,17 @@ fn format_bitrate(bps: u32) -> String {
     }
 }
 
-fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
+fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, open_call_view: bool) {
     let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
     let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
 
     ui.text(format!("[voice] {channel_name}"));
+    if open_call_view {
+        ui.same_line();
+        if ui.small_button("Open call") {
+            state.server_call_minimized = false;
+        }
+    }
     let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
     ui.set_window_font_scale(0.85);
     let stats = &state.voice_stats;
@@ -2893,7 +3140,9 @@ fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, textures: &TextureCache,
 
 fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let Some(user) = state.current_user.clone() else { return };
-    const SETTINGS_WIDTH: f32 = 70.0;
+    const PANEL_ICON: f32 = 30.0;
+    const CHEVRON_WIDTH: f32 = 14.0;
+    const CONTROLS_WIDTH: f32 = PANEL_ICON * 3.0 + CHEVRON_WIDTH * 2.0 + 8.0;
     let avatar_url =
         rustcord_client::cdn::avatar_url(&user, 64).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&user));
     let bar_start = ui.cursor_pos();
@@ -2902,7 +3151,7 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
 
     let clicked = ui
         .selectable_config("##user_bar")
-        .size([(width - SETTINGS_WIDTH).max(40.0), USER_BAR_HEIGHT])
+        .size([(width - CONTROLS_WIDTH).max(40.0), USER_BAR_HEIGHT])
         .build();
     let hovered = ui.is_item_hovered();
 
@@ -2929,17 +3178,45 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
         .to_string()
     };
     let display_name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+    let name_room = (width - CONTROLS_WIDTH - 46.0).max(20.0);
     ui.set_cursor_pos([bar_start[0] + 42.0, bar_start[1] + 3.0]);
-    ui.text(&display_name);
+    ui.text(truncate_to_width(ui, &display_name, name_room).as_deref().unwrap_or(&display_name));
     ui.set_cursor_pos([bar_start[0] + 42.0, bar_start[1] + 3.0 + ui.text_line_height()]);
     let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
     ui.set_window_font_scale(0.85);
-    ui.text(&status_label);
+    ui.text(truncate_to_width(ui, &status_label, name_room).as_deref().unwrap_or(&status_label));
     ui.set_window_font_scale(1.0);
     token.pop();
 
-    ui.set_cursor_pos([bar_start[0] + width - SETTINGS_WIDTH + 4.0, bar_start[1] + (USER_BAR_HEIGHT - ui.frame_height()) / 2.0]);
-    if ui.button("Settings") {
+    let red = state.theme.mention_badge();
+    ui.set_cursor_pos([bar_start[0] + width - CONTROLS_WIDTH + 4.0, bar_start[1] + (USER_BAR_HEIGHT - PANEL_ICON) / 2.0]);
+    let (mic_icon, mic_tip) = if state.self_muted { (crate::icons::Icon::MicOff, "Unmute") } else { (crate::icons::Icon::Mic, "Mute") };
+    if icon_button_sized(ui, textures, "user_mute", mic_icon, mic_tip, state.self_muted.then_some(red), PANEL_ICON) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Mute);
+    }
+    ui.same_line_with_spacing(0.0, 0.0);
+    if chevron_button(ui, textures, "user_input_menu", "Input device", CHEVRON_WIDTH, PANEL_ICON) {
+        if state.voice_input_devices.is_empty() {
+            let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+        }
+        ui.open_popup("input_device_menu");
+    }
+    ui.same_line_with_spacing(0.0, 0.0);
+    let (deaf_icon, deaf_tip) = if state.self_deafened { (crate::icons::Icon::HeadphoneOff, "Undeafen") } else { (crate::icons::Icon::Headphones, "Deafen") };
+    if icon_button_sized(ui, textures, "user_deafen", deaf_icon, deaf_tip, state.self_deafened.then_some(red), PANEL_ICON) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
+    }
+    ui.same_line_with_spacing(0.0, 0.0);
+    if chevron_button(ui, textures, "user_output_menu", "Output device", CHEVRON_WIDTH, PANEL_ICON) {
+        if state.voice_output_devices.is_empty() {
+            let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
+        }
+        ui.open_popup("output_device_menu");
+    }
+    ui.popup("input_device_menu", || draw_device_menu(ui, state, cmd_tx, DeviceKind::Input));
+    ui.popup("output_device_menu", || draw_device_menu(ui, state, cmd_tx, DeviceKind::Output));
+    ui.same_line_with_spacing(0.0, 0.0);
+    if icon_button_sized(ui, textures, "user_settings", crate::icons::Icon::Settings, "User Settings", state.show_settings.then_some(state.theme.accent), PANEL_ICON) {
         state.show_settings = !state.show_settings;
         if state.show_settings && state.voice_input_devices.is_empty() && state.voice_output_devices.is_empty() {
             let _ = cmd_tx.send(UiCommand::LoadVoiceDevices);
@@ -2990,25 +3267,542 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     });
 }
 
-fn call_message_text(msg: &rustcord_client::models::Message, me: &str) -> (String, Option<[f32; 4]>) {
-    let name = msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
-    let participated = msg.call.as_ref().is_some_and(|c| c.participants.iter().any(|p| p == me));
-    let duration = msg.call.as_ref().and_then(|c| c.ended_timestamp.as_deref()).and_then(|end| {
-        let start = chrono::DateTime::parse_from_rfc3339(&msg.timestamp).ok()?;
-        let secs = (chrono::DateTime::parse_from_rfc3339(end).ok()? - start).num_seconds();
-        let plural = |n: i64, unit: &str| if n == 1 { format!("a {unit}") } else { format!("{n} {unit}s") };
-        Some(match secs {
-            ..=59 => "a few seconds".to_string(),
-            60..=3599 => plural(secs / 60, "minute"),
-            _ => plural(secs / 3600, "hour"),
-        })
-    });
-    let tail = duration.map(|d| format!(" that lasted {d}")).unwrap_or_default();
-    if msg.author.id != me && !participated {
-        (format!("You missed a call from {name}{tail}."), None)
-    } else {
-        (format!("{name} started a call{tail}."), Some([0.35, 0.7, 0.4, 1.0]))
+const SYSTEM_ICON_SIZE: f32 = 16.0;
+const START_AVATAR_SIZE: f32 = 80.0;
+const START_MUTUAL_ICON: f32 = 20.0;
+
+fn draw_bold_sentence(ui: &Ui, fonts: &Fonts, muted: [f32; 4], strong: [f32; 4], before: &str, name: &str, after: &str) {
+    ui.text_colored(muted, before);
+    ui.same_line_with_spacing(0.0, 0.0);
+    let bold = ui.push_font(fonts.bold);
+    ui.text_colored(strong, name);
+    bold.pop();
+    ui.same_line_with_spacing(0.0, 0.0);
+    ui.text_colored(muted, after);
+}
+
+fn draw_start_avatar(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, url: Option<&str>, fallback: [f32; 4]) {
+    match url.and_then(|url| textures.get(url)) {
+        Some((texture, _)) => draw_circular_image(ui, texture, [START_AVATAR_SIZE; 2]),
+        None => {
+            if let Some(url) = url {
+                textures.request(url, cmd_tx);
+            }
+            let min = ui.cursor_screen_pos();
+            let radius = START_AVATAR_SIZE / 2.0;
+            ui.get_window_draw_list()
+                .add_circle([min[0] + radius, min[1] + radius], radius, fallback)
+                .filled(true)
+                .num_segments(48)
+                .build();
+            let icon = 36.0;
+            let inset = (START_AVATAR_SIZE - icon) / 2.0;
+            draw_icon_at(ui, textures, crate::icons::Icon::Users, [min[0] + inset, min[1] + inset], icon, [1.0, 1.0, 1.0, 1.0]);
+            ui.dummy([START_AVATAR_SIZE; 2]);
+        }
     }
+}
+
+fn draw_conversation_start(
+    ui: &Ui,
+    state: &mut AppState,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    fonts: &Fonts,
+    dm: &rustcord_client::models::Channel,
+) {
+    use crate::backend::RelationshipAction;
+    use rustcord_client::models::{ChannelType, RelationshipType};
+
+    let muted = state.theme.text_muted;
+    let strong = state.theme.text;
+    let accent = state.theme.accent;
+    let left = ui.cursor_pos()[0] + 24.0;
+    ui.dummy([0.0, 16.0]);
+    let indent = |ui: &Ui| ui.set_cursor_pos([left, ui.cursor_pos()[1]]);
+
+    if dm.kind == ChannelType::GroupDm {
+        let name = AppState::dm_display_name(dm);
+        let icon_url = dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 128));
+        indent(ui);
+        draw_start_avatar(ui, textures, cmd_tx, icon_url.as_deref(), accent);
+        indent(ui);
+        let bold = ui.push_font(fonts.bold);
+        ui.set_window_font_scale(1.6);
+        ui.text_colored(strong, &name);
+        ui.set_window_font_scale(1.0);
+        bold.pop();
+        indent(ui);
+        draw_bold_sentence(ui, fonts, muted, strong, "Welcome to the beginning of the ", &name, " group.");
+        ui.dummy([0.0, 16.0]);
+        return;
+    }
+
+    let Some(user) = dm.recipients.first() else { return };
+    let display = user.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&user.username);
+    let avatar = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+    indent(ui);
+    draw_start_avatar(ui, textures, cmd_tx, Some(&avatar), accent);
+    indent(ui);
+    let bold = ui.push_font(fonts.bold);
+    ui.set_window_font_scale(1.6);
+    ui.text_colored(strong, display);
+    ui.set_window_font_scale(1.0);
+    bold.pop();
+    indent(ui);
+    ui.set_window_font_scale(1.25);
+    ui.text_colored(strong, &user.username);
+    ui.set_window_font_scale(1.0);
+    ui.dummy([0.0, 4.0]);
+    indent(ui);
+    draw_bold_sentence(ui, fonts, muted, strong, "This is the beginning of your direct message history with ", display, ".");
+    ui.dummy([0.0, 2.0]);
+    indent(ui);
+
+    if !state.profiles_requested.contains(&user.id) {
+        state.profiles_requested.insert(user.id.clone());
+        let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user.id.clone() });
+    }
+    let mut started_row = false;
+    let profile = state.profiles.get(&user.id).filter(|p| !p.mutual_guild_ids.is_empty());
+    if let (Some(profile), Some(label)) = (profile, state.mutual_server_labels.get(&user.id)) {
+        let row_y = ui.cursor_screen_pos()[1];
+        let icon_y = row_y + (ui.frame_height() - START_MUTUAL_ICON) / 2.0;
+        let mut x = ui.cursor_screen_pos()[0];
+        for guild in profile.mutual_guild_ids.iter().take(3).filter_map(|id| state.guilds.iter().find(|g| &g.id == id)) {
+            if let Some(url) = rustcord_client::cdn::guild_icon_url(guild, 64) {
+                match textures.get(&url) {
+                    Some((texture, _)) => {
+                        ui.get_window_draw_list()
+                            .add_image_rounded(texture, [x, icon_y], [x + START_MUTUAL_ICON, icon_y + START_MUTUAL_ICON], START_MUTUAL_ICON / 2.0)
+                            .build();
+                    }
+                    None => textures.request(&url, cmd_tx),
+                }
+            }
+            x += START_MUTUAL_ICON - 4.0;
+        }
+        if x > ui.cursor_screen_pos()[0] {
+            ui.set_cursor_screen_pos([x + 8.0, row_y]);
+        }
+        let text_y = ui.cursor_pos()[1] + (ui.frame_height() - ui.text_line_height()) / 2.0;
+        ui.set_cursor_pos([ui.cursor_pos()[0], text_y]);
+        if clickable_text(ui, "mutual_servers_link", label, muted) {
+            ui.open_popup("mutual_servers");
+        }
+        if ui.is_item_hovered() {
+            ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+        }
+        ui.same_line();
+        ui.text_colored(muted, "\u{2022}");
+        ui.same_line();
+        started_row = true;
+        let mut picked = None;
+        ui.popup("mutual_servers", || {
+            ui.text_disabled("Mutual Servers");
+            ui.separator();
+            for id in &profile.mutual_guild_ids {
+                let Some(guild) = state.guilds.iter().find(|g| &g.id == id) else { continue };
+                if ui.selectable(&guild.name) {
+                    picked = Some(guild.id.clone());
+                }
+            }
+        });
+        if let Some(guild_id) = picked {
+            let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
+            state.selected_guild = Some(guild_id);
+            state.selected_channel = None;
+        }
+    }
+    if !started_row {
+        indent(ui);
+    }
+
+    if !user.bot {
+        let relationship = state.relationship_with(&user.id);
+        let busy = state.relationship_busy.contains(&user.id);
+        let mut request = None;
+        let _button = ui.push_style_color(imgui::StyleColor::Button, [muted[0], muted[1], muted[2], 0.22]);
+        let disabled = ui.begin_disabled(busy);
+        let friend_button = match relationship {
+            Some(RelationshipType::Friend) => Some(("Remove Friend", Some(RelationshipAction::Remove))),
+            Some(RelationshipType::OutgoingRequest) => Some(("Friend Request Sent", None)),
+            Some(RelationshipType::IncomingRequest) => Some(("Accept Friend Request", Some(RelationshipAction::SendRequest))),
+            Some(RelationshipType::Blocked) => None,
+            None => Some(("Add Friend", Some(RelationshipAction::SendRequest))),
+        };
+        if let Some((label, action)) = friend_button {
+            let inert = ui.begin_disabled(action.is_none());
+            if ui.button(label) {
+                request = action;
+            }
+            drop(inert);
+            ui.same_line();
+        }
+        let block_action = if relationship == Some(RelationshipType::Blocked) { RelationshipAction::Unblock } else { RelationshipAction::Block };
+        if ui.button(if block_action == RelationshipAction::Unblock { "Unblock" } else { "Block" }) {
+            request = Some(block_action);
+        }
+        drop(disabled);
+
+        match request {
+            Some(action @ (RelationshipAction::Remove | RelationshipAction::Block)) => {
+                state.relationship_confirm = Some((action, user.id.clone(), display.to_string()));
+                ui.open_popup("Confirm##relationship");
+            }
+            Some(action) => {
+                state.relationship_busy.insert(user.id.clone());
+                let _ = cmd_tx.send(UiCommand::UpdateRelationship { user_id: user.id.clone(), action });
+            }
+            None => {}
+        }
+    }
+
+    if let Some(_modal) = ui.modal_popup_config("Confirm##relationship").always_auto_resize(true).begin_popup() {
+        let mut close = false;
+        if let Some((action, user_id, name)) = state.relationship_confirm.clone() {
+            let (title, body, confirm) = if action == RelationshipAction::Block {
+                ("Block", "They won't be able to message you, and you won't see their messages.", "Block")
+            } else {
+                ("Remove Friend", "You'll need to send a new friend request to be friends again.", "Remove Friend")
+            };
+            let bold = ui.push_font(fonts.bold);
+            ui.text(format!("{title} {name}?"));
+            bold.pop();
+            ui.text_colored(muted, body);
+            ui.dummy([0.0, 6.0]);
+            if ui.button("Cancel") {
+                close = true;
+            }
+            ui.same_line();
+            let _danger = ui.push_style_color(imgui::StyleColor::Button, state.theme.mention_badge());
+            if ui.button(confirm) {
+                state.relationship_busy.insert(user_id.clone());
+                let _ = cmd_tx.send(UiCommand::UpdateRelationship { user_id, action });
+                close = true;
+            }
+        } else {
+            close = true;
+        }
+        if close {
+            state.relationship_confirm = None;
+            ui.close_current_popup();
+        }
+    }
+    ui.dummy([0.0, 16.0]);
+}
+const INVITE_CARD_WIDTH: f32 = 400.0;
+const INVITE_CARD_HEIGHT: f32 = 76.0;
+const INVITE_ICON_SIZE: f32 = 48.0;
+
+enum InviteAction {
+    JoinGuild,
+    JoinVoice { guild_id: String, channel_id: String, member: bool },
+}
+
+fn draw_invite_card(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, code: &str) {
+    use crate::invites::InviteState;
+    let _id = ui.push_id(code);
+    ui.dummy([0.0, 2.0]);
+    let start = ui.cursor_pos();
+    let origin = ui.cursor_screen_pos();
+    let width = INVITE_CARD_WIDTH.min(ui.content_region_avail()[0]).max(200.0);
+    let max = [origin[0] + width, origin[1] + INVITE_CARD_HEIGHT];
+    if ui.is_rect_visible(origin, max) {
+        state.ensure_invite(code, cmd_tx);
+    }
+    let panel = state.theme.panel;
+    let text_color = state.theme.text;
+    let muted = state.theme.text_muted;
+    let accent = state.theme.accent;
+    let call_green = state.theme.call_active();
+    ui.get_window_draw_list().add_rect(origin, max, panel).filled(true).rounding(8.0).build();
+    let icon_min = [origin[0] + 14.0, origin[1] + (INVITE_CARD_HEIGHT - INVITE_ICON_SIZE) / 2.0];
+    let icon_max = [icon_min[0] + INVITE_ICON_SIZE, icon_min[1] + INVITE_ICON_SIZE];
+    let text_x = start[0] + 14.0 + INVITE_ICON_SIZE + 14.0;
+    let line = ui.text_line_height_with_spacing();
+    let text_top = start[1] + (INVITE_CARD_HEIGHT - line * 2.0) / 2.0;
+    let button_y = start[1] + (INVITE_CARD_HEIGHT - ui.frame_height()) / 2.0;
+    let mut action = None;
+
+    match state.invites.get(code).map(|entry| &entry.state) {
+        None | Some(InviteState::Loading) => {
+            let skeleton = [muted[0], muted[1], muted[2], 0.18];
+            let dl = ui.get_window_draw_list();
+            dl.add_rect(icon_min, icon_max, skeleton).filled(true).rounding(12.0).build();
+            let bar_x = icon_max[0] + 14.0;
+            dl.add_rect([bar_x, origin[1] + 22.0], [bar_x + 140.0, origin[1] + 36.0], skeleton).filled(true).rounding(4.0).build();
+            dl.add_rect([bar_x, origin[1] + 44.0], [bar_x + 90.0, origin[1] + 54.0], skeleton).filled(true).rounding(4.0).build();
+        }
+        Some(InviteState::Invalid) | Some(InviteState::Unavailable) => {
+            let invalid = matches!(state.invites.get(code).map(|e| &e.state), Some(InviteState::Invalid));
+            let tint = [muted[0], muted[1], muted[2], 0.6];
+            ui.get_window_draw_list().add_rect(icon_min, icon_max, [tint[0], tint[1], tint[2], 0.12]).filled(true).rounding(12.0).build();
+            draw_icon_at(ui, textures, crate::icons::Icon::CircleHelp, [icon_min[0] + 12.0, icon_min[1] + 12.0], 24.0, tint);
+            ui.set_cursor_pos([text_x, text_top]);
+            ui.text_colored(muted, if invalid { "Invite invalid" } else { "Couldn't load invite" });
+            ui.set_cursor_pos([text_x, text_top + line]);
+            ui.set_window_font_scale(0.85);
+            ui.text_colored(
+                muted,
+                if invalid { "This invite may be expired, or you might not have permission to join." } else { "Try again in a few minutes." },
+            );
+            ui.set_window_font_scale(1.0);
+        }
+        Some(InviteState::Ready(resolved)) => {
+            let guild = resolved.invite.guild.as_ref();
+            let guild_id = guild.map(|g| g.id.as_str()).unwrap_or_default();
+            let member = state.guilds.iter().any(|g| g.id == guild_id);
+            let voice = resolved.invite.channel.as_ref().filter(|c| c.is_voice());
+            match voice {
+                Some(channel) => {
+                    ui.get_window_draw_list().add_rect(icon_min, icon_max, [accent[0], accent[1], accent[2], 0.18]).filled(true).rounding(12.0).build();
+                    draw_icon_at(ui, textures, crate::icons::Icon::Volume, [icon_min[0] + 12.0, icon_min[1] + 12.0], 24.0, text_color);
+                    ui.set_cursor_pos([text_x, text_top]);
+                    ui.text(&resolved.channel_name);
+                    ui.set_cursor_pos([text_x, text_top + line]);
+                    ui.set_window_font_scale(0.85);
+                    if member {
+                        let occupants = state.members_in_voice_channel(guild_id, &channel.id).len();
+                        if occupants == 0 {
+                            ui.text_colored(muted, "No one is currently in voice");
+                        } else {
+                            ui.text_colored(call_green, format!("{occupants} in voice"));
+                        }
+                    } else {
+                        ui.text_colored(muted, "Only server members can see who's in voice");
+                    }
+                    ui.set_window_font_scale(1.0);
+                    let in_channel = state.connected_voice_channel.as_ref().is_some_and(|(_, id)| *id == channel.id);
+                    ui.set_cursor_pos([start[0] + width - 108.0, button_y]);
+                    let _green = ui.push_style_color(imgui::StyleColor::Button, call_green);
+                    let disabled = ui.begin_disabled(in_channel || state.voice_connecting);
+                    if ui.button_with_size(if in_channel { "Connected" } else { "Join Voice" }, [96.0, 0.0]) {
+                        action = Some(InviteAction::JoinVoice { guild_id: guild_id.to_string(), channel_id: channel.id.clone(), member });
+                    }
+                    drop(disabled);
+                }
+                None => {
+                    match resolved.icon_url.as_deref().and_then(|url| textures.get(url).map(|t| (url, t))) {
+                        Some((_, (texture, _))) => {
+                            ui.get_window_draw_list().add_image_rounded(texture, icon_min, icon_max, 12.0).build();
+                        }
+                        None => {
+                            if let Some(url) = resolved.icon_url.as_deref() {
+                                textures.request(url, cmd_tx);
+                            }
+                            let dl = ui.get_window_draw_list();
+                            dl.add_rect(icon_min, icon_max, accent).filled(true).rounding(12.0).build();
+                            let size = ui.calc_text_size(&resolved.initials);
+                            dl.add_text(
+                                [icon_min[0] + (INVITE_ICON_SIZE - size[0]) / 2.0, icon_min[1] + (INVITE_ICON_SIZE - size[1]) / 2.0],
+                                text_color,
+                                &resolved.initials,
+                            );
+                        }
+                    }
+                    ui.set_cursor_pos([text_x, text_top]);
+                    let name = guild.map(|g| g.name.as_str()).unwrap_or("Unknown server");
+                    ui.text(name);
+                    ui.set_cursor_pos([text_x, text_top + line]);
+                    ui.set_window_font_scale(0.85);
+                    ui.text_colored(muted, &resolved.counts);
+                    ui.set_window_font_scale(1.0);
+                    ui.set_cursor_pos([start[0] + width - 88.0, button_y]);
+                    if member {
+                        let disabled = ui.begin_disabled(true);
+                        ui.button_with_size("Joined", [76.0, 0.0]);
+                        drop(disabled);
+                    } else {
+                        let _green = ui.push_style_color(imgui::StyleColor::Button, call_green);
+                        if ui.button_with_size("Join", [76.0, 0.0]) {
+                            action = Some(InviteAction::JoinGuild);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match action {
+        Some(InviteAction::JoinGuild) => {
+            let _ = cmd_tx.send(UiCommand::JoinGuildByInvite { invite_code: code.to_string() });
+        }
+        Some(InviteAction::JoinVoice { guild_id, channel_id, member: true }) => {
+            let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: Some(guild_id.clone()), channel_id: channel_id.clone(), ring: false });
+            state.pending_voice_channel = Some((Some(guild_id), channel_id));
+        }
+        Some(InviteAction::JoinVoice { guild_id, channel_id, member: false }) => {
+            let _ = cmd_tx.send(UiCommand::JoinGuildByInvite { invite_code: code.to_string() });
+            state.pending_invite_voice = Some((guild_id, channel_id));
+        }
+        None => {}
+    }
+    ui.set_cursor_pos(start);
+    ui.dummy([width, INVITE_CARD_HEIGHT]);
+}
+
+fn draw_system_row(
+    ui: &Ui,
+    state: &AppState,
+    textures: &TextureCache,
+    fonts: &Fonts,
+    row: &crate::message_rows::MessageRow,
+    system: &crate::message_rows::SystemRow,
+    in_call: bool,
+) -> Option<crate::message_rows::SystemAction> {
+    use crate::message_rows::{SystemAction, Tone};
+    let theme = &state.theme;
+    let tint = match system.tone {
+        Tone::CallActive | Tone::Positive => theme.call_active(),
+        Tone::CallMissed => theme.call_missed(),
+        Tone::Muted => theme.text_muted,
+    };
+    let line = ui.text_line_height();
+    let origin = ui.cursor_pos();
+    let icon_x = origin[0] + 24.0 + (AVATAR_SIZE[0] - SYSTEM_ICON_SIZE) / 2.0;
+    ui.set_cursor_pos([icon_x, origin[1] + (line - SYSTEM_ICON_SIZE) / 2.0]);
+    draw_icon(ui, textures, system.icon, SYSTEM_ICON_SIZE, tint);
+    ui.set_cursor_pos([origin[0] + 24.0 + AVATAR_SIZE[0] + 12.0, origin[1]]);
+
+    let text_min = ui.cursor_screen_pos();
+    for (idx, (text, bold)) in system.parts.iter().enumerate() {
+        if idx > 0 {
+            ui.same_line_with_spacing(0.0, 0.0);
+        }
+        if *bold {
+            let font = ui.push_font(fonts.bold);
+            ui.text_colored(theme.text, text);
+            font.pop();
+        } else {
+            ui.text_colored(theme.text_muted, text);
+        }
+    }
+    let text_max = ui.item_rect_max();
+    let mouse = ui.io().mouse_pos;
+    let text_hovered = ui.is_window_hovered()
+        && mouse[0] >= text_min[0]
+        && mouse[0] <= text_max[0]
+        && mouse[1] >= text_min[1]
+        && mouse[1] <= text_max[1];
+    let mut action = None;
+    if text_hovered {
+        if let Some(tooltip) = &system.tooltip {
+            ui.tooltip_text(tooltip);
+        }
+        if let Some(jump @ SystemAction::JumpTo { .. }) = &system.action {
+            ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+            if ui.is_mouse_clicked(imgui::MouseButton::Left) {
+                action = Some(jump.clone());
+            }
+        }
+    }
+    ui.same_line_with_spacing(0.0, 6.0);
+    timestamp_text(ui, theme.text_muted, &row.times.inline, &row.times.full, 0.85);
+    if system.action == Some(SystemAction::JoinCall) && !in_call {
+        ui.same_line_with_spacing(0.0, 8.0);
+        let _id = ui.push_id(row.message.id.as_str());
+        if ui.small_button("Join") {
+            action = Some(SystemAction::JoinCall);
+        }
+    }
+    action
+}
+
+fn draw_icon(ui: &Ui, textures: &TextureCache, icon: crate::icons::Icon, size: f32, tint: [f32; 4]) {
+    match textures.icon(icon, size) {
+        Some(texture) => imgui::Image::new(texture, [size, size]).tint_col(tint).build(ui),
+        None => ui.dummy([size, size]),
+    }
+}
+
+fn draw_icon_at(ui: &Ui, textures: &TextureCache, icon: crate::icons::Icon, min: [f32; 2], size: f32, tint: [f32; 4]) {
+    if let Some(texture) = textures.icon(icon, size) {
+        ui.get_window_draw_list().add_image(texture, min, [min[0] + size, min[1] + size]).col(tint).build();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum VoiceToggle {
+    Mute,
+    Deafen,
+}
+
+fn persist_settings(state: &AppState) {
+    crate::settings::save(&crate::settings::Settings {
+        theme_file: current_theme_file(&state.theme),
+        input_device: state.selected_input_device.clone(),
+        output_device: state.selected_output_device.clone(),
+        ..state.audio_settings()
+    });
+}
+
+fn toggle_voice(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, toggle: VoiceToggle) {
+    match toggle {
+        VoiceToggle::Mute => state.toggle_mute(),
+        VoiceToggle::Deafen => state.toggle_deafen(),
+    }
+    persist_settings(state);
+    if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
+        let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
+            guild_id,
+            channel_id,
+            self_mute: state.self_muted,
+            self_deaf: state.self_deafened,
+        });
+    }
+}
+
+fn chevron_button(ui: &Ui, textures: &TextureCache, id: &str, tooltip: &str, width: f32, height: f32) -> bool {
+    let p = ui.cursor_screen_pos();
+    let clicked = ui.invisible_button(id, [width, height]);
+    let hovered = ui.is_item_hovered();
+    let tint = ui.style_color(if hovered { imgui::StyleColor::Text } else { imgui::StyleColor::TextDisabled });
+    let size = width;
+    draw_icon_at(ui, textures, crate::icons::Icon::ChevronDown, [p[0], p[1] + (height - size) / 2.0], size, tint);
+    if hovered {
+        ui.tooltip_text(tooltip);
+    }
+    clicked
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeviceKind {
+    Input,
+    Output,
+}
+
+fn draw_device_menu(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, kind: DeviceKind) {
+    let (title, devices, selected) = match kind {
+        DeviceKind::Input => ("Input Device", &state.voice_input_devices, &state.selected_input_device),
+        DeviceKind::Output => ("Output Device", &state.voice_output_devices, &state.selected_output_device),
+    };
+    ui.text_disabled(title);
+    ui.separator();
+    let mut picked: Option<Option<String>> = None;
+    if ui.selectable_config("Default").selected(selected.is_none()).build() {
+        picked = Some(None);
+    }
+    if devices.is_empty() {
+        ui.text_disabled("Loading devices...");
+    }
+    for device in devices {
+        if ui.selectable_config(device).selected(selected.as_deref() == Some(device.as_str())).build() {
+            picked = Some(Some(device.clone()));
+        }
+    }
+    let Some(device) = picked else { return };
+    match kind {
+        DeviceKind::Input => {
+            state.selected_input_device = device.clone();
+            let _ = cmd_tx.send(UiCommand::SetVoiceInputDevice { device });
+        }
+        DeviceKind::Output => {
+            state.selected_output_device = device.clone();
+            let _ = cmd_tx.send(UiCommand::SetVoiceOutputDevice { device });
+        }
+    }
+    persist_settings(state);
 }
 
 fn draw_voice_info(ui: &Ui, state: &mut AppState) {
@@ -3054,6 +3848,19 @@ fn draw_voice_info(ui: &Ui, state: &mut AppState) {
             row("Bitrate", format!("up {} / down {}", format_bitrate(s.bitrate_up_bps), format_bitrate(s.bitrate_down_bps)));
             row("Packet loss", format!("up {} / down {}", opt(s.loss_up_pct, "%"), opt(s.loss_down_pct, "%")));
             row("Jitter", opt(s.jitter_ms, "ms"));
+            #[cfg(feature = "screenshare")]
+            if !state.screen_share_stats.endpoint.is_empty() {
+                let video = &state.screen_share_stats;
+                let resolution = if video.video_width > 0 && video.video_height > 0 { format!("{}×{}", video.video_width, video.video_height) } else { "waiting for frame".into() };
+                ui.separator();
+                ui.text("Screen share");
+                row("Video", format!("{} | {:.1} fps | {}", if video.video_codec.is_empty() { "-" } else { &video.video_codec }, video.video_fps, resolution));
+                let send_resolution = if video.video_up_width > 0 && video.video_up_height > 0 { format!("{}×{}", video.video_up_width, video.video_up_height) } else { "-".into() };
+                row("Video sent", format!("{} | {:.1} fps | {}", format_bitrate(video.video_bitrate_up_bps), video.video_fps_up, send_resolution));
+                row("Video received", format!("{} | {:.1} fps", format_bitrate(video.video_bitrate_down_bps), video.video_fps));
+                row("Stream audio", format!("up {} | {}", format_bitrate(video.audio_stream_bitrate_up_bps), if video.audio_stream_active { "active" } else { "no packets" }));
+                row("Video errors", format!("decrypt {} | decoder drops {}", video.video_decrypt_failures, video.video_decoder_drops));
+            }
             ui.separator();
             let size = [340.0, 44.0];
             let graph = |id: &str, values: Vec<f32>, overlay: String| {
@@ -3063,6 +3870,13 @@ fn draw_voice_info(ui: &Ui, state: &mut AppState) {
             };
             graph("##g_up", series(&|x| x.bitrate_up_bps as f32 / 1000.0), format!("upload {:.0} kbps", s.bitrate_up_bps as f32 / 1000.0));
             graph("##g_down", series(&|x| x.bitrate_down_bps as f32 / 1000.0), format!("download {:.0} kbps", s.bitrate_down_bps as f32 / 1000.0));
+            #[cfg(feature = "screenshare")]
+            if !state.screen_share_stats.endpoint.is_empty() {
+                let video_series: Vec<f32> = state.screen_share_history.iter().map(|x| x.video_bitrate_down_bps as f32 / 1000.0).collect();
+                graph("##g_video_down", video_series, format!("video received {:.0} kbps", state.screen_share_stats.video_bitrate_down_bps as f32 / 1000.0));
+                let video_up_series: Vec<f32> = state.screen_share_history.iter().map(|x| x.video_bitrate_up_bps as f32 / 1000.0).collect();
+                graph("##g_video_up", video_up_series, format!("video sent {:.0} kbps", state.screen_share_stats.video_bitrate_up_bps as f32 / 1000.0));
+            }
             graph(
                 "##g_rtt",
                 series(&|x| x.rtc_rtt_ms.or(x.ws_rtt_ms.map(|v| v as f32)).unwrap_or(0.0)),
@@ -3576,38 +4390,275 @@ fn apply_switcher_target(state: &mut AppState, cmd_tx: &UnboundedSender<UiComman
             }
             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
             state.selected_channel = Some(channel_id);
+            state.server_call_minimized = true;
         }
         Target::Dm { channel_id } => {
             state.selected_guild = None;
             state.pending_sidebar_tab = Some(0);
             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
             state.selected_channel = Some(channel_id);
+            state.server_call_minimized = true;
         }
     }
 }
 
-fn emoji_button(ui: &Ui, textures: &TextureCache, id: &str, ch: char, tooltip: &str, active: Option<[f32; 4]>) -> bool {
-    const SIZE: f32 = 30.0;
+fn icon_button(ui: &Ui, textures: &TextureCache, id: &str, icon: crate::icons::Icon, tooltip: &str, active: Option<[f32; 4]>) -> bool {
+    icon_button_sized(ui, textures, id, icon, tooltip, active, 30.0)
+}
+
+fn icon_button_sized(
+    ui: &Ui,
+    textures: &TextureCache,
+    id: &str,
+    icon: crate::icons::Icon,
+    tooltip: &str,
+    active: Option<[f32; 4]>,
+    size: f32,
+) -> bool {
+    const SIZE_REF: f32 = 30.0;
+    let pad = (6.0 * size / SIZE_REF).round();
     let p = ui.cursor_screen_pos();
-    let clicked = ui.invisible_button(id, [SIZE, SIZE]);
+    let clicked = ui.invisible_button(id, [size, size]);
     let hovered = ui.is_item_hovered();
-    let dl = ui.get_window_draw_list();
     let fill = match (active, hovered) {
         (Some(c), _) => Some([c[0], c[1], c[2], 0.18]),
         (None, true) => Some(ui.style_color(imgui::StyleColor::ButtonHovered)),
         (None, false) => None,
     };
     if let Some(c) = fill {
-        dl.add_rect(p, [p[0] + SIZE, p[1] + SIZE], c).filled(true).rounding(9.0).build();
+        ui.get_window_draw_list().add_rect(p, [p[0] + size, p[1] + size], c).filled(true).rounding(9.0).build();
     }
-    if let EmojiTexture::Ready(tex) = emoji_texture(textures, ch) {
-        let pad = 4.0;
-        dl.add_image(tex, [p[0] + pad, p[1] + pad], [p[0] + SIZE - pad, p[1] + SIZE - pad]).build();
-    }
+    let tint = match (active, hovered) {
+        (Some(c), _) => c,
+        (None, true) => ui.style_color(imgui::StyleColor::Text),
+        (None, false) => ui.style_color(imgui::StyleColor::TextDisabled),
+    };
+    draw_icon_at(ui, textures, icon, [p[0] + pad, p[1] + pad], size - pad * 2.0, tint);
     if hovered {
         ui.tooltip_text(tooltip);
     }
     clicked
+}
+
+#[cfg(feature = "screenshare")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerCallIcon { Microphone, Headphones, Screen, Info, Hangup }
+
+#[cfg(feature = "screenshare")]
+fn draw_server_call_button(ui: &Ui, textures: &TextureCache, id: &str, tooltip: &str, icon: ServerCallIcon, active: Option<[f32; 4]>, x: f32, y: f32, size: f32) -> bool {
+    ui.set_cursor_pos([x, y]);
+    let clicked = ui.invisible_button(id, [size, size]);
+    let hovered = ui.is_item_hovered();
+    let p = ui.item_rect_min();
+    let base = active.unwrap_or([0.17, 0.17, 0.20, 1.0]);
+    let fill = if icon == ServerCallIcon::Hangup {
+        [0.78, 0.16, 0.19, 1.0]
+    } else if hovered && active.is_none() {
+        [0.27, 0.27, 0.31, 1.0]
+    } else {
+        base
+    };
+    ui.get_window_draw_list().add_rect(p, [p[0] + size, p[1] + size], fill).filled(true).rounding(size * 0.3).build();
+    let glyph = match (icon, active.is_some()) {
+        (ServerCallIcon::Microphone, false) => crate::icons::Icon::Mic,
+        (ServerCallIcon::Microphone, true) => crate::icons::Icon::MicOff,
+        (ServerCallIcon::Headphones, false) => crate::icons::Icon::Headphones,
+        (ServerCallIcon::Headphones, true) => crate::icons::Icon::HeadphoneOff,
+        (ServerCallIcon::Screen, _) => crate::icons::Icon::MonitorUp,
+        (ServerCallIcon::Info, _) => crate::icons::Icon::Info,
+        (ServerCallIcon::Hangup, _) => crate::icons::Icon::PhoneOff,
+    };
+    let glyph_size = (size * 0.45).round();
+    let inset = (size - glyph_size) / 2.0;
+    draw_icon_at(ui, textures, glyph, [p[0] + inset, p[1] + inset], glyph_size, [0.96, 0.96, 0.98, 1.0]);
+    if hovered { ui.tooltip_text(tooltip); }
+    clicked
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_server_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str) {
+    const SIZE: f32 = 60.0;
+    const GAP: f32 = 14.0;
+    const COUNT: f32 = 5.0;
+    let width = ui.window_size()[0];
+    let x = ((width - (COUNT * SIZE + (COUNT - 1.0) * GAP)) * 0.5).max(0.0);
+    let y = (ui.window_size()[1] - 88.0).max(8.0);
+    let dock_width = COUNT * SIZE + (COUNT - 1.0) * GAP + 28.0;
+    {
+        let dl = ui.get_window_draw_list();
+        let origin = ui.cursor_screen_pos();
+        dl.add_rect([origin[0] + x - 14.0, origin[1] + y - 8.0], [origin[0] + x + dock_width - 14.0, origin[1] + y + SIZE + 8.0], [0.105, 0.105, 0.125, 0.96]).filled(true).rounding(22.0).build();
+    }
+    let mut index = 0.0f32;
+    let mut next_x = || {
+        let pos = x + index * (SIZE + GAP);
+        index += 1.0;
+        pos
+    };
+    let muted = state.self_muted;
+    if draw_server_call_button(ui, textures, "server_call_mute", if muted { "Unmute microphone" } else { "Mute microphone" }, ServerCallIcon::Microphone, muted.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Mute);
+    }
+    let deafened = state.self_deafened;
+    if draw_server_call_button(ui, textures, "server_call_deafen", if deafened { "Undeafen" } else { "Deafen" }, ServerCallIcon::Headphones, deafened.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
+    }
+    let sharing = state.screen_sharing;
+    if draw_server_call_button(ui, textures, "server_call_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
+        if sharing {
+            state.screen_sharing = false;
+            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
+        } else {
+            state.show_screen_share_setup = true;
+        }
+    }
+    if draw_server_call_button(ui, textures, "server_call_info", "Connection info", ServerCallIcon::Info, state.show_voice_info.then_some([0.25, 0.35, 0.72, 1.0]), next_x(), y, SIZE) {
+        state.show_voice_info = !state.show_voice_info;
+    }
+    if draw_server_call_button(ui, textures, "server_call_hangup", "Leave voice channel", ServerCallIcon::Hangup, None, next_x(), y, SIZE) {
+        let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
+    }
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str) {
+    const SIZE: f32 = 34.0;
+    const GAP: f32 = 5.0;
+    const COUNT: f32 = 5.0;
+    let width = ui.window_size()[0];
+    let x = ((width - (COUNT * SIZE + (COUNT - 1.0) * GAP)) * 0.5).max(0.0);
+    let y = ui.cursor_pos()[1] + 1.0;
+    let mut index = 0.0f32;
+    let mut next_x = || {
+        let pos = x + index * (SIZE + GAP);
+        index += 1.0;
+        pos
+    };
+    let muted = state.self_muted;
+    if draw_server_call_button(ui, textures, "server_call_sidebar_mute", if muted { "Unmute microphone" } else { "Mute microphone" }, ServerCallIcon::Microphone, muted.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Mute);
+    }
+    let deafened = state.self_deafened;
+    if draw_server_call_button(ui, textures, "server_call_sidebar_deafen", if deafened { "Undeafen" } else { "Deafen" }, ServerCallIcon::Headphones, deafened.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
+    }
+    let sharing = state.screen_sharing;
+    if draw_server_call_button(ui, textures, "server_call_sidebar_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
+        if sharing {
+            state.screen_sharing = false;
+            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
+        } else {
+            state.show_screen_share_setup = true;
+        }
+    }
+    if draw_server_call_button(ui, textures, "server_call_sidebar_info", "Connection info", ServerCallIcon::Info, state.show_voice_info.then_some([0.25, 0.35, 0.72, 1.0]), next_x(), y, SIZE) {
+        state.show_voice_info = !state.show_voice_info;
+    }
+    if draw_server_call_button(ui, textures, "server_call_sidebar_hangup", "Leave voice channel", ServerCallIcon::Hangup, None, next_x(), y, SIZE) {
+        let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
+    }
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_call_participant_tiles(
+    ui: &Ui,
+    state: &mut AppState,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    participants: &[(rustcord_client::models::User, bool)],
+    origin: [f32; 2],
+    width: f32,
+    height: f32,
+    large: bool,
+) {
+    if participants.is_empty() { return; }
+    let gap = if large { 18.0 } else { 12.0 };
+    let columns = if large {
+        participants.len().min(3).max(1)
+    } else {
+        (((width + gap) / (220.0 + gap)).floor() as usize).clamp(1, 6).min(participants.len())
+    };
+    let rows = (participants.len() + columns - 1) / columns;
+    let area_top = if large { 72.0 } else { height - 224.0 };
+    let area_bottom = if large { height - 122.0 } else { height - 106.0 };
+    let area_h = (area_bottom - area_top).max(90.0);
+    let tile_w = if large {
+        ((width - 48.0 - gap * (columns.saturating_sub(1) as f32)) / columns as f32).min(420.0).max(180.0)
+    } else { 220.0 };
+    let tile_h = if large {
+        ((area_h - gap * (rows.saturating_sub(1) as f32)) / rows as f32).min(340.0).max(180.0)
+    } else { 118.0 };
+    let visible = participants.len().min(columns * if large { 3 } else { 1 });
+    let grid_w = columns as f32 * tile_w + columns.saturating_sub(1) as f32 * gap;
+    let grid_h = if large { rows.min(3) as f32 * tile_h + rows.min(3).saturating_sub(1) as f32 * gap } else { tile_h };
+    let start_x = (width - grid_w) * 0.5;
+    let start_y = if large { area_top + (area_h - grid_h) * 0.5 } else { area_top };
+    for (index, (user, speaking)) in participants.iter().take(visible).enumerate() {
+        let col = index % columns;
+        let row = index / columns;
+        let p_min = [origin[0] + start_x + col as f32 * (tile_w + gap), origin[1] + start_y + row as f32 * (tile_h + gap)];
+        let p_max = [p_min[0] + tile_w, p_min[1] + tile_h];
+        let avatar_size = if large { 124.0 } else { 58.0 };
+        let avatar_min = [p_min[0] + (tile_w - avatar_size) * 0.5, p_min[1] + (tile_h - avatar_size) * 0.5 - if large { 14.0 } else { 8.0 }];
+        let avatar_max = [avatar_min[0] + avatar_size, avatar_min[1] + avatar_size];
+        let avatar_url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+        let avatar = textures.get_still(&avatar_url).map(|(id, _)| id);
+        if avatar.is_none() { textures.request(&avatar_url, cmd_tx); }
+        let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+        let display_name = truncate_to_width(ui, &name, tile_w - if large { 32.0 } else { 82.0 }).unwrap_or(name);
+        let speaking_color = [0.26, 0.83, 0.44, 1.0];
+        let border = if *speaking { speaking_color } else { [0.23, 0.23, 0.27, 1.0] };
+        let fill = if *speaking { [0.10, 0.16, 0.13, 1.0] } else { [0.09, 0.09, 0.105, 1.0] };
+        {
+            let dl = ui.get_window_draw_list();
+            dl.add_rect(p_min, p_max, border).filled(true).rounding(if large { 16.0 } else { 12.0 }).build();
+            dl.add_rect([p_min[0] + 2.0, p_min[1] + 2.0], [p_max[0] - 2.0, p_max[1] - 2.0], fill).filled(true).rounding(if large { 14.0 } else { 10.0 }).build();
+            if let Some(texture_id) = avatar {
+                dl.add_image_rounded(texture_id, avatar_min, avatar_max, avatar_size * 0.5).build();
+            } else {
+                dl.add_circle([avatar_min[0] + avatar_size * 0.5, avatar_min[1] + avatar_size * 0.5], avatar_size * 0.5, [0.35, 0.35, 0.40, 1.0]).filled(true).build();
+            }
+            let text_y = p_max[1] - if large { 34.0 } else { 25.0 };
+            dl.add_rect([p_min[0] + 8.0, text_y - 4.0], [p_max[0] - 8.0, p_max[1] - 8.0], [0.035, 0.035, 0.045, 0.9]).filled(true).rounding(8.0).build();
+            dl.add_text([p_min[0] + 16.0, text_y], ui.style_color(imgui::StyleColor::Text), display_name);
+            if *speaking {
+                dl.add_circle([p_max[0] - 18.0, text_y + 6.0], 4.0, speaking_color).filled(true).build();
+            }
+            if large && state.active_streams.contains_key(&user.id) {
+                dl.add_rect([p_min[0] + 14.0, p_min[1] + 14.0], [p_min[0] + 60.0, p_min[1] + 38.0], [0.82, 0.12, 0.18, 1.0]).filled(true).rounding(8.0).build();
+                dl.add_text([p_min[0] + 22.0, p_min[1] + 18.0], [1.0, 1.0, 1.0, 1.0], "LIVE");
+            }
+        }
+        if large {
+            if let Some(stream_key) = state.active_streams.get(&user.id).cloned() {
+                let button_width = 152.0;
+                let button_height = 38.0;
+                ui.set_cursor_pos([p_min[0] - origin[0] + (tile_w - button_width) * 0.5, p_max[1] - origin[1] - 82.0]);
+                let clicked = ui.invisible_button(format!("watch_stream_tile_{}", user.id), [button_width, button_height]);
+                let hovered = ui.is_item_hovered();
+                let button_min = ui.item_rect_min();
+                {
+                    let dl = ui.get_window_draw_list();
+                    let color = if hovered { [0.42, 0.27, 0.83, 1.0] } else { [0.36, 0.22, 0.73, 1.0] };
+                    dl.add_rect(button_min, [button_min[0] + button_width, button_min[1] + button_height], color).filled(true).rounding(9.0).build();
+                    let label = "Watch Stream";
+                    let label_size = ui.calc_text_size(label);
+                    dl.add_text([button_min[0] + (button_width - label_size[0]) * 0.5, button_min[1] + (button_height - label_size[1]) * 0.5], [1.0, 1.0, 1.0, 1.0], label);
+                }
+                if clicked {
+                    let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+                    state.watching_stream = Some(stream_key);
+                    state.server_call_minimized = false;
+                    state.server_call_focus_stream = false;
+                }
+            }
+        }
+    }
+    if participants.len() > visible {
+        let text = format!("+{} more", participants.len() - visible);
+        ui.set_cursor_pos([start_x + grid_w + 8.0, start_y + tile_h * 0.5]);
+        ui.text_disabled(text);
+    }
 }
 
 fn dispatch_keybinds(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
@@ -3617,42 +4668,116 @@ fn dispatch_keybinds(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiC
     use crate::keybinds::Action;
 
     let pressed = |action: Action| state.keybinds.get(action).is_some_and(|key| ui.is_key_pressed(key));
+    let (focus, mute, deafen, leave) =
+        (pressed(Action::FocusCompose), pressed(Action::ToggleMute), pressed(Action::ToggleDeafen), pressed(Action::LeaveVoiceChannel));
 
-    if pressed(Action::FocusCompose) {
+    if focus {
         state.focus_compose = true;
     }
 
-    if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
-        if pressed(Action::ToggleMute) {
-            state.self_muted = !state.self_muted;
-            if state.self_muted {
-                state.self_deafened = false;
-            }
-            let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
-                guild_id: guild_id.clone(),
-                channel_id: channel_id.clone(),
-                self_mute: state.self_muted,
-                self_deaf: state.self_deafened,
-            });
+    if let Some((guild_id, _)) = state.connected_voice_channel.clone() {
+        if mute {
+            toggle_voice(state, cmd_tx, VoiceToggle::Mute);
         }
-        if pressed(Action::ToggleDeafen) {
-            state.self_deafened = !state.self_deafened;
-            if state.self_deafened {
-                state.self_muted = true;
-            }
-            let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
-                guild_id: guild_id.clone(),
-                channel_id: channel_id.clone(),
-                self_mute: state.self_muted,
-                self_deaf: state.self_deafened,
-            });
+        if deafen {
+            toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
         }
-        if pressed(Action::LeaveVoiceChannel) {
+        if leave {
             let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
-            state.self_muted = false;
-            state.self_deafened = false;
         }
     }
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_screen_share_setup_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    ui.window("##screen_share_setup_host")
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([1.0, 1.0], imgui::Condition::Always)
+        .no_decoration()
+        .draw_background(false)
+        .build(|| {
+            let _popup_bg = ui.push_style_color(imgui::StyleColor::PopupBg, state.theme.panel);
+            let _popup_title = ui.push_style_color(imgui::StyleColor::TitleBg, state.theme.panel);
+            let _popup_title_active = ui.push_style_color(imgui::StyleColor::TitleBgActive, state.theme.panel);
+            let _popup_text = ui.push_style_color(imgui::StyleColor::Text, state.theme.text);
+            let _popup_muted = ui.push_style_color(imgui::StyleColor::TextDisabled, state.theme.text_muted);
+            let _popup_frame = ui.push_style_color(imgui::StyleColor::FrameBg, state.theme.background);
+            let _popup_button = ui.push_style_color(imgui::StyleColor::Button, state.theme.accent);
+            let _popup_button_hovered = ui.push_style_color(imgui::StyleColor::ButtonHovered, state.theme.accent_hover);
+            let _popup_button_active = ui.push_style_color(imgui::StyleColor::ButtonActive, state.theme.accent_hover);
+            if state.show_screen_share_setup {
+                ui.open_popup("Start screen share");
+                state.show_screen_share_setup = false;
+                if !state.screen_audio_sources_loaded {
+                    let _ = cmd_tx.send(UiCommand::LoadScreenAudioSources);
+                }
+            }
+            if let Some(_popup) = ui.modal_popup_config("Start screen share").always_auto_resize(true).begin_popup() {
+                ui.text("Choose stream quality and audio before sharing.");
+                ui.checkbox("Share audio", &mut state.share_system_audio);
+                if state.share_system_audio {
+                    let selected_audio = state.selected_screen_audio_pid
+                        .and_then(|pid| state.screen_audio_sources.iter().find(|(source_pid, _, _)| *source_pid == pid))
+                        .map(|(_, name, _)| name.as_str())
+                        .unwrap_or("System audio (exclude RustCord)");
+                    ui.set_next_item_width(260.0);
+                    if let Some(_combo) = ui.begin_combo("Audio source", selected_audio) {
+                        if ui.selectable_config("System audio (exclude RustCord)")
+                            .selected(state.selected_screen_audio_pid.is_none()).build()
+                        {
+                            state.selected_screen_audio_pid = None;
+                        }
+                        for (pid, name, active) in &state.screen_audio_sources {
+                            let label = if *active { format!("{name} (playing)##{pid}") } else { format!("{name}##{pid}") };
+                            if ui.selectable_config(&label).selected(state.selected_screen_audio_pid == Some(*pid)).build() {
+                                state.selected_screen_audio_pid = Some(*pid);
+                            }
+                        }
+                    }
+                    if let Some(error) = &state.screen_audio_sources_error {
+                        ui.text_colored([1.0, 0.55, 0.35, 1.0], format!("App audio sources unavailable: {error}"));
+                    } else if state.screen_audio_sources_loaded && state.screen_audio_sources.is_empty() {
+                        ui.text_disabled("No other apps with audio output found.");
+                    }
+                    if ui.small_button("Refresh audio sources") {
+                        state.screen_audio_sources_loaded = false;
+                        state.screen_audio_sources_error = None;
+                        let _ = cmd_tx.send(UiCommand::LoadScreenAudioSources);
+                    }
+                }
+                let quality = format!("{}p / {} fps", state.screen_share_max_height, state.screen_share_fps);
+                ui.set_next_item_width(180.0);
+                if let Some(_combo) = ui.begin_combo("Stream quality", &quality) {
+                    for (height, fps, label) in [(720, 15, "720p / 15 fps"), (720, 30, "720p / 30 fps"), (1080, 15, "1080p / 15 fps"), (1080, 30, "1080p / 30 fps"), (1080, 60, "1080p / 60 fps")] {
+                        let selected = state.screen_share_max_height == height && state.screen_share_fps == fps;
+                        if ui.selectable_config(label).selected(selected).build() {
+                            state.screen_share_max_height = height;
+                            state.screen_share_fps = fps;
+                        }
+                    }
+                }
+                ui.spacing();
+                if ui.button("Start sharing") {
+                    if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
+                        state.screen_sharing = true;
+                        let _ = cmd_tx.send(UiCommand::SetScreenSharing {
+                            enabled: true,
+                            include_system_audio: state.share_system_audio,
+                            audio_source_pid: state.selected_screen_audio_pid,
+                            max_height: state.screen_share_max_height,
+                            framerate: state.screen_share_fps,
+                            guild_id,
+                            channel_id,
+                        });
+                    }
+                    ui.close_current_popup();
+                }
+                ui.same_line();
+                if ui.button("Cancel") {
+                    ui.close_current_popup();
+                }
+            }
+        });
 }
 
 fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str, center: bool) {
@@ -3660,40 +4785,26 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
     const GAP: f32 = 8.0;
     const RED: [f32; 4] = [0.75, 0.25, 0.25, 1.0];
     const GREEN: [f32; 4] = [0.20, 0.60, 0.35, 1.0];
+    #[cfg(not(feature = "screenshare"))]
+    let _ = channel_id;
     if center {
-        let total = 5.0 * BUTTON + 4.0 * GAP;
+        let button_count = if cfg!(feature = "screenshare") { 6.0 } else { 5.0 };
+        let total = button_count * BUTTON + (button_count - 1.0) * GAP;
         let y = ui.cursor_pos()[1];
         ui.set_cursor_pos([(ui.window_size()[0] - total) / 2.0, y]);
     }
-    let send_mute_deaf = |state: &AppState| {
-        let _ = cmd_tx.send(UiCommand::SetVoiceMuteDeaf {
-            guild_id: guild_id.clone(),
-            channel_id: channel_id.to_string(),
-            self_mute: state.self_muted,
-            self_deaf: state.self_deafened,
-        });
-    };
-
     let muted = state.self_muted;
-    if emoji_button(ui, textures, "vc_mute", if muted { '\u{1F507}' } else { '\u{1F3A4}' }, if muted { "Unmute" } else { "Mute" }, muted.then_some(RED)) {
-        state.self_muted = !state.self_muted;
-        if state.self_muted {
-            state.self_deafened = false;
-        }
-        send_mute_deaf(state);
+    if icon_button(ui, textures, "vc_mute", if muted { crate::icons::Icon::MicOff } else { crate::icons::Icon::Mic }, if muted { "Unmute" } else { "Mute" }, muted.then_some(RED)) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Mute);
     }
     ui.same_line_with_spacing(0.0, GAP);
     let deafened = state.self_deafened;
-    if emoji_button(ui, textures, "vc_deafen", if deafened { '\u{1F515}' } else { '\u{1F3A7}' }, if deafened { "Undeafen" } else { "Deafen" }, deafened.then_some(RED)) {
-        state.self_deafened = !state.self_deafened;
-        if state.self_deafened {
-            state.self_muted = true;
-        }
-        send_mute_deaf(state);
+    if icon_button(ui, textures, "vc_deafen", if deafened { crate::icons::Icon::HeadphoneOff } else { crate::icons::Icon::Headphones }, if deafened { "Undeafen" } else { "Deafen" }, deafened.then_some(RED)) {
+        toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
     }
     ui.same_line_with_spacing(0.0, GAP);
     let denoise = state.denoise;
-    if emoji_button(ui, textures, "vc_rnn", '\u{1F92B}', if denoise { "Noise suppression: on" } else { "Noise suppression: off" }, denoise.then_some(GREEN)) {
+    if icon_button(ui, textures, "vc_rnn", crate::icons::Icon::AudioWaveform, if denoise { "Noise suppression: on" } else { "Noise suppression: off" }, denoise.then_some(GREEN)) {
         state.denoise = !state.denoise;
         crate::settings::save(&crate::settings::Settings {
             theme_file: current_theme_file(&state.theme),
@@ -3704,14 +4815,25 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
         let _ = cmd_tx.send(UiCommand::SetMicProcessing { gain: state.mic_gain, denoise: state.denoise });
     }
     ui.same_line_with_spacing(0.0, GAP);
-    if emoji_button(ui, textures, "vc_info", '\u{2139}', "Connection info", state.show_voice_info.then_some([0.35, 0.40, 0.95, 1.0])) {
+    if icon_button(ui, textures, "vc_info", crate::icons::Icon::Info, "Connection info", state.show_voice_info.then_some([0.35, 0.40, 0.95, 1.0])) {
         state.show_voice_info = !state.show_voice_info;
     }
     ui.same_line_with_spacing(0.0, GAP);
-    if emoji_button(ui, textures, "vc_disconnect", '\u{1F4F4}', "Disconnect", None) {
+    #[cfg(feature = "screenshare")]
+    {
+        let active = state.screen_sharing;
+        if icon_button(ui, textures, "vc_screenshare", SCREENSHARE_ICON, if active { "Stop screen sharing" } else { "Share your screen" }, active.then_some(GREEN)) {
+            if active {
+                state.screen_sharing = false;
+                let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
+            } else {
+                state.show_screen_share_setup = true;
+            }
+        }
+        ui.same_line_with_spacing(0.0, GAP);
+    }
+    if icon_button(ui, textures, "vc_disconnect", crate::icons::Icon::PhoneOff, "Disconnect", None) {
         let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: guild_id.clone() });
-        state.self_muted = false;
-        state.self_deafened = false;
     }
 }
 
@@ -3742,7 +4864,127 @@ fn draw_user_volume_controls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSe
     }
 }
 
+#[cfg(feature = "screenshare")]
+const CALL_PANEL_HEIGHT: f32 = 230.0;
+#[cfg(not(feature = "screenshare"))]
 const CALL_PANEL_HEIGHT: f32 = 130.0;
+
+#[cfg(feature = "screenshare")]
+fn draw_server_call_fullscreen(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some((Some(guild_id), channel_id)) = state.connected_voice_channel.clone() else { return };
+    let stream_key = state.watching_stream.clone();
+    let owner_id = stream_key.as_ref().and_then(|key| state.active_streams.iter().find_map(|(user_id, active_key)| (active_key == key).then(|| user_id.clone())));
+    let owner_name = owner_id.as_ref().and_then(|id| state.known_users.get(id))
+        .map(|user| user.global_name.clone().unwrap_or_else(|| user.username.clone()))
+        .or(owner_id.clone())
+        .unwrap_or_else(|| "No stream selected".into());
+    let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
+    let [width, height] = ui.window_size();
+    let origin = ui.cursor_screen_pos();
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_rect(origin, [origin[0] + width, origin[1] + height], [0.035, 0.035, 0.045, 1.0]).filled(true).build();
+    drop(draw_list);
+
+    ui.set_cursor_pos([20.0, 14.0]);
+    ui.text_colored([0.92, 0.92, 0.96, 1.0], if stream_key.is_some() { format!("{channel_name}  ·  Live: {owner_name}") } else { format!("Voice channel  ·  {channel_name}") });
+    let button_width = if stream_key.is_some() { 330.0 } else { 120.0 };
+    ui.set_cursor_pos([(width - button_width).max(12.0), 10.0]);
+    if stream_key.is_some() {
+        if ui.small_button(if state.server_call_focus_stream { "Show tiles##server_call" } else { "Expand stream##server_call" }) {
+            state.server_call_focus_stream = !state.server_call_focus_stream;
+        }
+        ui.same_line();
+    }
+    if ui.small_button("Return to chat##server_call") {
+        state.server_call_minimized = true;
+    }
+    if let Some(stream_key) = stream_key {
+        ui.same_line();
+        if ui.small_button("Stop watching##server_call") {
+            let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+            state.unwatching_stream = Some(stream_key);
+            state.watching_stream = None;
+            state.server_call_minimized = false;
+        }
+    }
+
+    let stage_top = 48.0;
+    let stage_bottom = if state.server_call_focus_stream { height - 108.0 } else { height - 230.0 };
+    let stage_width = if state.server_call_focus_stream { width - 32.0 } else { width * 0.92 };
+    let stage_width = stage_width.clamp(1.0, (width - 48.0).max(1.0));
+    let stage_height = (stage_bottom - stage_top).max(100.0);
+    let frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    if let Some((texture_id, source)) = frame {
+        let scale = (stage_width / source[0].max(1.0)).min(stage_height / source[1].max(1.0));
+        let size = [source[0] * scale, source[1] * scale];
+        let pos = [(width - size[0]) * 0.5, stage_top + (stage_height - size[1]) * 0.5];
+        ui.set_cursor_pos(pos);
+        imgui::Image::new(texture_id, size).build(ui);
+    } else if state.watching_stream.is_some() {
+        let text = "Connecting to the stream…";
+        let text_size = ui.calc_text_size(text);
+        ui.set_cursor_pos([(width - text_size[0]) * 0.5, stage_top + stage_height * 0.5]);
+        ui.text_disabled(text);
+    }
+
+    let participants: Vec<(rustcord_client::models::User, bool)> = state.members_in_voice_channel(&guild_id, &channel_id)
+        .into_iter()
+        .filter_map(|voice_state| {
+            let user = state.known_users.get(&voice_state.user_id)
+                .or_else(|| voice_state.member.as_ref().and_then(|m| m.user.as_ref()))
+                .or_else(|| state.current_user.as_ref().filter(|u| u.id == voice_state.user_id))?;
+            Some((user.clone(), state.voice_speaking_users.contains(&voice_state.user_id)))
+        })
+        .collect();
+    if state.watching_stream.is_some() {
+        if !state.server_call_focus_stream {
+            draw_call_participant_tiles(ui, state, textures, cmd_tx, &participants, origin, width, height, false);
+        }
+    } else {
+        if !state.active_streams.is_empty() {
+            ui.set_cursor_pos([20.0, 51.0]);
+            ui.text_disabled("Right-click a LIVE participant in the channel list to watch their stream.");
+        }
+        draw_call_participant_tiles(ui, state, textures, cmd_tx, &participants, origin, width, height, true);
+    }
+
+    draw_server_call_controls(ui, state, textures, cmd_tx, Some(guild_id), &channel_id);
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_watched_stream_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) -> f32 {
+    let Some(stream_key) = state.watching_stream.clone() else { return 0.0 };
+    let owner_id = state.active_streams.iter().find_map(|(user_id, key)| (key == &stream_key).then(|| user_id.clone()));
+    let owner_name = owner_id.as_ref().and_then(|id| state.known_users.get(id))
+        .map(|user| user.global_name.clone().unwrap_or_else(|| user.username.clone()))
+        .or(owner_id.clone())
+        .unwrap_or_else(|| "screen share".into());
+    let frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    let image_size = frame.map(|(_, source)| {
+        let max_width = (ui.window_size()[0] - 24.0).clamp(1.0, 900.0);
+        let max_height = 400.0;
+        let scale = (max_width / source[0].max(1.0)).min(max_height / source[1].max(1.0));
+        [source[0] * scale, source[1] * scale]
+    });
+    let panel_height = image_size.map_or(74.0, |size| size[1] + 44.0);
+    ui.child_window("watched_stream_panel").size([0.0, panel_height]).build(|| {
+        ui.text(format!("Live: {owner_name}"));
+        ui.same_line();
+        if ui.small_button("Stop watching##live_stream_panel") {
+            let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+            state.unwatching_stream = Some(stream_key.clone());
+            state.watching_stream = None;
+        }
+        if let (Some((texture_id, _)), Some(size)) = (frame, image_size) {
+            let x = ((ui.window_size()[0] - size[0]) * 0.5).max(0.0);
+            ui.set_cursor_pos([x, 28.0]);
+            imgui::Image::new(texture_id, size).build(ui);
+        } else {
+            ui.text_disabled("Connecting to the stream…");
+        }
+    });
+    panel_height
+}
 
 fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
     const SIZE: f32 = 56.0;
@@ -3761,14 +5003,46 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
         })
         .collect();
     let in_call = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
+    #[cfg(feature = "screenshare")]
+    let live_videos: Vec<_> = members.iter().map(|(user, _)| textures.live_video(&user.id)).collect();
     ui.child_window("dm_call_panel").size([0.0, CALL_PANEL_HEIGHT]).build(|| {
         let width = ui.window_size()[0];
+        #[cfg(feature = "screenshare")]
+        let row_w = live_videos.iter().map(|live| if live.is_some() { 180.0 } else { SIZE }).sum::<f32>()
+            + members.len().saturating_sub(1) as f32 * GAP;
+        #[cfg(not(feature = "screenshare"))]
         let row_w = members.len() as f32 * SIZE + members.len().saturating_sub(1) as f32 * GAP;
         ui.set_cursor_pos([(width - row_w) / 2.0, 12.0]);
-        for (user, speaking) in &members {
+        let mut row_height = SIZE;
+        for (member_index, (user, speaking)) in members.iter().enumerate() {
             let p = ui.cursor_screen_pos();
-            let center = [p[0] + SIZE / 2.0, p[1] + SIZE / 2.0];
+            #[cfg(feature = "screenshare")]
+            let live = live_videos.get(member_index).and_then(|v| *v);
+            #[cfg(feature = "screenshare")]
+            let tile_size = if let Some((_, source_size)) = live {
+                let scale = (180.0 / source_size[0].max(1.0)).min(112.0 / source_size[1].max(1.0));
+                [source_size[0] * scale, source_size[1] * scale]
+            } else {
+                [SIZE, SIZE]
+            };
+            #[cfg(not(feature = "screenshare"))]
+            let tile_size = [SIZE, SIZE];
+            row_height = row_height.max(tile_size[1]);
+            let center = [p[0] + tile_size[0] / 2.0, p[1] + tile_size[1] / 2.0];
             let url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+            #[cfg(feature = "screenshare")]
+            if let Some((texture_id, _)) = live {
+                imgui::Image::new(texture_id, tile_size).build(ui);
+            } else {
+                match textures.get(&url) {
+                    Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
+                    None => {
+                        textures.request(&url, cmd_tx);
+                        ui.dummy([SIZE, SIZE]);
+                    }
+                }
+            }
+            #[cfg(not(feature = "screenshare"))]
             match textures.get(&url) {
                 Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
                 None => {
@@ -3786,7 +5060,9 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
                     ui.open_popup("dm_call_member_ctx");
                 }
             }
-            ui.same_line_with_spacing(0.0, GAP);
+            if member_index + 1 < members.len() {
+                ui.same_line_with_spacing(0.0, GAP);
+            }
         }
         ui.popup("dm_call_member_ctx", || {
             let Some(member_id) = state.context_vc_member.clone() else { return };
@@ -3798,10 +5074,26 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
             if ui.selectable("Profile") {
                 state.profile_popout = known;
             }
+            #[cfg(feature = "screenshare")]
+            if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
+                if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                    if ui.selectable("Stop watching") {
+                        let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+                        state.unwatching_stream = Some(stream_key.clone());
+                        state.watching_stream = None;
+                        state.server_call_minimized = false;
+                    }
+                } else if ui.selectable("Watch screen share") {
+                    let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+                    state.watching_stream = Some(stream_key);
+                    state.server_call_minimized = false;
+                    state.server_call_focus_stream = false;
+                }
+            }
             draw_user_volume_controls(ui, state, cmd_tx, &member_id);
         });
         if in_call {
-            ui.set_cursor_pos([0.0, 12.0 + SIZE + 18.0]);
+            ui.set_cursor_pos([0.0, 12.0 + row_height + 18.0]);
             draw_voice_controls(ui, state, textures, cmd_tx, None, &channel_id, true);
         }
     });
@@ -3863,8 +5155,13 @@ fn draw_channel_header(
             text_x = 44.0;
         }
 
-        let icon_count = if is_dm { 3 } else { 2 };
-        let icons_width = icon_count as f32 * ICON_SIZE + (icon_count - 1) as f32 * ICON_GAP;
+        let is_one_to_one = dm.is_some_and(|d| d.kind == rustcord_client::models::ChannelType::Dm);
+        let icon_count = match (is_dm, is_one_to_one) {
+            (true, true) => 6,
+            (true, false) => 5,
+            _ => 2,
+        };
+        let icons_width = icon_count as f32 * (ICON_SIZE + ICON_GAP) + HEADER_SEARCH_WIDTH;
         let icons_x = ui.window_size()[0] - icons_width - 12.0;
 
         ui.set_cursor_pos([text_x, (HEADER_HEIGHT - ui.text_line_height()) / 2.0]);
@@ -3910,7 +5207,7 @@ fn draw_channel_header(
             let call_tint = is_connected.then_some(state.theme.accent);
             let call_tip = if is_connected { "Hang up" } else { "Start voice call" };
             let call_disabled = ui.begin_disabled(is_connecting);
-            let call_clicked = emoji_button(ui, textures, "header_call", HEADER_ICONS[0], call_tip, call_tint);
+            let call_clicked = icon_button(ui, textures, "header_call", HEADER_ICONS[0], call_tip, call_tint);
             drop(call_disabled);
             if call_clicked && !is_connecting {
                 if is_connected {
@@ -3918,18 +5215,70 @@ fn draw_channel_header(
                 } else {
                     let _ = cmd_tx
                         .send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone(), ring: true });
-                    state.pending_voice_channel = Some((None, channel_id));
+                    state.pending_voice_channel = Some((None, channel_id.clone()));
+                }
+            }
+            ui.same_line_with_spacing(0.0, ICON_GAP);
+            {
+                let disabled = ui.begin_disabled(true);
+                icon_button(ui, textures, "header_camera", HEADER_ICONS[1], "Video calls aren't supported yet", None);
+                drop(disabled);
+                if ui.is_item_hovered_with_flags(imgui::ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
+                    ui.tooltip_text("Video calls aren't supported yet");
                 }
             }
             ui.same_line_with_spacing(0.0, ICON_GAP);
 
-            let _disabled = ui.begin_disabled(true);
-            emoji_button(ui, textures, "header_video", HEADER_ICONS[1], "Video calls aren't supported yet", None);
-            drop(_disabled);
+            #[cfg(feature = "screenshare")]
+            {
+                let disabled = ui.begin_disabled(!is_connected);
+                let tint = state.screen_sharing.then_some(state.theme.accent);
+                let tip = if state.screen_sharing { "Stop screen sharing" } else { "Share your screen" };
+                let clicked = icon_button(ui, textures, "header_video", SCREENSHARE_ICON, tip, tint);
+                drop(disabled);
+                if clicked && is_connected {
+                    if state.screen_sharing {
+                        state.screen_sharing = false;
+                        let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: None, channel_id: channel_id.clone() });
+                    } else {
+                        state.show_screen_share_setup = true;
+                    }
+                }
+            }
+            #[cfg(not(feature = "screenshare"))]
+            {
+                let disabled = ui.begin_disabled(true);
+                icon_button(ui, textures, "header_video", SCREENSHARE_ICON, "Screen sharing isn't available in this build", None);
+                drop(disabled);
+            }
             ui.same_line_with_spacing(0.0, ICON_GAP);
+            draw_pins_button(ui, state, cmd_tx, textures, &channel_id);
+            ui.same_line_with_spacing(0.0, ICON_GAP);
+            if icon_button(ui, textures, "header_add_people", crate::icons::Icon::UserPlus, "Add Friends to DM", None) {
+                state.add_people_selected.clear();
+                state.add_people_filter.clear();
+                ui.open_popup("add_people");
+            }
+            draw_add_people_popup(ui, state, cmd_tx, dm);
+            ui.same_line_with_spacing(0.0, ICON_GAP);
+            if is_one_to_one {
+                let tint = state.show_profile_panel.then_some(state.theme.accent);
+                let tip = if state.show_profile_panel { "Hide User Profile" } else { "Show User Profile" };
+                if icon_button(ui, textures, "header_profile", crate::icons::Icon::UserRound, tip, tint) {
+                    state.show_profile_panel = !state.show_profile_panel;
+                    if state.show_profile_panel {
+                        state.search_open = false;
+                    }
+                }
+                ui.same_line_with_spacing(0.0, ICON_GAP);
+            }
         } else {
+            if let Some(channel_id) = channel_id.clone() {
+                draw_pins_button(ui, state, cmd_tx, textures, &channel_id);
+                ui.same_line_with_spacing(0.0, ICON_GAP);
+            }
             let members_tint = state.show_members_panel.then_some(state.theme.accent);
-            if emoji_button(ui, textures, "header_members", HEADER_ICONS[2], "Members", members_tint) {
+            if icon_button(ui, textures, "header_members", HEADER_ICONS[2], "Members", members_tint) {
                 state.show_members_panel = !state.show_members_panel;
                 if state.show_members_panel {
                     state.search_open = false;
@@ -3943,12 +5292,137 @@ fn draw_channel_header(
             ui.same_line_with_spacing(0.0, ICON_GAP);
         }
 
-        let search_tint = state.search_open.then_some(state.theme.accent);
-        if emoji_button(ui, textures, "header_search", HEADER_ICONS[3], "Search", search_tint) {
-            toggle_search_panel(state);
+        let search_y = (HEADER_HEIGHT - ui.frame_height()) / 2.0;
+        ui.set_cursor_pos([ui.cursor_pos()[0], search_y]);
+        let search_min = ui.cursor_screen_pos();
+        ui.set_next_item_width(HEADER_SEARCH_WIDTH);
+        let submitted = ui.input_text("##header_search", &mut state.search_input).hint("Search").enter_returns_true(true).build();
+        let icon = 16.0;
+        draw_icon_at(
+            ui,
+            textures,
+            HEADER_ICONS[3],
+            [search_min[0] + HEADER_SEARCH_WIDTH - icon - 8.0, search_min[1] + (ui.frame_height() - icon) / 2.0],
+            icon,
+            ui.style_color(imgui::StyleColor::TextDisabled),
+        );
+        if submitted {
+            if !state.search_open {
+                toggle_search_panel(state);
+            }
+            state.show_profile_panel = false;
+            submit_search(state, cmd_tx, 0);
         }
     });
     ui.separator();
+}
+
+const HEADER_SEARCH_WIDTH: f32 = 180.0;
+
+fn draw_pins_button(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, channel_id: &str) {
+    use crate::app_state::PinsState;
+    if icon_button(ui, textures, "header_pins", crate::icons::Icon::Pin, "Pinned Messages", None) {
+        state.pins.insert(channel_id.to_string(), PinsState::Loading);
+        let _ = cmd_tx.send(UiCommand::LoadPins { channel_id: channel_id.to_string() });
+        ui.open_popup("pinned_messages");
+    }
+    let mut jump = None;
+    ui.popup("pinned_messages", || {
+        ui.text("Pinned Messages");
+        ui.separator();
+        match state.pins.get(channel_id) {
+            None | Some(PinsState::Loading) => ui.text_disabled("Loading..."),
+            Some(PinsState::Failed) => ui.text_disabled("Couldn't load pinned messages."),
+            Some(PinsState::Ready(pins)) if pins.is_empty() => ui.text_disabled("This channel doesn't have any pinned messages yet."),
+            Some(PinsState::Ready(pins)) => {
+                ui.child_window("pins_list").size([380.0, 360.0f32.min(pins.len() as f32 * 64.0 + 8.0)]).build(|| {
+                    for pin in pins {
+                        let _id = ui.push_id(pin.id.as_str());
+                        let start = ui.cursor_pos();
+                        let clicked = ui.selectable_config("##pin").size([0.0, 56.0]).build();
+                        ui.set_cursor_pos([start[0] + 6.0, start[1] + 4.0]);
+                        ui.text(pin.author.display_name());
+                        ui.same_line();
+                        ui.text_disabled(format_result_timestamp(&pin.timestamp));
+                        ui.set_cursor_pos([start[0] + 6.0, start[1] + 6.0 + ui.text_line_height()]);
+                        let preview = pin.content.lines().next().unwrap_or_default();
+                        let preview = if preview.is_empty() && !pin.attachments.is_empty() { "[attachment]" } else { preview };
+                        let room = ui.content_region_avail()[0] - 12.0;
+                        ui.text_disabled(truncate_to_width(ui, preview, room).as_deref().unwrap_or(preview));
+                        ui.set_cursor_pos([start[0], start[1] + 60.0]);
+                        if clicked {
+                            jump = Some((pin.channel_id.clone(), pin.id.clone()));
+                        }
+                    }
+                });
+            }
+        }
+    });
+    if let Some((channel_id, message_id)) = jump {
+        let loaded = state.messages.get(&channel_id).is_some_and(|list| list.iter().any(|m| m.id == message_id));
+        if loaded {
+            state.scroll_to_message = Some(message_id);
+        } else {
+            let _ = cmd_tx.send(UiCommand::JumpToMessage { channel_id, message_id });
+        }
+    }
+}
+
+fn draw_add_people_popup(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, dm: Option<&rustcord_client::models::Channel>) {
+    const GROUP_LIMIT: usize = 10;
+    let Some(dm) = dm else { return };
+    ui.popup("add_people", || {
+        let existing: Vec<&str> = dm.recipients.iter().map(|u| u.id.as_str()).collect();
+        let room = GROUP_LIMIT.saturating_sub(existing.len() + 1);
+        ui.text("Select Friends");
+        ui.text_disabled(format!("You can add {} more friend{}.", room.saturating_sub(state.add_people_selected.len()), if room == 1 { "" } else { "s" }));
+        ui.set_next_item_width(300.0);
+        ui.input_text("##add_people_filter", &mut state.add_people_filter).hint("Type the username of a friend").build();
+        let filter = state.add_people_filter.trim().to_lowercase();
+        let friends: Vec<(String, String, String)> = state
+            .relationships
+            .iter()
+            .filter(|r| r.kind == rustcord_client::models::RelationshipType::Friend)
+            .filter(|r| !existing.contains(&r.user.id.as_str()))
+            .filter(|r| {
+                filter.is_empty()
+                    || r.user.username.to_lowercase().contains(&filter)
+                    || r.user.display_name().to_lowercase().contains(&filter)
+            })
+            .map(|r| (r.user.id.clone(), r.user.display_name().to_string(), r.user.username.clone()))
+            .collect();
+        ui.child_window("add_people_list").size([300.0, 240.0]).build(|| {
+            if friends.is_empty() {
+                ui.text_disabled("No friends found.");
+            }
+            for (id, display, username) in &friends {
+                let mut checked = state.add_people_selected.contains(id);
+                let full = !checked && state.add_people_selected.len() >= room;
+                let disabled = ui.begin_disabled(full);
+                if ui.checkbox(format!("{display}  ({username})##{id}"), &mut checked) {
+                    if checked {
+                        state.add_people_selected.insert(id.clone());
+                    } else {
+                        state.add_people_selected.remove(id);
+                    }
+                }
+                drop(disabled);
+            }
+        });
+        let label = if dm.kind == rustcord_client::models::ChannelType::GroupDm { "Add" } else { "Create Group DM" };
+        let disabled = ui.begin_disabled(state.add_people_selected.is_empty());
+        if ui.button(label) {
+            let user_ids: Vec<String> = state.add_people_selected.drain().collect();
+            let _ = cmd_tx.send(UiCommand::AddDmRecipients {
+                channel_id: dm.id.clone(),
+                existing: existing.iter().map(|id| id.to_string()).collect(),
+                group: dm.kind == rustcord_client::models::ChannelType::GroupDm,
+                user_ids,
+            });
+            ui.close_current_popup();
+        }
+        drop(disabled);
+    });
 }
 
 
@@ -4029,7 +5503,7 @@ fn draw_member_row(
         state.selected_guild.clone().and_then(|g| state.member_color(&g, &member.user.id))
     };
     let _dim = offline.then(|| ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted));
-    let result = draw_user_row(ui, cmd_tx, textures, &member.user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel, member_color);
+    let result = draw_user_row(ui, cmd_tx, textures, &member.user, &name, false, status, platform.as_deref(), activity.as_deref(), None, state.theme.panel, member_color);
     if result.avatar_clicked {
         state.profile_popout = Some(member.user.clone());
     } else if result.row_clicked {
@@ -4118,7 +5592,7 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
             let activity = state.activity_for(&user.id);
-            let result = draw_user_row(ui, cmd_tx, textures, user, &name, false, status, platform.as_deref(), activity.as_deref(), state.theme.panel, None);
+            let result = draw_user_row(ui, cmd_tx, textures, user, &name, false, status, platform.as_deref(), activity.as_deref(), None, state.theme.panel, None);
             if result.avatar_clicked {
                 state.profile_popout = Some(user.clone());
             } else if result.row_clicked {
@@ -4137,27 +5611,34 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             return;
         }
     }
-    let dms: Vec<(String, String, Option<rustcord_client::models::User>, Option<String>)> = state
+    let dms: Vec<(String, String, Option<rustcord_client::models::User>, Option<String>, usize, Option<String>)> = state
         .filtered_dm_channels()
         .into_iter()
         .filter(|dm| group.is_none_or(|g| state.groups[g].channels.contains(&dm.id)))
-        .map(|dm| (dm.id.clone(), AppState::dm_display_name(dm), dm.recipients.first().cloned(), dm.last_message_id.clone()))
+        .map(|dm| {
+            let recipient = (dm.kind == rustcord_client::models::ChannelType::Dm).then(|| dm.recipients.first().cloned()).flatten();
+            let icon = dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 64));
+            (dm.id.clone(), AppState::dm_display_name(dm), recipient, dm.last_message_id.clone(), dm.recipients.len() + 1, icon)
+        })
         .collect();
     if dms.is_empty() {
         ui.text_disabled(if group.is_some() { "Empty group. Right-click a DM to add it." } else { "No direct messages." });
     }
-    for (channel_id, name, recipient, last_message_id) in &dms {
+    for (channel_id, name, recipient, last_message_id, member_count, icon) in &dms {
         let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
         let row_start = ui.cursor_screen_pos();
         let (row_clicked, avatar_clicked, right_clicked) = if let Some(user) = recipient {
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
-            let activity = state.activity_for(&user.id);
-            let r = draw_user_row(ui, cmd_tx, textures, user, name, is_selected, status, platform.as_deref(), activity.as_deref(), state.theme.panel, None);
+            let status_line = state.status_line_for(&user.id);
+            let (status_emoji, status_text) = match &status_line {
+                Some((emoji, text)) => (emoji.as_ref(), Some(text.as_str())),
+                None => (None, None),
+            };
+            let r = draw_user_row(ui, cmd_tx, textures, user, name, is_selected, status, platform.as_deref(), status_text, status_emoji, state.theme.panel, None);
             (r.row_clicked, r.avatar_clicked, r.right_clicked)
         } else {
-            let clicked = ui.selectable_config(name).selected(is_selected).build();
-            (clicked, false, ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right))
+            draw_group_dm_row(ui, state, cmd_tx, textures, channel_id, name, *member_count, icon.as_deref(), is_selected)
         };
         if state.channel_is_unread(channel_id, last_message_id.as_deref()) {
             draw_unread_dot(ui, row_start, ui.item_rect_size()[1]);
@@ -4173,6 +5654,7 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         } else if row_clicked {
             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
             state.selected_channel = Some(channel_id.clone());
+            state.server_call_minimized = true;
             if let Some(last_id) = last_message_id {
                 if state.mark_channel_read(channel_id, last_id) {
                     let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
@@ -4202,6 +5684,153 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             state.save_groups();
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_group_dm_row(
+    ui: &Ui,
+    state: &AppState,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    channel_id: &str,
+    name: &str,
+    member_count: usize,
+    icon_url: Option<&str>,
+    selected: bool,
+) -> (bool, bool, bool) {
+    let row_start = ui.cursor_pos();
+    let row_height = USER_ROW_AVATAR_SIZE[1] + 8.0;
+    let _id = ui.push_id(channel_id);
+    let clicked = ui.selectable_config("##group_dm_row").selected(selected).size([0.0, row_height]).build();
+    let right_clicked = ui.is_item_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Right);
+    ui.set_cursor_pos([row_start[0] + 4.0, row_start[1] + 4.0]);
+    let icon_min = ui.cursor_screen_pos();
+    let size = USER_ROW_AVATAR_SIZE[0];
+    match icon_url.and_then(|url| textures.get_still(url)) {
+        Some((texture, _)) => draw_circular_image(ui, texture, USER_ROW_AVATAR_SIZE),
+        None => {
+            if let Some(url) = icon_url {
+                textures.request(url, cmd_tx);
+            }
+            ui.get_window_draw_list()
+                .add_circle([icon_min[0] + size / 2.0, icon_min[1] + size / 2.0], size / 2.0, state.theme.accent)
+                .filled(true)
+                .num_segments(32)
+                .build();
+            let glyph = 16.0;
+            let inset = (size - glyph) / 2.0;
+            draw_icon_at(ui, textures, crate::icons::Icon::Users, [icon_min[0] + inset, icon_min[1] + inset], glyph, [1.0, 1.0, 1.0, 1.0]);
+            ui.dummy(USER_ROW_AVATAR_SIZE);
+        }
+    }
+    ui.same_line();
+    let text_x = ui.cursor_pos()[0];
+    let room = ui.content_region_avail()[0] - 4.0;
+    ui.set_cursor_pos([text_x, row_start[1] + 3.0]);
+    ui.text(truncate_to_width(ui, name, room).as_deref().unwrap_or(name));
+    ui.set_cursor_pos([text_x, row_start[1] + 3.0 + ui.text_line_height()]);
+    let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
+    ui.set_window_font_scale(0.8);
+    ui.text(format!("{member_count} Members"));
+    ui.set_window_font_scale(1.0);
+    token.pop();
+    ui.set_cursor_pos([row_start[0], row_start[1] + row_height + ui.clone_style().item_spacing[1]]);
+    (clicked, false, right_clicked)
+}
+
+fn draw_profile_panel(
+    ui: &Ui,
+    state: &mut AppState,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    fonts: &Fonts,
+    user: &rustcord_client::models::User,
+) {
+    const BANNER_HEIGHT: f32 = 110.0;
+    const AVATAR: f32 = 80.0;
+    if !state.profiles_requested.contains(&user.id) {
+        state.profiles_requested.insert(user.id.clone());
+        let _ = cmd_tx.send(UiCommand::LoadProfile { user_id: user.id.clone() });
+    }
+    let width = ui.content_region_avail()[0];
+    let origin = ui.cursor_screen_pos();
+    let banner_url = state.profiles.get(&user.id).and_then(|p| p.banner_url.clone());
+    match banner_url.as_deref().and_then(|url| textures.get(url).map(|t| (url, t))) {
+        Some((_, (texture, _))) => {
+            ui.get_window_draw_list().add_image_rounded(texture, origin, [origin[0] + width, origin[1] + BANNER_HEIGHT], 6.0).build();
+        }
+        None => {
+            if let Some(url) = banner_url.as_deref() {
+                textures.request(url, cmd_tx);
+            }
+            ui.get_window_draw_list()
+                .add_rect(origin, [origin[0] + width, origin[1] + BANNER_HEIGHT], state.theme.accent)
+                .filled(true)
+                .rounding(6.0)
+                .build();
+        }
+    }
+    let start = ui.cursor_pos();
+    ui.set_cursor_pos([start[0] + 12.0, start[1] + BANNER_HEIGHT - AVATAR / 2.0]);
+    let avatar_min = ui.cursor_screen_pos();
+    let radius = AVATAR / 2.0;
+    ui.get_window_draw_list()
+        .add_circle([avatar_min[0] + radius, avatar_min[1] + radius], radius + 5.0, state.theme.panel)
+        .filled(true)
+        .num_segments(48)
+        .build();
+    let avatar_url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
+    match textures.get(&avatar_url) {
+        Some((texture, _)) => draw_circular_image(ui, texture, [AVATAR; 2]),
+        None => {
+            textures.request(&avatar_url, cmd_tx);
+            ui.dummy([AVATAR; 2]);
+        }
+    }
+    draw_status_dot(ui, [avatar_min[0] + AVATAR - 10.0, avatar_min[1] + AVATAR - 10.0], 8.0, state.presence_for(&user.id), state.theme.panel);
+
+    ui.dummy([0.0, 6.0]);
+    let bold = ui.push_font(fonts.bold);
+    ui.set_window_font_scale(1.3);
+    ui.text_wrapped(user.display_name());
+    ui.set_window_font_scale(1.0);
+    bold.pop();
+    ui.text(&user.username);
+    if let Some(tag) = user.server_tag() {
+        ui.same_line_with_spacing(0.0, 6.0);
+        draw_server_tag(ui, textures, cmd_tx, tag, tag.badge_url(32).as_deref());
+    }
+    if let Some((emoji, text)) = state.status_line_for(&user.id) {
+        if let Some(emoji) = &emoji {
+            draw_status_emoji(ui, textures, cmd_tx, emoji, ui.text_line_height());
+            ui.same_line_with_spacing(0.0, 4.0);
+        }
+        ui.text_colored(state.theme.text_muted, text);
+    }
+
+    ui.dummy([0.0, 6.0]);
+    ui.separator();
+    if let Some(bio) = state.profiles.get(&user.id).and_then(|p| p.bio.clone()) {
+        let bold = ui.push_font(fonts.bold);
+        ui.text_colored(state.theme.text_muted, "About Me");
+        bold.pop();
+        ui.text_wrapped(bio);
+        ui.dummy([0.0, 4.0]);
+    }
+    let bold = ui.push_font(fonts.bold);
+    ui.text_colored(state.theme.text_muted, "Member Since");
+    bold.pop();
+    ui.text(snowflake_date(&user.id));
+    if let Some(label) = state.mutual_server_labels.get(&user.id).filter(|_| {
+        state.profiles.get(&user.id).is_some_and(|p| !p.mutual_guild_ids.is_empty())
+    }) {
+        ui.dummy([0.0, 4.0]);
+        ui.text_colored(state.theme.text_muted, label);
+    }
+    ui.dummy([0.0, 8.0]);
+    if ui.button_with_size("View Full Profile", [-1.0, 0.0]) {
+        state.profile_popout = Some(user.clone());
+    }
 }
 
 fn snowflake_date(id: &str) -> String {
@@ -4429,7 +6058,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                 ui.text(state.settings_category.label());
                 ui.set_window_font_scale(1.0);
                 ui.same_line_with_spacing(heading_w, 0.0);
-                if emoji_button(ui, textures, "close_settings", CHROME_ICONS[0], "Close settings", None) {
+                if icon_button(ui, textures, "close_settings", CHROME_ICONS[0], "Close settings", None) {
                     state.show_settings = false;
                 }
                 ui.spacing();
@@ -4676,10 +6305,8 @@ fn draw_settings_about(ui: &Ui, textures: &TextureCache) {
     const LABEL_COLUMN: f32 = 130.0;
 
     let row_top = ui.cursor_pos()[1];
-    let logo_drawn = draw_unicode_emoji(ui, textures, CHROME_ICONS[1], [LOGO_SIZE, LOGO_SIZE]);
-    if logo_drawn {
-        ui.same_line_with_spacing(0.0, 14.0);
-    }
+    draw_icon(ui, textures, CHROME_ICONS[1], LOGO_SIZE, ui.style_color(imgui::StyleColor::Button));
+    ui.same_line_with_spacing(0.0, 14.0);
     let text_block = ui.text_line_height() * 2.0 + ui.clone_style().item_spacing[1];
     ui.set_cursor_pos([ui.cursor_pos()[0], row_top + (LOGO_SIZE - text_block) / 2.0]);
     ui.group(|| {
@@ -4725,6 +6352,19 @@ fn draw_settings_about(ui: &Ui, textures: &TextureCache) {
 }
 
 fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
+    let clock_options = [(None, "System default"), (Some(false), "12-hour"), (Some(true), "24-hour")];
+    let mut clock_idx = clock_options.iter().position(|(value, _)| *value == state.clock_24h).unwrap_or(0);
+    ui.set_next_item_width(200.0);
+    if ui.combo("Clock", &mut clock_idx, &clock_options, |(_, label)| std::borrow::Cow::Borrowed(*label)) {
+        state.clock_24h = clock_options[clock_idx].0;
+        crate::settings::save(&crate::settings::Settings {
+            theme_file: current_theme_file(&state.theme),
+            input_device: state.selected_input_device.clone(),
+            output_device: state.selected_output_device.clone(),
+            ..state.audio_settings()
+        });
+    }
+    ui.separator();
     let theme_paths = crate::theme::Theme::list_available();
     if theme_paths.is_empty() {
         ui.text_disabled("No themes are available.");
@@ -5077,63 +6717,6 @@ mod link_tests {
             assert!(!out.trim().is_empty(), "{style:?} rendered empty");
             assert!(!out.contains("invalid"), "{style:?} -> {out}");
         }
-    }
-}
-
-#[cfg(test)]
-mod chrome_icon_tests {
-    use super::*;
-
-    #[test]
-    fn every_chrome_icon_exists_in_twemoji() {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("http client");
-
-        let mut missing = Vec::new();
-        for icon in CHROME_ICONS.iter().chain(HEADER_ICONS.iter()).copied() {
-            let url = crate::emoji::url(icon);
-            match client.get(&url).send() {
-                Ok(resp) if resp.status().is_success() => {}
-                Ok(resp) => missing.push(format!("U+{:04X} -> {} ({})", icon as u32, resp.status(), url)),
-                Err(e) if e.is_connect() || e.is_timeout() => return,
-                Err(e) => missing.push(format!("U+{:04X} -> {e}", icon as u32)),
-            }
-        }
-        assert!(missing.is_empty(), "chrome and header icons absent from Twemoji, they will render as ? boxes:\n  {}", missing.join("\n  "));
-    }
-}
-
-#[cfg(all(test, feature = "video"))]
-mod video_control_tests {
-    use super::*;
-
-    #[test]
-    fn every_control_icon_exists_in_twemoji() {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("http client");
-
-        let mut missing = Vec::new();
-        let mut checked = 0;
-        for icon in VIDEO_CONTROL_ICONS {
-            let url = crate::emoji::url(icon);
-            match client.get(&url).send() {
-                Ok(resp) if resp.status().is_success() => checked += 1,
-                Ok(resp) => missing.push(format!("U+{:04X} -> {} ({})", icon as u32, resp.status(), url)),
-                Err(e) if e.is_connect() || e.is_timeout() => return,
-                Err(e) => missing.push(format!("U+{:04X} -> {e}", icon as u32)),
-            }
-        }
-        assert!(missing.is_empty(), "control icons absent from Twemoji, they will render as ? boxes:\n  {}", missing.join("\n  "));
-        eprintln!("verified {checked} control icons against {}", crate::emoji::BASE_URL);
-    }
-
-    #[test]
-    fn control_icons_are_not_plain_ascii() {
-        assert!(VIDEO_CONTROL_ICONS.iter().all(|c| !c.is_ascii()));
     }
 }
 

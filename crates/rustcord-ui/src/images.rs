@@ -163,11 +163,73 @@ pub struct TextureCache {
     wanted: std::cell::RefCell<std::collections::HashSet<String>>,
     total_bytes: usize,
     pub animating: bool,
+    icon_scale: f32,
+    icons: HashMap<(crate::icons::Icon, u32), imgui::TextureId>,
+    icons_wanted: std::cell::RefCell<std::collections::HashSet<(crate::icons::Icon, u32)>>,
     #[cfg(feature = "video")]
     stopped_videos: std::cell::RefCell<Vec<String>>,
+    #[cfg(feature = "screenshare")]
+    live_videos: HashMap<String, LiveVideoTexture>,
+}
+
+#[cfg(feature = "screenshare")]
+struct LiveVideoTexture {
+    texture_id: imgui::TextureId,
+    size: [f32; 2],
+    dimensions: (u32, u32),
+    last_seen: Instant,
 }
 
 impl TextureCache {
+    #[cfg(feature = "screenshare")]
+    pub fn ingest_live_video(
+        &mut self,
+        user_id: String,
+        rgba: &image::RgbaImage,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        renderer: &mut imgui_wgpu::Renderer,
+    ) {
+        let dimensions = rgba.dimensions();
+        if let Some(live) = self.live_videos.get_mut(&user_id) {
+            if live.dimensions == dimensions {
+                if let Some(texture) = renderer.textures.get(live.texture_id) {
+                    texture.write(queue, rgba.as_raw(), dimensions.0, dimensions.1);
+                    live.last_seen = Instant::now();
+                    return;
+                }
+            }
+            renderer.textures.remove(live.texture_id);
+        }
+        let texture_id = upload_texture(device, queue, renderer, rgba);
+        self.live_videos.insert(user_id, LiveVideoTexture {
+            texture_id,
+            size: [dimensions.0 as f32, dimensions.1 as f32],
+            dimensions,
+            last_seen: Instant::now(),
+        });
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn live_video(&mut self, user_id: &str) -> Option<(imgui::TextureId, [f32; 2])> {
+        let live = self.live_videos.get(user_id)?;
+        Some((live.texture_id, live.size))
+    }
+
+    #[cfg(feature = "screenshare")]
+    pub fn expire_live_videos(&mut self, renderer: &mut imgui_wgpu::Renderer) {
+        let cutoff = Instant::now() - Duration::from_secs(3);
+        let expired: Vec<String> = self.live_videos.iter()
+            .filter(|(_, live)| live.last_seen < cutoff)
+            .map(|(user_id, _)| user_id.clone())
+            .collect();
+        for user_id in expired {
+            if let Some(live) = self.live_videos.remove(&user_id) {
+                renderer.textures.remove(live.texture_id);
+            }
+        }
+    }
+
     pub fn request(&mut self, url: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
         if self.entries.contains_key(url) {
             return;
@@ -668,6 +730,38 @@ impl TextureCache {
 
     pub fn is_failed(&self, url: &str) -> bool {
         matches!(self.entries.get(url), Some(Entry::Failed))
+    }
+
+    pub fn icon(&self, icon: crate::icons::Icon, logical_size: f32) -> Option<imgui::TextureId> {
+        let px = (logical_size * self.icon_scale.max(1.0)).round().max(1.0) as u32;
+        let texture = self.icons.get(&(icon, px)).copied();
+        if texture.is_none() {
+            self.icons_wanted.borrow_mut().insert((icon, px));
+        }
+        texture
+    }
+
+    pub fn sync_icons(&mut self, scale: f32, device: &wgpu::Device, queue: &wgpu::Queue, renderer: &mut imgui_wgpu::Renderer) {
+        if scale != self.icon_scale {
+            for (_, texture_id) in self.icons.drain() {
+                renderer.textures.remove(texture_id);
+            }
+            self.icons_wanted.borrow_mut().clear();
+            self.icon_scale = scale;
+        }
+        let wanted = std::mem::take(&mut *self.icons_wanted.borrow_mut());
+        for (icon, px) in wanted {
+            if self.icons.contains_key(&(icon, px)) {
+                continue;
+            }
+            if let Some(rgba) = crate::icons::rasterize(icon, px) {
+                self.icons.insert((icon, px), upload_texture(device, queue, renderer, &rgba));
+            }
+        }
+    }
+
+    pub fn has_wanted_icons(&self) -> bool {
+        !self.icons_wanted.borrow().is_empty()
     }
 }
 
