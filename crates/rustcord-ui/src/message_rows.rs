@@ -244,6 +244,7 @@ pub struct MessageRow {
     pub times: Times,
     pub system: Option<SystemRow>,
     pub invites: Vec<String>,
+    pub tag_badge: Option<String>,
 }
 
 pub struct ChannelRows {
@@ -288,6 +289,7 @@ impl ChannelRows {
                 times: Times::of(msg, stamp, tz, today, format),
                 system: is_system(msg).then(|| system_row(msg, me, peer)),
                 invites: if is_system(msg) { Vec::new() } else { crate::invites::invite_codes(&msg.content) },
+                tag_badge: starts.then(|| msg.author.server_tag().and_then(|t| t.badge_url(32))).flatten(),
             });
         }
         Self { rows, today, format }

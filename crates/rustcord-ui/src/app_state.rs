@@ -324,6 +324,28 @@ pub struct AppState {
     pub relationship_busy: std::collections::HashSet<String>,
     pub relationship_confirm: Option<(crate::backend::RelationshipAction, String, String)>,
     pub mutual_server_labels: HashMap<String, String>,
+    pub muted_before_deafen: bool,
+    pub drafts: HashMap<String, String>,
+    pub draft_channel: Option<String>,
+    pub compose_placeholder: String,
+    pub uploads: Vec<PendingUpload>,
+    pub next_upload_id: u64,
+    pub pins: HashMap<String, PinsState>,
+    pub show_profile_panel: bool,
+    pub add_people_selected: std::collections::HashSet<String>,
+    pub add_people_filter: String,
+}
+
+pub enum PinsState {
+    Loading,
+    Ready(Vec<Message>),
+    Failed,
+}
+
+pub struct PendingUpload {
+    pub id: u64,
+    pub filename: String,
+    pub progress: std::sync::Arc<rustcord_client::rest::UploadProgress>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -519,6 +541,17 @@ impl AppState {
     pub fn activity_for(&self, user_id: &str) -> Option<String> {
         let acts = &self.presences.get(user_id)?.activities;
         acts.iter().find(|a| a.kind != 4).or_else(|| acts.first()).map(|a| a.summary_title()).filter(|s| !s.is_empty())
+    }
+
+    pub fn status_line_for(&self, user_id: &str) -> Option<(Option<rustcord_client::models::ActivityEmoji>, String)> {
+        let activities = &self.presences.get(user_id)?.activities;
+        if let Some(custom) = activities.iter().find(|a| a.kind == 4) {
+            let text = custom.state.clone().unwrap_or_default();
+            if !text.is_empty() || custom.emoji.is_some() {
+                return Some((custom.emoji.clone(), text));
+            }
+        }
+        activities.iter().find(|a| a.kind != 4).map(|a| (None, a.summary_title())).filter(|(_, s)| !s.is_empty())
     }
 
     pub fn platform_for(&self, user_id: &str) -> Option<&'static str> {
@@ -904,6 +937,70 @@ impl AppState {
         }
     }
 
+    pub fn sync_draft_channel(&mut self) {
+        if self.draft_channel == self.selected_channel {
+            return;
+        }
+        if let Some((_, draft)) = self.editing.take() {
+            self.compose_buf = draft;
+        }
+        let current = std::mem::take(&mut self.compose_buf);
+        if let Some(previous) = self.draft_channel.take() {
+            if current.is_empty() {
+                self.drafts.remove(&previous);
+            } else {
+                self.drafts.insert(previous, current);
+            }
+        }
+        self.compose_buf = self.selected_channel.as_ref().and_then(|id| self.drafts.remove(id)).unwrap_or_default();
+        self.reply_target = None;
+        self.draft_channel = self.selected_channel.clone();
+        self.compose_placeholder = self.placeholder_for_selected();
+    }
+
+    fn placeholder_for_selected(&self) -> String {
+        let Some(channel_id) = self.selected_channel.as_deref() else { return String::new() };
+        if let Some(dm) = self.dm_channels.iter().find(|c| c.id == channel_id) {
+            return match (dm.kind, dm.recipients.first()) {
+                (ChannelType::Dm, Some(user)) => {
+                    format!("Message @{}", user.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&user.username))
+                }
+                _ => format!("Message {}", Self::dm_display_name(dm)),
+            };
+        }
+        match self.guild_channels.values().flatten().find(|c| c.id == channel_id).and_then(|c| c.name.as_deref()) {
+            Some(name) => format!("Message #{name}"),
+            None => "Message".to_string(),
+        }
+    }
+
+    pub fn start_upload(&mut self, filename: String) -> (u64, std::sync::Arc<rustcord_client::rest::UploadProgress>) {
+        self.next_upload_id += 1;
+        let progress = std::sync::Arc::new(rustcord_client::rest::UploadProgress::default());
+        self.uploads.push(PendingUpload { id: self.next_upload_id, filename, progress: progress.clone() });
+        (self.next_upload_id, progress)
+    }
+
+    pub fn toggle_mute(&mut self) {
+        if self.self_deafened {
+            self.self_deafened = false;
+            self.self_muted = false;
+        } else {
+            self.self_muted = !self.self_muted;
+        }
+    }
+
+    pub fn toggle_deafen(&mut self) {
+        if self.self_deafened {
+            self.self_deafened = false;
+            self.self_muted = self.muted_before_deafen;
+        } else {
+            self.muted_before_deafen = self.self_muted;
+            self.self_deafened = true;
+            self.self_muted = true;
+        }
+    }
+
     pub fn relationship_with(&self, user_id: &str) -> Option<RelationshipType> {
         self.relationships.iter().find(|r| r.id == user_id || r.user.id == user_id).map(|r| r.kind)
     }
@@ -1086,6 +1183,8 @@ impl AppState {
             user_volumes: self.user_volumes.clone(),
             keybinds: self.keybinds.to_map(),
             clock_24h: self.clock_24h,
+            self_mute: self.self_muted,
+            self_deaf: self.self_deafened,
             ..Default::default()
         }
     }
@@ -1370,6 +1469,7 @@ mod tests {
             discriminator: "0".into(),
             avatar: None,
             bot: false,
+            primary_guild: None,
         }
     }
 
@@ -1436,6 +1536,81 @@ mod tests {
         state.selected_channel = Some("dm".into());
         let authors = state.searchable_authors(None);
         assert!(authors.iter().any(|(id, _)| id == "2"), "{authors:?}");
+    }
+
+    #[test]
+    fn switching_channels_keeps_each_draft() {
+        let mut state = AppState::default();
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        state.compose_buf = "half written".into();
+        state.selected_channel = Some("b".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "");
+        state.compose_buf = "other".into();
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "half written");
+        state.selected_channel = Some("b".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "other");
+    }
+
+    #[test]
+    fn switching_away_mid_edit_keeps_the_draft_not_the_edit() {
+        let mut state = AppState::default();
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        state.compose_buf = "editing text".into();
+        state.editing = Some(("m1".into(), "my draft".into()));
+        state.selected_channel = Some("b".into());
+        state.sync_draft_channel();
+        assert!(state.editing.is_none());
+        state.selected_channel = Some("a".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_buf, "my draft");
+    }
+
+    #[test]
+    fn dm_placeholders_use_the_display_name() {
+        let mut state = AppState::default();
+        let mut dm = test_channel("dm", "dm");
+        dm.kind = ChannelType::Dm;
+        dm.recipients = vec![test_user("2", "olbiaphleet", Some("lunatest"))];
+        state.dm_channels.push(dm);
+        state.selected_channel = Some("dm".into());
+        state.sync_draft_channel();
+        assert_eq!(state.compose_placeholder, "Message @lunatest");
+    }
+
+    #[test]
+    fn deafening_mutes_and_undeafening_restores_the_previous_mute() {
+        let mut state = AppState::default();
+        state.toggle_deafen();
+        assert!(state.self_deafened && state.self_muted);
+        state.toggle_deafen();
+        assert!(!state.self_deafened && !state.self_muted);
+
+        state.toggle_mute();
+        state.toggle_deafen();
+        state.toggle_deafen();
+        assert!(state.self_muted && !state.self_deafened);
+    }
+
+    #[test]
+    fn unmuting_while_deafened_undeafens_too() {
+        let mut state = AppState::default();
+        state.toggle_deafen();
+        state.toggle_mute();
+        assert!(!state.self_muted && !state.self_deafened);
+    }
+
+    #[test]
+    fn mute_state_round_trips_through_settings() {
+        let mut state = AppState::default();
+        state.toggle_deafen();
+        let saved = state.audio_settings();
+        assert!(saved.self_mute && saved.self_deaf);
     }
 
     #[test]
@@ -1805,6 +1980,7 @@ mod tests {
                 discriminator: "0".into(),
                 avatar: None,
                 bot: false,
+                primary_guild: None,
             }],
             last_message_id: None,
             icon: None,

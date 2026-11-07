@@ -78,6 +78,9 @@ async fn save_attachment(url: &str, filename: &str) -> Result<std::path::PathBuf
 }
 
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
+static UPLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>> =
+    std::sync::LazyLock::new(Default::default);
+
 pub(crate) static VOICE_MEDIA_STATE: std::sync::Mutex<Option<rustcord_client::voice_gateway::VoiceMediaState>> = std::sync::Mutex::new(None);
 static ACTIVE_STREAM_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static WATCH_STREAM_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -103,7 +106,15 @@ pub enum UiCommand {
     SelectChannel { channel_id: String },
     LoadOlderMessages { channel_id: String, before: String },
     SendMessage { channel_id: String, content: String, reply_to: Option<String> },
-    SendAttachment { channel_id: String, content: String, path: std::path::PathBuf, reply_to: Option<String> },
+    SendAttachment {
+        channel_id: String,
+        content: String,
+        path: std::path::PathBuf,
+        reply_to: Option<String>,
+        upload_id: u64,
+        progress: std::sync::Arc<rustcord_client::rest::UploadProgress>,
+    },
+    CancelUpload { upload_id: u64 },
     SendAttachmentBytes {
         channel_id: String,
         content: String,
@@ -138,6 +149,8 @@ pub enum UiCommand {
     JoinGuildByInvite { invite_code: String },
     ResolveInvite { code: String },
     UpdateRelationship { user_id: String, action: RelationshipAction },
+    LoadPins { channel_id: String },
+    AddDmRecipients { channel_id: String, existing: Vec<String>, group: bool, user_ids: Vec<String> },
     CreateGuild { name: String },
     RequestGuildMembers { guild_id: String },
     KickMember { guild_id: String, user_id: String },
@@ -227,6 +240,8 @@ pub enum BackendEvent {
     InviteResolved { code: String, result: Result<rustcord_client::models::Invite, InviteFailure> },
     GuildJoined(rustcord_client::models::Guild),
     RelationshipSettled { user_id: String },
+    UploadFinished { upload_id: u64 },
+    PinsLoaded { channel_id: String, pins: Option<Vec<rustcord_client::models::Message>> },
     MicTestStarted,
     MicTestFinished,
 }
@@ -362,34 +377,47 @@ pub fn spawn(
                         }
                     }
                 }
-                UiCommand::SendAttachment { channel_id, content, path, reply_to } => {
-                    if let Some(client) = &rest {
-                        let filename = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "file".into());
-                        let content_type = mime_guess_from_path(&path);
-                        match tokio::fs::read(&path).await {
-                            Ok(bytes) => {
-                                if let Err(e) = client
-                                    .send_message_with_attachment_reply(
-                                        &channel_id,
-                                        &content,
-                                        &filename,
-                                        bytes,
-                                        content_type,
-                                        reply_to.as_deref(),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!("attachment send failed: {e}");
-                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachment: {e}")));
+                UiCommand::SendAttachment { channel_id, content, path, reply_to, upload_id, progress } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        let task = tokio::spawn(async move {
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "file".into());
+                            let content_type = mime_guess_from_path(&path);
+                            match tokio::fs::read(&path).await {
+                                Ok(bytes) => {
+                                    progress.total.store(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                                    if let Err(e) = client
+                                        .send_message_with_attachment_progress(
+                                            &channel_id,
+                                            &content,
+                                            &filename,
+                                            bytes,
+                                            content_type,
+                                            reply_to.as_deref(),
+                                            Some(progress),
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!("attachment send failed: {e}");
+                                        let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachment: {e}")));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to read file: {e}")));
                                 }
                             }
-                            Err(e) => {
-                                let _ = event_tx.send(BackendEvent::Error(format!("failed to read file: {e}")));
-                            }
-                        }
+                            UPLOADS.lock().unwrap().remove(&upload_id);
+                            let _ = event_tx.send(BackendEvent::UploadFinished { upload_id });
+                        });
+                        UPLOADS.lock().unwrap().insert(upload_id, task.abort_handle());
+                    }
+                }
+                UiCommand::CancelUpload { upload_id } => {
+                    if let Some(task) = UPLOADS.lock().unwrap().remove(&upload_id) {
+                        task.abort();
                     }
                 }
                 UiCommand::SendAttachmentBytes { channel_id, content, filename, bytes, content_type, reply_to } => {
@@ -595,6 +623,46 @@ pub fn spawn(
                         }
                     }
                 }
+                UiCommand::LoadPins { channel_id } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let pins = client
+                                .pins(&channel_id)
+                                .await
+                                .inspect_err(|e| tracing::warn!("failed to load pins for {channel_id}: {e}"))
+                                .ok();
+                            let _ = event_tx.send(BackendEvent::PinsLoaded { channel_id, pins });
+                        });
+                    }
+                }
+                UiCommand::AddDmRecipients { channel_id, existing, group, user_ids } => {
+                    if let Some(client) = &rest {
+                        if group {
+                            for user_id in &user_ids {
+                                if let Err(e) = client.add_recipient(&channel_id, user_id).await {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("could not add to group: {e}")));
+                                }
+                            }
+                            match client.dm_channels().await {
+                                Ok(channels) => {
+                                    let _ = event_tx.send(BackendEvent::DmChannelsLoaded(channels));
+                                }
+                                Err(e) => tracing::warn!("failed to refresh DM channels: {e}"),
+                            }
+                        } else {
+                            let recipients: Vec<String> = existing.into_iter().chain(user_ids).collect();
+                            match client.create_group_dm(&recipients).await {
+                                Ok(channel) => {
+                                    let _ = event_tx.send(BackendEvent::DmOpened(channel));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("could not create group DM: {e}")));
+                                }
+                            }
+                        }
+                    }
+                }
                 UiCommand::UpdateRelationship { user_id, action } => {
                     if let Some(client) = &rest {
                         let result = match action {
@@ -698,7 +766,13 @@ pub fn spawn(
                 }
                 UiCommand::JoinVoiceChannel { guild_id, channel_id, ring } => {
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                        let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), false, false);
+                        let saved = crate::settings::load();
+                        let frame = rustcord_client::gateway::voice_state_update_frame(
+                            guild_id.as_deref(),
+                            Some(&channel_id),
+                            saved.self_mute || saved.self_deaf,
+                            saved.self_deaf,
+                        );
                         let _ = tx.send(frame);
                     }
                     if guild_id.is_none() && ring {
@@ -994,6 +1068,8 @@ fn try_spawn_voice_gateway(
         input_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.input_device)),
         output_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.output_device)),
         user_volumes: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.user_volumes)),
+        muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved_settings.self_mute || saved_settings.self_deaf)),
+        deafened: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved_settings.self_deaf)),
         ..Default::default()
     };
     media_state.mic.set_gain(saved_settings.mic_gain.unwrap_or(1.0));

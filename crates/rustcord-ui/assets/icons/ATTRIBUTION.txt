@@ -4,6 +4,7 @@ https://unpkg.com/lucide-static@0.460.0/icons/<name>.svg
 
 Icon file            Used for
 audio-waveform.svg   noise suppression toggle
+chevron-down.svg     device dropdowns (user panel)
 circle-plus.svg      attach a file (composer)
 circle-help.svg      unsupported system message fallback
 file-text.svg        text/document attachments
@@ -27,7 +28,7 @@ phone-call.svg       ongoing call rows
 phone-missed.svg     missed call rows
 phone-off.svg        disconnect / hang up
 phone.svg            completed call rows, start voice call
-pin.svg              pinned message rows
+pin.svg              pinned message rows, pinned messages popover
 play.svg             video play
 rotate-ccw.svg       video replay
 search.svg           search
@@ -35,7 +36,8 @@ settings.svg         user settings
 smile.svg            emoji picker (composer)
 sticker.svg          sticker picker (composer)
 user-minus.svg       member removed / left rows
-user-plus.svg        member added / joined rows
+user-plus.svg        member added / joined rows, add friends to DM
+user-round.svg       user profile panel toggle
 users.svg            member list
 video.svg            video call
 volume-2.svg         video volume, voice channels

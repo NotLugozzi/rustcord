@@ -73,6 +73,8 @@ fn main() {
         rail_order,
         last_read_message_id: app_state::load_read_state(),
         clock_24h: saved_settings.clock_24h,
+        self_muted: saved_settings.self_mute || saved_settings.self_deaf,
+        self_deafened: saved_settings.self_deaf,
         ..Default::default()
     };
     theme::Theme::install_bundled();
@@ -383,6 +385,16 @@ pub fn drain_backend_events(
                     Err(backend::InviteFailure::Unavailable) => invites::InviteState::Unavailable,
                 };
                 state.invites.insert(code, invites::InviteEntry { state: state_for, updated: std::time::Instant::now() });
+            }
+            BackendEvent::PinsLoaded { channel_id, pins } => {
+                let entry = match pins {
+                    Some(pins) => app_state::PinsState::Ready(pins),
+                    None => app_state::PinsState::Failed,
+                };
+                state.pins.insert(channel_id, entry);
+            }
+            BackendEvent::UploadFinished { upload_id } => {
+                state.uploads.retain(|u| u.id != upload_id);
             }
             BackendEvent::RelationshipSettled { user_id } => {
                 state.relationship_busy.remove(&user_id);

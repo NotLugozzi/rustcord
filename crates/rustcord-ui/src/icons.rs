@@ -38,10 +38,12 @@ pub enum Icon {
     Gif,
     Sticker,
     Smile,
+    ChevronDown,
+    UserRound,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 38] = [
+    pub const ALL: [Icon; 40] = [
         Icon::Phone,
         Icon::PhoneMissed,
         Icon::PhoneCall,
@@ -80,6 +82,8 @@ impl Icon {
         Icon::Gif,
         Icon::Sticker,
         Icon::Smile,
+        Icon::ChevronDown,
+        Icon::UserRound,
     ];
 
     fn svg(self) -> &'static str {
@@ -122,6 +126,8 @@ impl Icon {
             Icon::Gif => include_str!("../assets/icons/gif.svg"),
             Icon::Sticker => include_str!("../assets/icons/sticker.svg"),
             Icon::Smile => include_str!("../assets/icons/smile.svg"),
+            Icon::ChevronDown => include_str!("../assets/icons/chevron-down.svg"),
+            Icon::UserRound => include_str!("../assets/icons/user-round.svg"),
         }
     }
 }

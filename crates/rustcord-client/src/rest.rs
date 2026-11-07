@@ -124,6 +124,22 @@ impl LoginSession {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct UploadProgress {
+    pub sent: std::sync::atomic::AtomicU64,
+    pub total: std::sync::atomic::AtomicU64,
+}
+
+impl UploadProgress {
+    pub fn fraction(&self) -> f32 {
+        let total = self.total.load(std::sync::atomic::Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        (self.sent.load(std::sync::atomic::Ordering::Relaxed) as f64 / total as f64).min(1.0) as f32
+    }
+}
+
 #[derive(Clone)]
 pub struct RestClient {
     http: Client,
@@ -290,6 +306,21 @@ impl RestClient {
         self.send_empty(|| self.http.delete(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))).await
     }
 
+    pub async fn pins(&self, channel_id: &str) -> Result<Vec<Message>, ClientError> {
+        self.get(&format!("/channels/{channel_id}/pins")).await
+    }
+
+    pub async fn add_recipient(&self, channel_id: &str, user_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| {
+            self.http.put(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}")).json(&serde_json::json!({}))
+        })
+        .await
+    }
+
+    pub async fn create_group_dm(&self, recipients: &[String]) -> Result<Channel, ClientError> {
+        self.post("/users/@me/channels", &serde_json::json!({ "recipients": recipients })).await
+    }
+
     pub async fn put_relationship(&self, user_id: &str, kind: Option<u8>) -> Result<(), ClientError> {
         let body = match kind {
             Some(kind) => serde_json::json!({ "type": kind }),
@@ -381,6 +412,21 @@ impl RestClient {
         content_type: &str,
         reply_to: Option<&str>,
     ) -> Result<Message, ClientError> {
+        self.send_message_with_attachment_progress(channel_id, content, filename, file_bytes, content_type, reply_to, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_message_with_attachment_progress(
+        &self,
+        channel_id: &str,
+        content: &str,
+        filename: &str,
+        file_bytes: Vec<u8>,
+        content_type: &str,
+        reply_to: Option<&str>,
+        progress: Option<std::sync::Arc<UploadProgress>>,
+    ) -> Result<Message, ClientError> {
         #[derive(Serialize)]
         struct PayloadAttachment<'a> {
             id: u32,
@@ -404,8 +450,22 @@ impl RestClient {
         };
         let payload_json = serde_json::to_string(&payload)?;
 
-        let file_part = reqwest::multipart::Part::bytes(file_bytes)
-            .file_name(filename.to_string())
+        let file_part = match progress {
+            Some(progress) => {
+                const CHUNK: usize = 64 * 1024;
+                let total = file_bytes.len() as u64;
+                let bytes = bytes::Bytes::from(file_bytes);
+                let chunks: Vec<bytes::Bytes> =
+                    (0..bytes.len()).step_by(CHUNK).map(|start| bytes.slice(start..(start + CHUNK).min(bytes.len()))).collect();
+                let stream = futures_util::stream::iter(chunks.into_iter().map(move |chunk| {
+                    progress.sent.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    Ok::<_, std::io::Error>(chunk)
+                }));
+                reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), total)
+            }
+            None => reqwest::multipart::Part::bytes(file_bytes),
+        }
+        .file_name(filename.to_string())
             .mime_str(content_type)
             .map_err(|e| ClientError::Api { status: 0, message: e.to_string() })?;
         let form = reqwest::multipart::Form::new()

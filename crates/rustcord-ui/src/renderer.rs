@@ -364,6 +364,13 @@ impl ApplicationHandler for App {
                 self.state.window_focused = *focused;
                 self.needs_redraw = true;
             }
+            WindowEvent::DroppedFile(path) => {
+                if self.state.selected_channel.is_some() {
+                    self.state.pending_attachment = Some(path.clone());
+                    self.state.focus_compose = true;
+                }
+                self.needs_redraw = true;
+            }
             _ => {
                 self.last_input = Instant::now();
                 self.needs_redraw = true;
@@ -418,7 +425,8 @@ impl ApplicationHandler for App {
             self.needs_redraw = true;
         }
         self.typing_active = typing;
-        if self.needs_redraw || active || animating || typing || !self.event_rx.is_empty() {
+        let uploading = !self.state.uploads.is_empty();
+        if self.needs_redraw || active || animating || typing || uploading || !self.event_rx.is_empty() {
             window.window.request_redraw();
             self.needs_redraw = false;
         }
