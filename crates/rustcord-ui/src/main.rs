@@ -7,12 +7,14 @@ mod images;
 mod ipc;
 mod keybinds;
 mod markdown;
+mod message_rows;
 mod presence;
 mod renderer;
 mod session_store;
 mod settings;
 mod switcher;
 mod theme;
+mod timefmt;
 mod ui;
 #[cfg(feature = "video")]
 mod video;
@@ -68,6 +70,7 @@ fn main() {
         rail_folders,
         rail_order,
         last_read_message_id: app_state::load_read_state(),
+        clock_24h: saved_settings.clock_24h,
         ..Default::default()
     };
     theme::Theme::install_bundled();
@@ -223,23 +226,10 @@ pub fn drain_backend_events(
                 state.presences.insert(presence.user.id.clone(), presence);
             }
             BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call }) => {
-                if let Some(msg) = state.messages.get_mut(&channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) {
-                    let msg = std::sync::Arc::make_mut(msg);
-                    if let Some(content) = content {
-                        msg.content = content;
-                    }
-                    if edited_timestamp.is_some() {
-                        msg.edited_timestamp = edited_timestamp;
-                    }
-                    if call.is_some() {
-                        msg.call = call;
-                    }
-                }
+                state.update_message(&channel_id, &id, content, edited_timestamp, call);
             }
             BackendEvent::Gateway(GatewayEvent::MessageDelete { channel_id, id }) => {
-                if let Some(list) = state.messages.get_mut(&channel_id) {
-                    list.retain(|m| m.id != id);
-                }
+                state.delete_message(&channel_id, &id);
             }
             BackendEvent::Gateway(GatewayEvent::ReactionAdd { channel_id, message_id, user_id, emoji }) => {
                 state.apply_reaction(&channel_id, &message_id, &user_id, emoji, true);

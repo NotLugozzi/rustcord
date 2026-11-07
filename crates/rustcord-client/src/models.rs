@@ -305,6 +305,17 @@ pub struct Message {
     pub kind: u8,
     #[serde(default)]
     pub call: Option<CallInfo>,
+    #[serde(default)]
+    pub webhook_id: Option<Snowflake>,
+    #[serde(default)]
+    pub message_reference: Option<MessageReference>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageReference {
+    pub message_id: Option<Snowflake>,
+    pub channel_id: Option<Snowflake>,
+    pub guild_id: Option<Snowflake>,
 }
 
 fn lenient_embeds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Embed>, D::Error> {

@@ -222,6 +222,7 @@ pub struct AppState {
     pub guild_members_requested: std::collections::HashSet<String>,
     pub show_members_panel: bool,
     pub messages: HashMap<String, Vec<std::sync::Arc<Message>>>,
+    pub message_rows: HashMap<String, std::sync::Arc<crate::message_rows::ChannelRows>>,
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
     pub compose_buf: String,
@@ -317,6 +318,7 @@ pub struct AppState {
     pub keybinds: crate::keybinds::Keybinds,
     pub rebinding_action: Option<crate::keybinds::Action>,
     pub mic_test_running: bool,
+    pub clock_24h: Option<bool>,
 }
 
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
@@ -571,6 +573,7 @@ impl AppState {
                 }
             }
         }
+        self.message_rows.remove(&message.channel_id);
         let list = self.messages.entry(message.channel_id.clone()).or_default();
         let new_id = snowflake_value(&message.id);
         let insert_at = list.partition_point(|m| snowflake_value(&m.id) <= new_id);
@@ -668,6 +671,7 @@ impl AppState {
 
     fn forget_channel(&mut self, channel_id: &str) {
         self.messages.remove(channel_id);
+        self.message_rows.remove(channel_id);
         self.typing_users.remove(channel_id);
         self.last_read_message_id.remove(channel_id);
         if self.selected_channel.as_deref() == Some(channel_id) {
@@ -693,6 +697,7 @@ impl AppState {
         added: bool,
     ) {
         let is_me = self.current_user.as_ref().is_some_and(|u| u.id == user_id);
+        self.message_rows.remove(channel_id);
         let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) else {
             return;
         };
@@ -700,6 +705,7 @@ impl AppState {
     }
 
     pub fn clear_reactions(&mut self, channel_id: &str, message_id: &str) {
+        self.message_rows.remove(channel_id);
         if let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) {
             std::sync::Arc::make_mut(msg).reactions.clear();
         }
@@ -832,15 +838,58 @@ impl AppState {
 
     pub fn set_message_history(&mut self, channel_id: String, mut messages: Vec<Message>) {
         messages.sort_by_key(|m| snowflake_value(&m.id));
+        self.message_rows.remove(&channel_id);
         self.messages.insert(channel_id, messages.into_iter().map(std::sync::Arc::new).collect());
     }
 
     pub fn prepend_message_history(&mut self, channel_id: String, mut older: Vec<Message>) {
         older.sort_by_key(|m| snowflake_value(&m.id));
+        self.message_rows.remove(&channel_id);
         let existing = self.messages.entry(channel_id).or_default();
         let mut combined: Vec<_> = older.into_iter().map(std::sync::Arc::new).collect();
         combined.append(existing);
         *existing = combined;
+    }
+
+    pub fn update_message(
+        &mut self,
+        channel_id: &str,
+        id: &str,
+        content: Option<String>,
+        edited_timestamp: Option<String>,
+        call: Option<rustcord_client::models::CallInfo>,
+    ) {
+        let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) else { return };
+        self.message_rows.remove(channel_id);
+        let msg = std::sync::Arc::make_mut(msg);
+        if let Some(content) = content {
+            msg.content = content;
+        }
+        if edited_timestamp.is_some() {
+            msg.edited_timestamp = edited_timestamp;
+        }
+        if call.is_some() {
+            msg.call = call;
+        }
+    }
+
+    pub fn delete_message(&mut self, channel_id: &str, id: &str) {
+        if let Some(list) = self.messages.get_mut(channel_id) {
+            list.retain(|m| m.id != id);
+            self.message_rows.remove(channel_id);
+        }
+    }
+
+    pub fn rows_for(&mut self, channel_id: &str) -> std::sync::Arc<crate::message_rows::ChannelRows> {
+        let today = crate::timefmt::local_today();
+        let format = crate::timefmt::TimeFormat::resolve(self.clock_24h);
+        if let Some(rows) = self.message_rows.get(channel_id).filter(|rows| !rows.is_stale(today, format)) {
+            return rows.clone();
+        }
+        let messages = self.messages.get(channel_id).map(Vec::as_slice).unwrap_or(&[]);
+        let rows = std::sync::Arc::new(crate::message_rows::ChannelRows::build(messages, &chrono::Local, today, format));
+        self.message_rows.insert(channel_id.to_string(), rows.clone());
+        rows
     }
 
     pub fn last_message_timestamp(&self, channel_id: &str) -> Option<&str> {
@@ -993,6 +1042,7 @@ impl AppState {
             denoise: self.denoise,
             user_volumes: self.user_volumes.clone(),
             keybinds: self.keybinds.to_map(),
+            clock_24h: self.clock_24h,
             ..Default::default()
         }
     }

@@ -1,0 +1,28 @@
+UI icons are from Lucide (https://lucide.dev), lucide-static v0.460.0, licensed
+under the ISC License (see LICENSE-lucide.txt). Fetched unmodified from
+https://unpkg.com/lucide-static@0.460.0/icons/<name>.svg
+
+Icon file          Lucide name      Used for
+phone.svg          phone            completed call rows, start voice call
+phone-missed.svg   phone-missed     missed call rows
+phone-call.svg     phone-call       ongoing call rows
+user-plus.svg      user-plus        member added rows, add people to DM
+user-minus.svg     user-minus       member removed / left rows
+pencil.svg         pencil           channel name change rows
+image.svg          image            channel icon change rows
+pin.svg            pin              pinned message rows, pinned messages
+circle-help.svg    circle-help      unsupported system message fallback
+volume-2.svg       volume-2         voice channel invites
+video.svg          video            start video call
+users.svg          users            member list, group DM
+search.svg         search           conversation search
+user-round.svg     user-round       profile panel toggle
+mic.svg            mic              microphone unmuted
+mic-off.svg        mic-off          microphone muted
+headphones.svg     headphones       output undeafened
+headphone-off.svg  headphone-off    output deafened
+paperclip.svg      paperclip        attach a file
+pin-off.svg        pin-off          (reserved) unpin
+
+The artwork uses stroke="currentColor"; the renderer rasterizes it as a white
+alpha mask and tints it from theme colors at draw time.

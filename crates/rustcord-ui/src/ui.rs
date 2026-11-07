@@ -26,17 +26,31 @@ impl Fonts {
     }
 }
 
-fn format_timestamp(iso: &str) -> String {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-        .unwrap_or_else(|_| "--:--".to_string())
+fn timestamp_text(ui: &Ui, color: [f32; 4], label: &str, full: &str, scale: f32) {
+    let token = ui.push_style_color(imgui::StyleColor::Text, color);
+    ui.set_window_font_scale(scale);
+    ui.text(label);
+    ui.set_window_font_scale(1.0);
+    token.pop();
+    if ui.is_item_hovered() {
+        ui.tooltip_text(full);
+    }
 }
 
-fn same_group_window(a: &str, b: &str) -> bool {
-    let (Ok(a), Ok(b)) = (chrono::DateTime::parse_from_rfc3339(a), chrono::DateTime::parse_from_rfc3339(b)) else {
-        return false;
-    };
-    (b - a).num_minutes().abs() < 5
+fn draw_day_divider(ui: &Ui, theme: &crate::theme::Theme, label: &str) {
+    ui.dummy([0.0, 4.0]);
+    let start = ui.cursor_screen_pos();
+    let width = ui.content_region_avail()[0];
+    ui.set_window_font_scale(0.8);
+    let text_size = ui.calc_text_size(label);
+    let line_y = start[1] + text_size[1] / 2.0;
+    let text_x = start[0] + (width - text_size[0]) / 2.0;
+    let dl = ui.get_window_draw_list();
+    dl.add_line([start[0] + 16.0, line_y], [text_x - 8.0, line_y], theme.border).thickness(1.0).build();
+    dl.add_line([text_x + text_size[0] + 8.0, line_y], [start[0] + width - 8.0, line_y], theme.border).thickness(1.0).build();
+    dl.add_text([text_x, start[1]], theme.text_muted, label);
+    ui.set_window_font_scale(1.0);
+    ui.dummy([width, text_size[1] + 8.0]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2408,10 +2422,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             }
             let show_reconnecting = state.logged_in && !state.gateway_connected;
             let status_height = if state.status_message.is_some() || show_reconnecting { 24.0 } else { 0.0 };
-            let messages = state.active_messages().to_vec();
             let channel_key = state.selected_channel.clone().unwrap_or_default();
+            let channel_rows = state.rows_for(&channel_key);
+            let rows = &channel_rows.rows;
             let seen_count = state.last_seen_message_count.get(&channel_key).copied().unwrap_or(0);
-            let has_new_messages = messages.len() > seen_count;
+            let has_new_messages = rows.len() > seen_count;
 
             let dm_channel = state.selected_channel.as_ref().and_then(|id| state.dm_channels.iter().find(|c| c.id == *id).cloned());
             let mut header_height = if state.selected_channel.is_some() { HEADER_HEIGHT } else { 0.0 };
@@ -2448,7 +2463,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .size([0.0, display_h - 80.0 - status_height - header_height - extra_banner_height])
                 .build(|| {
                     let was_at_bottom = ui.scroll_y() >= ui.scroll_max_y() - 40.0;
-                    if messages.is_empty() {
+                    if rows.is_empty() {
                         ui.text_disabled("No messages loaded yet.");
                     }
 
@@ -2460,16 +2475,20 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     let scroll_target = state.scroll_to_message.clone();
                     let mut scrolled_to_target = false;
 
-                    for (idx, msg) in messages.iter().enumerate() {
+                    for row in rows {
+                        let msg = &row.message;
+                        if let Some(label) = &row.divider {
+                            draw_day_divider(ui, &state.theme, label);
+                        }
                         let message_y = ui.cursor_pos()[1];
                         let is_history_anchor = state.history_scroll_anchor.as_ref().is_some_and(|(channel, id)| {
                             channel == &channel_key && id == &msg.id
                         });
                         let is_scroll_target = scroll_target.as_deref() == Some(msg.id.as_str());
                         let highlight_start = ui.cursor_screen_pos();
-                        if msg.kind == 3 {
+                        if crate::message_rows::is_system(msg) {
                             let me = state.current_user.as_ref().map(|u| u.id.as_str()).unwrap_or_default();
-                            let (text, color) = call_message_text(msg, me);
+                            let (text, color) = system_message_text(msg, me);
                             let missed = color.is_none();
                             let mut pos = ui.cursor_pos();
                             pos[0] += 24.0 + AVATAR_SIZE[0] + 12.0 - EMOJI_SIZE - 12.0;
@@ -2478,7 +2497,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 ui.dummy([EMOJI_SIZE, EMOJI_SIZE]);
                             }
                             ui.same_line();
-                            ui.text_colored(state.theme.text_muted, format!("{text}  {}", format_timestamp(&msg.timestamp)));
+                            ui.text_colored(state.theme.text_muted, text);
+                            ui.same_line();
+                            timestamp_text(ui, state.theme.text_muted, &row.times.inline, &row.times.full, 0.85);
                             ui.dummy([0.0, MESSAGE_GAP]);
                             if is_history_anchor {
                                 ui.set_scroll_from_pos_y_with_ratio(message_y, 0.0);
@@ -2486,13 +2507,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             }
                             continue;
                         }
-                        let starts_group = msg.referenced_message.is_some()
-                            || match messages.get(idx.wrapping_sub(1)) {
-                                Some(prev) if idx > 0 => {
-                                    prev.author.id != msg.author.id || !same_group_window(&prev.timestamp, &msg.timestamp)
-                                }
-                                _ => true,
-                            };
+                        let starts_group = row.starts_group;
 
                         let mut row_start = ui.cursor_pos();
                         let mut row_screen_start = ui.cursor_screen_pos();
@@ -2546,17 +2561,13 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     state.profile_popout = Some(msg.author.clone());
                                 }
                                 ui.same_line();
-                                let time = format_timestamp(&msg.timestamp);
-                                let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-                                ui.set_window_font_scale(0.85);
-                                ui.text(time);
-                                ui.set_window_font_scale(1.0);
-                                token.pop();
+                                timestamp_text(ui, state.theme.text_muted, &row.times.header, &row.times.full, 0.85);
 
                                 if !msg.content.is_empty() {
                                     draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                     if msg.edited_timestamp.is_some() {
-                                        ui.text_colored(state.theme.text_muted, "(edited)");
+                                        let edited = row.times.edited_full.as_deref().unwrap_or(&row.times.full);
+                                        timestamp_text(ui, state.theme.text_muted, "(edited)", edited, 0.85);
                                     }
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
@@ -2576,7 +2587,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 if !msg.content.is_empty() {
                                     draw_markdown(ui, fonts, &state.theme, &msg.content, &mut state.revealed_spoilers, &msg.id, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                     if msg.edited_timestamp.is_some() {
-                                        ui.text_colored(state.theme.text_muted, "(edited)");
+                                        let edited = row.times.edited_full.as_deref().unwrap_or(&row.times.full);
+                                        timestamp_text(ui, state.theme.text_muted, "(edited)", edited, 0.85);
                                     }
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
@@ -2587,7 +2599,15 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
                             });
-                            ui.set_cursor_pos([row_start[0], content_top + ui.item_rect_size()[1]]);
+                            let after_group = [row_start[0], content_top + ui.item_rect_size()[1]];
+                            let mouse = ui.io().mouse_pos;
+                            let group_min = ui.item_rect_min();
+                            let group_max = ui.item_rect_max();
+                            if ui.is_window_hovered() && mouse[1] >= group_min[1] && mouse[1] <= group_max[1] && mouse[0] >= row_screen_start[0] {
+                                ui.set_cursor_pos([row_start[0], content_top + 2.0]);
+                                timestamp_text(ui, state.theme.text_muted, &row.times.short, &row.times.full, 0.75);
+                            }
+                            ui.set_cursor_pos(after_group);
                         }
 
                         let row_end_screen = ui.cursor_screen_pos();
@@ -2631,15 +2651,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             }
                         });
 
-                        let next_starts_group = match messages.get(idx + 1) {
-                            Some(next) => {
-                                next.referenced_message.is_some()
-                                    || next.author.id != msg.author.id
-                                    || !same_group_window(&msg.timestamp, &next.timestamp)
-                            }
-                            None => true,
-                        };
-                        ui.dummy([0.0, if next_starts_group { MESSAGE_GAP } else { 2.0 }]);
+                        ui.dummy([0.0, if row.ends_group { MESSAGE_GAP } else { 2.0 }]);
 
                         if is_history_anchor {
                             ui.set_scroll_from_pos_y_with_ratio(message_y, 0.0);
@@ -2674,8 +2686,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
 
                     let scroll_y = ui.scroll_y();
-                    if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !messages.is_empty() && !state.loading_older_messages && !state.history_exhausted.contains(&channel_key) {
-                        if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), messages.first()) {
+                    if !snapping_to_bottom && scroll_target.is_none() && scroll_y <= 0.0 && !rows.is_empty() && !state.loading_older_messages && !state.history_exhausted.contains(&channel_key) {
+                        if let (Some(channel_id), Some(oldest)) = (state.selected_channel.clone(), rows.first().map(|r| &r.message)) {
                             state.loading_older_messages = true;
                             state.history_scroll_anchor = Some((channel_id.clone(), oldest.id.clone()));
                             let _ = cmd_tx.send(UiCommand::LoadOlderMessages {
@@ -2685,9 +2697,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                     }
                 });
-            state.last_seen_message_count.insert(channel_key.clone(), messages.len());
+            state.last_seen_message_count.insert(channel_key.clone(), rows.len());
             if state.window_focused && !channel_key.is_empty() && !state.viewing_jumped_history {
-                if let Some(newest) = messages.last() {
+                if let Some(newest) = rows.last().map(|r| &r.message) {
                     if state.mark_channel_read(&channel_key, &newest.id) {
                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_key.clone(), message_id: newest.id.clone() });
                     }
@@ -3057,6 +3069,14 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
             state.custom_status_input.clear();
         }
     });
+}
+
+fn system_message_text(msg: &rustcord_client::models::Message, me: &str) -> (String, Option<[f32; 4]>) {
+    if msg.kind == 3 {
+        return call_message_text(msg, me);
+    }
+    let name = msg.author.global_name.clone().unwrap_or_else(|| msg.author.username.clone());
+    (format!("{name} performed an unsupported action"), Some([0.6, 0.6, 0.6, 1.0]))
 }
 
 fn call_message_text(msg: &rustcord_client::models::Message, me: &str) -> (String, Option<[f32; 4]>) {
@@ -5379,6 +5399,19 @@ fn draw_settings_about(ui: &Ui, textures: &TextureCache) {
 }
 
 fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
+    let clock_options = [(None, "System default"), (Some(false), "12-hour"), (Some(true), "24-hour")];
+    let mut clock_idx = clock_options.iter().position(|(value, _)| *value == state.clock_24h).unwrap_or(0);
+    ui.set_next_item_width(200.0);
+    if ui.combo("Clock", &mut clock_idx, &clock_options, |(_, label)| std::borrow::Cow::Borrowed(*label)) {
+        state.clock_24h = clock_options[clock_idx].0;
+        crate::settings::save(&crate::settings::Settings {
+            theme_file: current_theme_file(&state.theme),
+            input_device: state.selected_input_device.clone(),
+            output_device: state.selected_output_device.clone(),
+            ..state.audio_settings()
+        });
+    }
+    ui.separator();
     let theme_paths = crate::theme::Theme::list_available();
     if theme_paths.is_empty() {
         ui.text_disabled("No themes are available.");

@@ -10,6 +10,7 @@ pub struct Settings {
     pub denoise: bool,
     pub user_volumes: std::collections::HashMap<String, f32>,
     pub keybinds: std::collections::HashMap<String, String>,
+    pub clock_24h: Option<bool>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
