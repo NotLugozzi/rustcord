@@ -439,6 +439,9 @@ pub struct AppState {
     pub incoming_calls: Vec<String>,
     pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub pending_attachments: HashMap<String, Vec<PendingAttachment>>,
+    pub poll_views: HashMap<String, PollView>,
+    pub poll_card_heights: HashMap<String, f32>,
+    pub poll_draft: Option<PollDraft>,
     pub next_attachment_id: u64,
     pub attachment_previews_requested: std::collections::HashSet<u64>,
     pub revealed_spoilers: std::collections::HashSet<usize>,
@@ -552,6 +555,48 @@ pub enum PinsState {
     Loading,
     Ready(Vec<Message>),
     Failed,
+}
+
+pub const MAX_POLL_ANSWERS: usize = 10;
+
+#[derive(Default, Clone)]
+pub struct PollView {
+    pub selected: Vec<u32>,
+    pub show_results: bool,
+}
+
+impl PollView {
+    pub fn toggle(&mut self, answer_id: u32, multiselect: bool) {
+        match (self.selected.iter().position(|&id| id == answer_id), multiselect) {
+            (Some(index), _) => {
+                self.selected.remove(index);
+            }
+            (None, true) => self.selected.push(answer_id),
+            (None, false) => self.selected = vec![answer_id],
+        }
+    }
+}
+
+pub struct PollDraft {
+    pub channel_id: String,
+    pub question: String,
+    pub answers: Vec<String>,
+    pub duration_index: usize,
+    pub multiselect: bool,
+}
+
+impl PollDraft {
+    pub fn new(channel_id: String) -> Self {
+        Self { channel_id, question: String::new(), answers: vec![String::new(), String::new()], duration_index: 3, multiselect: false }
+    }
+
+    pub fn filled_answers(&self) -> usize {
+        self.answers.iter().filter(|a| !a.trim().is_empty()).count()
+    }
+
+    pub fn can_post(&self) -> bool {
+        !self.question.trim().is_empty() && self.filled_answers() >= 1
+    }
 }
 
 pub const MAX_ATTACHMENTS: usize = 10;
@@ -1225,6 +1270,7 @@ impl AppState {
         content: Option<String>,
         edited_timestamp: Option<String>,
         call: Option<rustcord_client::models::CallInfo>,
+        poll: Option<rustcord_client::models::Poll>,
     ) {
         let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == id)) else { return };
         self.message_rows.remove(channel_id);
@@ -1237,6 +1283,20 @@ impl AppState {
         }
         if call.is_some() {
             msg.call = call;
+        }
+        if poll.is_some() {
+            msg.poll = poll;
+        }
+    }
+
+    pub fn apply_poll_vote(&mut self, channel_id: &str, message_id: &str, user_id: &str, answer_id: u32, added: bool) {
+        let is_me = self.current_user.as_ref().is_some_and(|u| u.id == user_id);
+        let Some(msg) = self.messages.get_mut(channel_id).and_then(|l| l.iter_mut().find(|m| m.id == message_id)) else { return };
+        let Some(poll) = std::sync::Arc::make_mut(msg).poll.as_mut() else { return };
+        poll.apply_vote(answer_id, is_me, added);
+        self.message_rows.remove(channel_id);
+        if is_me {
+            self.poll_views.remove(message_id);
         }
     }
 
@@ -2361,6 +2421,50 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["blob", "\u{1F600}"]);
+    }
+
+    #[test]
+    fn single_select_replaces_and_multiselect_accumulates() {
+        let mut view = PollView::default();
+        view.toggle(1, false);
+        view.toggle(2, false);
+        assert_eq!(view.selected, [2]);
+        view.toggle(2, false);
+        assert!(view.selected.is_empty());
+        view.toggle(1, true);
+        view.toggle(3, true);
+        view.toggle(1, true);
+        assert_eq!(view.selected, [3]);
+    }
+
+    #[test]
+    fn a_poll_draft_needs_a_question_and_one_answer() {
+        let mut draft = PollDraft::new("c".into());
+        assert!(!draft.can_post());
+        draft.question = "lunch?".into();
+        assert!(!draft.can_post());
+        draft.answers[1] = "pizza".into();
+        assert!(draft.can_post());
+    }
+
+    #[test]
+    fn my_own_vote_event_updates_the_poll_and_clears_my_selection() {
+        let mut state = AppState { current_user: Some(test_user("me", "me", None)), ..Default::default() };
+        let mut msg = incoming(None, "c", false);
+        msg.poll = Some(
+            serde_json::from_value(serde_json::json!({
+                "question": { "text": "q" },
+                "answers": [{ "answer_id": 1, "poll_media": { "text": "a" } }]
+            }))
+            .unwrap(),
+        );
+        state.messages.insert("c".into(), vec![std::sync::Arc::new(msg)]);
+        state.poll_views.insert("1".into(), PollView { selected: vec![1], show_results: false });
+        state.apply_poll_vote("c", "1", "me", 1, true);
+        state.apply_poll_vote("c", "1", "other", 1, true);
+        let poll = state.messages["c"][0].poll.clone().unwrap();
+        assert_eq!((poll.total_votes(), poll.my_votes()), (2, vec![1]));
+        assert!(!state.poll_views.contains_key("1"));
     }
 
     fn bytes_source() -> AttachmentSource {

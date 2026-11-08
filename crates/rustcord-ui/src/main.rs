@@ -107,10 +107,12 @@ fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Messa
         return;
     }
     let title = message.author.global_name.clone().unwrap_or_else(|| message.author.username.clone());
-    let body = match (message.content.is_empty(), message.sticker_items.first()) {
-        (false, _) => message.content.chars().take(160).collect(),
-        (true, Some(sticker)) => format!("[sticker: {}]", sticker.name),
-        (true, None) => "[attachment]".to_string(),
+    let poll_question = message.poll.as_ref().and_then(|p| p.question.text.as_deref());
+    let body = match (message.content.is_empty(), message.sticker_items.first(), poll_question) {
+        (false, _, _) => message.content.chars().take(160).collect(),
+        (true, Some(sticker), _) => format!("[sticker: {}]", sticker.name),
+        (true, None, Some(question)) => format!("[poll: {question}]"),
+        (true, None, None) => "[attachment]".to_string(),
     };
     let avatar_url = rustcord_client::cdn::avatar_url(&message.author, 64)
         .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&message.author));
@@ -272,8 +274,11 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::PresenceUpdate(presence)) => {
                 state.presences.insert(presence.user.id.clone(), presence);
             }
-            BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call }) => {
-                state.update_message(&channel_id, &id, content, edited_timestamp, call);
+            BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call, poll }) => {
+                state.update_message(&channel_id, &id, content, edited_timestamp, call, poll);
+            }
+            BackendEvent::Gateway(GatewayEvent::PollVote { channel_id, message_id, user_id, answer_id, added }) => {
+                state.apply_poll_vote(&channel_id, &message_id, &user_id, answer_id, added);
             }
             BackendEvent::Gateway(GatewayEvent::MessageDelete { channel_id, id }) => {
                 state.delete_message(&channel_id, &id);

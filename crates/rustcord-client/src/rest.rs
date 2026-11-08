@@ -334,6 +334,21 @@ impl RestClient {
         self.post(&format!("/channels/{channel_id}/messages"), &body).await
     }
 
+    pub async fn send_poll(&self, channel_id: &str, poll: serde_json::Value) -> Result<Message, ClientError> {
+        let body = serde_json::json!({ "content": "", "poll": poll });
+        self.post(&format!("/channels/{channel_id}/messages"), &body).await
+    }
+
+    pub async fn vote_poll(&self, channel_id: &str, message_id: &str, answer_ids: &[u32]) -> Result<(), ClientError> {
+        let url = format!("{API_BASE}/channels/{channel_id}/polls/{message_id}/answers/@me");
+        let body = serde_json::json!({ "answer_ids": answer_ids.iter().map(u32::to_string).collect::<Vec<_>>() });
+        self.send_empty(|| self.http.put(&url).json(&body)).await
+    }
+
+    pub async fn end_poll(&self, channel_id: &str, message_id: &str) -> Result<Message, ClientError> {
+        self.post(&format!("/channels/{channel_id}/polls/{message_id}/expire"), &serde_json::json!({})).await
+    }
+
     pub async fn guild_stickers(&self, guild_id: &str) -> Result<Vec<Sticker>, ClientError> {
         self.get(&format!("/guilds/{guild_id}/stickers")).await
     }

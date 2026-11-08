@@ -126,6 +126,9 @@ pub enum UiCommand {
         progress: std::sync::Arc<rustcord_client::rest::UploadProgress>,
     },
     CancelUpload { upload_id: u64 },
+    SendPoll { channel_id: String, poll: serde_json::Value },
+    VotePoll { channel_id: String, message_id: String, answer_ids: Vec<u32> },
+    EndPoll { channel_id: String, message_id: String },
     PreviewAttachment { key: String, source: crate::app_state::AttachmentSource },
     DownloadImage { url: String },
     ShowNotification { title: String, body: String, avatar_url: String },
@@ -482,6 +485,36 @@ pub fn spawn(
                         };
                         let _ = event_tx.send(BackendEvent::ImageDownloaded { url: key, image });
                     });
+                }
+                UiCommand::SendPoll { channel_id, poll } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = client.send_poll(&channel_id, poll).await {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to post poll: {e}")));
+                            }
+                        });
+                    }
+                }
+                UiCommand::VotePoll { channel_id, message_id, answer_ids } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = client.vote_poll(&channel_id, &message_id, &answer_ids).await {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to vote: {e}")));
+                            }
+                        });
+                    }
+                }
+                UiCommand::EndPoll { channel_id, message_id } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = client.end_poll(&channel_id, &message_id).await {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to end poll: {e}")));
+                            }
+                        });
+                    }
                 }
                 UiCommand::CancelUpload { upload_id } => {
                     if let Some(task) = UPLOADS.lock().unwrap().remove(&upload_id) {

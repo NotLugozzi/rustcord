@@ -462,7 +462,7 @@ pub struct SelfGuildMember {
     pub roles: Vec<Snowflake>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ReactionEmoji {
     pub id: Option<Snowflake>,
     pub name: Option<String>,
@@ -534,6 +534,8 @@ pub struct Message {
     pub message_reference: Option<MessageReference>,
     #[serde(default)]
     pub sticker_items: Vec<StickerItem>,
+    #[serde(default)]
+    pub poll: Option<Poll>,
 }
 
 impl Message {
@@ -667,6 +669,125 @@ pub struct StickerPack {
     pub name: String,
     #[serde(default)]
     pub stickers: Vec<Sticker>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct PollMedia {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<ReactionEmoji>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct PollAnswer {
+    pub answer_id: u32,
+    #[serde(default)]
+    pub poll_media: PollMedia,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct PollAnswerCount {
+    pub id: u32,
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub me_voted: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct PollResults {
+    #[serde(default)]
+    pub is_finalized: bool,
+    #[serde(default)]
+    pub answer_counts: Vec<PollAnswerCount>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Poll {
+    pub question: PollMedia,
+    #[serde(default)]
+    pub answers: Vec<PollAnswer>,
+    #[serde(default)]
+    pub expiry: Option<String>,
+    #[serde(default)]
+    pub allow_multiselect: bool,
+    #[serde(default)]
+    pub results: Option<PollResults>,
+}
+
+impl Poll {
+    pub fn count(&self, answer_id: u32) -> PollAnswerCount {
+        self.results
+            .as_ref()
+            .and_then(|r| r.answer_counts.iter().find(|c| c.id == answer_id).cloned())
+            .unwrap_or(PollAnswerCount { id: answer_id, ..Default::default() })
+    }
+
+    pub fn total_votes(&self) -> u32 {
+        self.results.as_ref().map_or(0, |r| r.answer_counts.iter().map(|c| c.count).sum())
+    }
+
+    pub fn my_votes(&self) -> Vec<u32> {
+        self.results.as_ref().map_or_else(Vec::new, |r| r.answer_counts.iter().filter(|c| c.me_voted).map(|c| c.id).collect())
+    }
+
+    pub fn is_finalized(&self) -> bool {
+        self.results.as_ref().is_some_and(|r| r.is_finalized)
+    }
+
+    pub fn expires_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let expiry = self.expiry.as_deref()?;
+        chrono::DateTime::parse_from_rfc3339(expiry).ok().map(|t| t.with_timezone(&chrono::Utc))
+    }
+
+    pub fn is_closed(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.is_finalized() || self.expires_at().is_some_and(|t| t <= now)
+    }
+
+    pub fn apply_vote(&mut self, answer_id: u32, is_me: bool, added: bool) {
+        let results = self.results.get_or_insert_with(Default::default);
+        let index = match results.answer_counts.iter().position(|c| c.id == answer_id) {
+            Some(index) => index,
+            None => {
+                results.answer_counts.push(PollAnswerCount { id: answer_id, ..Default::default() });
+                results.answer_counts.len() - 1
+            }
+        };
+        let entry = &mut results.answer_counts[index];
+        if added {
+            if is_me && entry.me_voted {
+                return;
+            }
+            entry.count += 1;
+        } else {
+            if is_me && !entry.me_voted {
+                return;
+            }
+            entry.count = entry.count.saturating_sub(1);
+        }
+        if is_me {
+            entry.me_voted = added;
+        }
+    }
+}
+
+pub const POLL_DURATIONS_HOURS: [(u32, &str); 7] =
+    [(1, "1 hour"), (4, "4 hours"), (8, "8 hours"), (24, "24 hours"), (72, "3 days"), (168, "1 week"), (336, "2 weeks")];
+
+pub fn poll_create_payload(question: &str, answers: &[String], duration_hours: u32, allow_multiselect: bool) -> serde_json::Value {
+    serde_json::json!({
+        "question": { "text": question.trim() },
+        "answers": answers
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|text| serde_json::json!({ "poll_media": { "text": text } }))
+            .collect::<Vec<_>>(),
+        "duration": duration_hours,
+        "allow_multiselect": allow_multiselect,
+        "layout_type": 1,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -958,4 +1079,72 @@ pub struct Attachment {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+}
+
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+
+    fn poll() -> Poll {
+        serde_json::from_value(serde_json::json!({
+            "question": { "text": "lunch?" },
+            "answers": [
+                { "answer_id": 1, "poll_media": { "text": "pizza" } },
+                { "answer_id": 2, "poll_media": { "text": "sushi", "emoji": { "id": null, "name": "\u{1F363}" } } }
+            ],
+            "expiry": "2026-11-09T12:00:00.000000+00:00",
+            "allow_multiselect": false,
+            "layout_type": 1,
+            "results": { "is_finalized": false, "answer_counts": [{ "id": 1, "count": 3, "me_voted": true }] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_poll_parses_with_partial_results() {
+        let poll = poll();
+        assert_eq!(poll.total_votes(), 3);
+        assert_eq!(poll.my_votes(), [1]);
+        assert_eq!(poll.count(2), PollAnswerCount { id: 2, count: 0, me_voted: false });
+        assert_eq!(poll.answers[1].poll_media.emoji.as_ref().and_then(|e| e.name.as_deref()), Some("\u{1F363}"));
+    }
+
+    #[test]
+    fn votes_move_counts_and_my_flag() {
+        let mut poll = poll();
+        poll.apply_vote(1, true, false);
+        poll.apply_vote(2, true, true);
+        poll.apply_vote(2, false, true);
+        assert_eq!((poll.count(1).count, poll.count(1).me_voted), (2, false));
+        assert_eq!((poll.count(2).count, poll.count(2).me_voted), (2, true));
+        assert_eq!(poll.my_votes(), [2]);
+    }
+
+    #[test]
+    fn a_repeated_own_vote_event_is_not_double_counted() {
+        let mut poll = poll();
+        poll.apply_vote(1, true, true);
+        assert_eq!(poll.count(1).count, 3);
+        poll.apply_vote(2, true, false);
+        assert_eq!(poll.count(2).count, 0);
+    }
+
+    #[test]
+    fn a_poll_closes_at_expiry_or_when_finalized() {
+        let mut poll = poll();
+        let before = chrono::DateTime::parse_from_rfc3339("2026-11-09T11:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let after = chrono::DateTime::parse_from_rfc3339("2026-11-09T13:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        assert!(!poll.is_closed(before));
+        assert!(poll.is_closed(after));
+        poll.results.as_mut().unwrap().is_finalized = true;
+        assert!(poll.is_closed(before));
+    }
+
+    #[test]
+    fn the_create_payload_drops_blank_answers_and_trims() {
+        let payload = poll_create_payload(" lunch? ", &["pizza ".into(), "  ".into(), "sushi".into()], 24, true);
+        assert_eq!(payload["question"]["text"], "lunch?");
+        assert_eq!(payload["answers"], serde_json::json!([{ "poll_media": { "text": "pizza" } }, { "poll_media": { "text": "sushi" } }]));
+        assert_eq!((payload["duration"].as_u64(), payload["allow_multiselect"].as_bool()), (Some(24), Some(true)));
+    }
 }

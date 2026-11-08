@@ -6741,6 +6741,7 @@ dependencies = [
  "ashpd 0.13.13",
  "audiopus",
  "bytes",
+ "chrono",
  "cpal",
  "ffmpeg-next",
  "flate2",

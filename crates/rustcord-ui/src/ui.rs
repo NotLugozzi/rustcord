@@ -2496,6 +2496,268 @@ fn draw_attachment_tray(ui: &Ui, state: &mut AppState, textures: &mut TextureCac
     }
 }
 
+const POLL_MAX_WIDTH: f32 = 440.0;
+const POLL_PADDING: f32 = 12.0;
+const POLL_ROW_HEIGHT: f32 = 38.0;
+
+fn poll_time_left(expires_at: Option<chrono::DateTime<chrono::Utc>>, closed: bool, now: chrono::DateTime<chrono::Utc>) -> String {
+    let Some(expires_at) = expires_at.filter(|_| !closed) else { return "Poll closed".into() };
+    let minutes = (expires_at - now).num_minutes().max(0);
+    match (minutes / (60 * 24), minutes / 60 % 24, minutes % 60) {
+        (0, 0, 0) => "Less than a minute left".into(),
+        (0, 0, m) => format!("{m}m left"),
+        (0, h, _) => format!("{h}h left"),
+        (d, 0, _) => format!("{d}d left"),
+        (d, h, _) => format!("{d}d {h}h left"),
+    }
+}
+
+fn poll_percent(count: u32, total: u32) -> u32 {
+    if total == 0 { 0 } else { ((count as f64 / total as f64) * 100.0).round() as u32 }
+}
+
+fn draw_poll_emoji(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, emoji: &rustcord_client::models::ReactionEmoji, at: [f32; 2], size: f32) -> bool {
+    let texture = match (&emoji.id, &emoji.name) {
+        (Some(id), _) => {
+            let url = format!("https://cdn.discordapp.com/emojis/{id}.{}?size=32", if emoji.animated { "gif" } else { "png" });
+            let texture = textures.get(&url).map(|(t, _)| t);
+            if texture.is_none() {
+                textures.request(&url, cmd_tx);
+            }
+            texture
+        }
+        (None, Some(name)) => match name.chars().next().map(|ch| emoji_texture(textures, ch)) {
+            Some(EmojiTexture::Ready(texture)) => Some(texture),
+            _ => None,
+        },
+        (None, None) => return false,
+    };
+    if let Some(texture) = texture {
+        ui.get_window_draw_list().add_image(texture, at, [at[0] + size, at[1] + size]).build();
+    }
+    true
+}
+
+fn draw_poll_creator(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some(draft) = state.poll_draft.as_mut() else { return };
+    let mut open = true;
+    let mut post = false;
+    let display = ui.io().display_size;
+    ui.window("Create a poll")
+        .opened(&mut open)
+        .size([420.0, 0.0], imgui::Condition::Always)
+        .position([display[0] / 2.0, display[1] / 2.0], imgui::Condition::Appearing)
+        .position_pivot([0.5, 0.5])
+        .collapsible(false)
+        .resizable(false)
+        .build(|| {
+            ui.text_colored(state.theme.text_muted, "Question");
+            ui.set_next_item_width(-1.0);
+            if ui.is_window_appearing() {
+                ui.set_keyboard_focus_here();
+            }
+            ui.input_text("##poll_question", &mut draft.question).hint("What would you like to ask?").build();
+            ui.spacing();
+            ui.text_colored(state.theme.text_muted, "Answers");
+            let mut removed = None;
+            let can_remove = draft.answers.len() > 1;
+            for (index, answer) in draft.answers.iter_mut().enumerate() {
+                ui.set_next_item_width(if can_remove { -36.0 } else { -1.0 });
+                ui.input_text(format!("##poll_answer_{index}"), answer).hint("Type your answer").build();
+                if can_remove {
+                    ui.same_line();
+                    if ui.button(format!("x##poll_remove_{index}")) {
+                        removed = Some(index);
+                    }
+                }
+            }
+            if let Some(index) = removed {
+                draft.answers.remove(index);
+            }
+            if draft.answers.len() < crate::app_state::MAX_POLL_ANSWERS && ui.button("+ Add another answer") {
+                draft.answers.push(String::new());
+            }
+            ui.spacing();
+            ui.text_colored(state.theme.text_muted, "Duration");
+            ui.set_next_item_width(160.0);
+            let durations = rustcord_client::models::POLL_DURATIONS_HOURS;
+            if let Some(_combo) = ui.begin_combo("##poll_duration", durations[draft.duration_index].1) {
+                for (index, (_, label)) in durations.iter().enumerate() {
+                    if ui.selectable_config(*label).selected(index == draft.duration_index).build() {
+                        draft.duration_index = index;
+                    }
+                }
+            }
+            ui.same_line();
+            ui.checkbox("Allow multiple answers", &mut draft.multiselect);
+            ui.spacing();
+            let disabled = ui.begin_disabled(!draft.can_post());
+            if ui.button("Post") {
+                post = true;
+            }
+            drop(disabled);
+        });
+    if post {
+        let draft = state.poll_draft.take().expect("draft present");
+        let hours = rustcord_client::models::POLL_DURATIONS_HOURS[draft.duration_index].0;
+        let poll = rustcord_client::models::poll_create_payload(&draft.question, &draft.answers, hours, draft.multiselect);
+        let _ = cmd_tx.send(UiCommand::SendPoll { channel_id: draft.channel_id, poll });
+        state.focus_compose = true;
+    } else if !open {
+        state.poll_draft = None;
+    }
+}
+
+fn draw_poll(ui: &Ui, fonts: &Fonts, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, msg: &rustcord_client::models::Message) {
+    let Some(poll) = msg.poll.as_ref() else { return };
+    let now = chrono::Utc::now();
+    let closed = poll.is_closed(now);
+    let my_votes = poll.my_votes();
+    let mut view = state.poll_views.get(&msg.id).cloned().unwrap_or_default();
+    let results = closed || !my_votes.is_empty() || view.show_results;
+    let total = poll.total_votes();
+    let is_author = state.current_user.as_ref().is_some_and(|u| u.id == msg.author.id);
+    let theme = state.theme.clone();
+    let width = ui.content_region_avail()[0].min(POLL_MAX_WIDTH).max(200.0);
+    let inner = width - POLL_PADDING * 2.0;
+    let start = ui.cursor_screen_pos();
+    let cached_height = state.poll_card_heights.get(&msg.id).copied().unwrap_or(0.0);
+    ui.get_window_draw_list()
+        .add_rect(start, [start[0] + width, start[1] + cached_height], theme.panel)
+        .filled(true)
+        .rounding(10.0)
+        .build();
+    let local = ui.cursor_pos();
+    ui.set_cursor_pos([local[0] + POLL_PADDING, local[1] + POLL_PADDING]);
+    let mut vote: Option<Vec<u32>> = None;
+    let mut end = false;
+    ui.group(|| {
+        let wrap = ui.push_text_wrap_pos_with_pos(local[0] + width - POLL_PADDING);
+        let font = ui.push_font(fonts.bold);
+        ui.text_wrapped(poll.question.text.as_deref().unwrap_or("Poll"));
+        font.pop();
+        let hint = match (closed, poll.allow_multiselect) {
+            (true, _) => "Final results",
+            (false, true) => "Select one or more answers",
+            (false, false) => "Select one answer",
+        };
+        ui.text_colored(theme.text_muted, hint);
+        wrap.end();
+        ui.dummy([0.0, 2.0]);
+        for answer in &poll.answers {
+            let count = poll.count(answer.answer_id);
+            let selected = view.selected.contains(&answer.answer_id);
+            let clicked = ui.invisible_button(format!("##poll_{}_{}", msg.id, answer.answer_id), [inner, POLL_ROW_HEIGHT]);
+            let hovered = ui.is_item_hovered();
+            let (p_min, p_max) = (ui.item_rect_min(), ui.item_rect_max());
+            if clicked && !results && !closed {
+                view.toggle(answer.answer_id, poll.allow_multiselect);
+            }
+            let highlight = if results { count.me_voted } else { selected };
+            {
+                let dl = ui.get_window_draw_list();
+                let base = if hovered && !results { theme.accent_hover } else { theme.background };
+                dl.add_rect(p_min, p_max, [base[0], base[1], base[2], if hovered && !results { 0.35 } else { 1.0 }]).filled(true).rounding(8.0).build();
+                if results && total > 0 {
+                    let fraction = count.count as f32 / total as f32;
+                    let alpha = if count.me_voted { 0.55 } else { 0.25 };
+                    let fill = [theme.accent[0], theme.accent[1], theme.accent[2], alpha];
+                    dl.add_rect(p_min, [p_min[0] + inner * fraction, p_max[1]], fill).filled(true).rounding(8.0).build();
+                }
+                if highlight {
+                    dl.add_rect(p_min, p_max, theme.accent).rounding(8.0).thickness(2.0).build();
+                }
+            }
+            let mut text_x = p_min[0] + 12.0;
+            if let Some(emoji) = &answer.poll_media.emoji {
+                let size = 20.0;
+                if draw_poll_emoji(ui, textures, cmd_tx, emoji, [text_x, p_min[1] + (POLL_ROW_HEIGHT - size) / 2.0], size) {
+                    text_x += size + 8.0;
+                }
+            }
+            let text_y = p_min[1] + (POLL_ROW_HEIGHT - ui.text_line_height()) / 2.0;
+            let right = if results {
+                format!("{} {} \u{b7} {}%", count.count, if count.count == 1 { "vote" } else { "votes" }, poll_percent(count.count, total))
+            } else {
+                String::new()
+            };
+            let right_width = ui.calc_text_size(&right)[0];
+            let label = answer.poll_media.text.clone().unwrap_or_default();
+            let label = truncate_to_width(ui, &label, (p_max[0] - 12.0 - right_width - 12.0 - text_x).max(20.0)).unwrap_or(label);
+            let dl = ui.get_window_draw_list();
+            dl.add_text([text_x, text_y], theme.text, &label);
+            if results {
+                dl.add_text([p_max[0] - 12.0 - right_width, text_y], if count.me_voted { theme.text } else { theme.text_muted }, &right);
+            } else {
+                let center = [p_max[0] - 22.0, p_min[1] + POLL_ROW_HEIGHT / 2.0];
+                if poll.allow_multiselect {
+                    let (a, b) = ([center[0] - 8.0, center[1] - 8.0], [center[0] + 8.0, center[1] + 8.0]);
+                    if selected {
+                        dl.add_rect(a, b, theme.accent).filled(true).rounding(3.0).build();
+                    } else {
+                        dl.add_rect(a, b, theme.text_muted).rounding(3.0).thickness(1.5).build();
+                    }
+                } else if selected {
+                    dl.add_circle(center, 8.0, theme.accent).filled(true).build();
+                    dl.add_circle(center, 3.5, theme.background).filled(true).build();
+                } else {
+                    dl.add_circle(center, 8.0, theme.text_muted).thickness(1.5).build();
+                }
+            }
+        }
+        ui.dummy([0.0, 2.0]);
+        let summary = format!(
+            "{total} {} \u{b7} {}",
+            if total == 1 { "vote" } else { "votes" },
+            poll_time_left(poll.expires_at(), closed, now)
+        );
+        ui.text_colored(theme.text_muted, summary);
+        if !closed {
+            if my_votes.is_empty() {
+                ui.same_line();
+                let toggle = if view.show_results { "Back to voting" } else { "Show results" };
+                if ui.small_button(format!("{toggle}##poll_results_{}", msg.id)) {
+                    view.show_results = !view.show_results;
+                }
+                if !view.show_results {
+                    ui.same_line();
+                    let disabled = ui.begin_disabled(view.selected.is_empty());
+                    if ui.small_button(format!("Vote##poll_vote_{}", msg.id)) {
+                        vote = Some(view.selected.clone());
+                    }
+                    drop(disabled);
+                }
+            } else {
+                ui.same_line();
+                if ui.small_button(format!("Remove vote##poll_unvote_{}", msg.id)) {
+                    vote = Some(Vec::new());
+                }
+            }
+            if is_author {
+                ui.same_line();
+                if ui.small_button(format!("End poll##poll_end_{}", msg.id)) {
+                    end = true;
+                }
+            }
+        }
+    });
+    let bottom = ui.item_rect_max()[1] + POLL_PADDING;
+    state.poll_card_heights.insert(msg.id.clone(), bottom - start[1]);
+    ui.set_cursor_screen_pos([start[0], bottom]);
+    ui.dummy([width, 0.0]);
+    if let Some(answer_ids) = vote {
+        let _ = cmd_tx.send(UiCommand::VotePoll { channel_id: msg.channel_id.clone(), message_id: msg.id.clone(), answer_ids });
+    }
+    if end {
+        let _ = cmd_tx.send(UiCommand::EndPoll { channel_id: msg.channel_id.clone(), message_id: msg.id.clone() });
+    }
+    if view.selected.is_empty() && !view.show_results {
+        state.poll_views.remove(&msg.id);
+    } else {
+        state.poll_views.insert(msg.id.clone(), view);
+    }
+}
+
 const MOSAIC_MAX_WIDTH: f32 = 520.0;
 const MOSAIC_GAP: f32 = 4.0;
 
@@ -3182,6 +3444,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
                                     draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
+                                if msg.poll.is_some() {
+                                    draw_poll(ui, fonts, state, textures, cmd_tx, msg);
+                                }
                                 draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
                                 draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
                                 for code in &row.invites {
@@ -3204,6 +3469,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 }
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
                                     draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
+                                }
+                                if msg.poll.is_some() {
+                                    draw_poll(ui, fonts, state, textures, cmd_tx, msg);
                                 }
                                 draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
                                 draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
@@ -3408,22 +3676,32 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
             let composer_icon = ui.frame_height();
             let attach_tint = state.selected_channel.as_ref().is_some_and(|c| state.pending_attachments.contains_key(c)).then_some(state.theme.accent);
-            if icon_button_sized(ui, textures, "compose_attach", crate::icons::Icon::CirclePlus, "Attach files", attach_tint, composer_icon) {
-                if let (Some(channel_id), Some(paths)) = (
-                    state.selected_channel.clone(),
-                    rfd::FileDialog::new()
-                        .add_filter("All files", &["*"])
-                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
-                        .pick_files(),
-                ) {
-                    for path in paths {
-                        if !state.queue_attachment_path(&channel_id, path) {
-                            break;
-                        }
-                    }
-                    state.focus_compose = true;
-                }
+            if icon_button_sized(ui, textures, "compose_attach", crate::icons::Icon::CirclePlus, "Upload files or create a poll", attach_tint, composer_icon) {
+                ui.open_popup("compose_plus_menu");
             }
+            ui.popup("compose_plus_menu", || {
+                if ui.selectable("Upload files") {
+                    if let (Some(channel_id), Some(paths)) = (
+                        state.selected_channel.clone(),
+                        rfd::FileDialog::new()
+                            .add_filter("All files", &["*"])
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                            .pick_files(),
+                    ) {
+                        for path in paths {
+                            if !state.queue_attachment_path(&channel_id, path) {
+                                break;
+                            }
+                        }
+                        state.focus_compose = true;
+                    }
+                }
+                if ui.selectable("Create poll") {
+                    if let Some(channel_id) = state.selected_channel.clone() {
+                        state.poll_draft = Some(crate::app_state::PollDraft::new(channel_id));
+                    }
+                }
+            });
             let plus_width = composer_icon;
             let right_pickers = [
                 ("compose_gif", crate::icons::Icon::Gif, "GIFs"),
@@ -3589,6 +3867,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_quick_switcher(ui, state, cmd_tx, textures, display_w, display_h);
     draw_channel_editor(ui, state, cmd_tx, display_w, display_h);
     draw_invite_manager(ui, state, cmd_tx, display_w, display_h);
+    draw_poll_creator(ui, state, cmd_tx);
 }
 
 fn format_bitrate(bps: u32) -> String {
@@ -7985,5 +8264,34 @@ mod mosaic_tests {
         for count in 0..=10 {
             assert_eq!(mosaic_rows(count).iter().sum::<usize>(), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_ui_tests {
+    use super::{poll_percent, poll_time_left};
+
+    fn at(text: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(text).unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn time_left_reads_like_discord() {
+        let now = at("2026-11-08T12:00:00Z");
+        let left = |end: &str| poll_time_left(Some(at(end)), false, now);
+        assert_eq!(left("2026-11-08T12:00:30Z"), "Less than a minute left");
+        assert_eq!(left("2026-11-08T12:45:00Z"), "45m left");
+        assert_eq!(left("2026-11-08T17:10:00Z"), "5h left");
+        assert_eq!(left("2026-11-10T12:00:00Z"), "2d left");
+        assert_eq!(left("2026-11-10T15:00:00Z"), "2d 3h left");
+        assert_eq!(poll_time_left(Some(at("2026-11-10T15:00:00Z")), true, now), "Poll closed");
+        assert_eq!(poll_time_left(None, false, now), "Poll closed");
+    }
+
+    #[test]
+    fn percentages_round_and_survive_zero_votes() {
+        assert_eq!(poll_percent(1, 3), 33);
+        assert_eq!(poll_percent(2, 3), 67);
+        assert_eq!(poll_percent(0, 0), 0);
     }
 }

@@ -174,6 +174,33 @@ pub fn system_row(msg: &Message, me: &str, peer: Option<&str>) -> SystemRow {
             }
         }
         7 => row(Icon::UserPlus, vec![bold(author), plain(" joined the server.")]),
+        46 => {
+            let field = |name: &str| {
+                msg.embeds
+                    .iter()
+                    .filter(|e| e.kind.as_deref() == Some("poll_result"))
+                    .flat_map(|e| &e.fields)
+                    .find(|f| f.name == name)
+                    .map(|f| f.value.clone())
+            };
+            let question = field("poll_question_text").unwrap_or_else(|| "a poll".into());
+            let mut parts = vec![bold(author), plain("'s poll "), bold(question), plain(" has closed.")];
+            match (field("victor_answer_text"), field("victor_answer_votes").and_then(|v| v.parse::<u32>().ok())) {
+                (Some(winner), Some(votes)) if votes > 0 => {
+                    parts.push(plain(" Winner: "));
+                    parts.push(bold(winner));
+                    parts.push((format!(" ({votes} {})", if votes == 1 { "vote" } else { "votes" }), false));
+                }
+                _ => parts.push(plain(" No one voted.")),
+            }
+            let action = msg.message_reference.as_ref().and_then(|r| {
+                Some(SystemAction::JumpTo {
+                    channel_id: r.channel_id.clone().unwrap_or_else(|| msg.channel_id.clone()),
+                    message_id: r.message_id.clone()?,
+                })
+            });
+            SystemRow { icon: Icon::Info, tone: Tone::Muted, parts, action, tooltip: None }
+        }
         67 => {
             let parts = if msg.author.id == me {
                 match target.map(display_name).or_else(|| peer.map(str::to_string)) {
@@ -404,6 +431,24 @@ mod tests {
         let mut renamed = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 4);
         renamed.content = "new name".into();
         assert_eq!(system_row_test(&renamed, "me").plain_text(), "a changed the channel name: new name.");
+    }
+
+    #[test]
+    fn poll_results_name_the_question_and_winner() {
+        let mut closed = with_kind(msg("1", "a", "2026-11-06T10:00:00+00:00"), 46);
+        closed.embeds = serde_json::from_value(serde_json::json!([{
+            "type": "poll_result",
+            "fields": [
+                { "name": "poll_question_text", "value": "lunch?" },
+                { "name": "victor_answer_text", "value": "pizza" },
+                { "name": "victor_answer_votes", "value": "3" },
+                { "name": "total_votes", "value": "5" }
+            ]
+        }]))
+        .unwrap();
+        assert_eq!(system_row_test(&closed, "me").plain_text(), "a's poll lunch? has closed. Winner: pizza (3 votes)");
+        closed.embeds[0].fields.retain(|f| f.name == "poll_question_text");
+        assert_eq!(system_row_test(&closed, "me").plain_text(), "a's poll lunch? has closed. No one voted.");
     }
 
     #[test]

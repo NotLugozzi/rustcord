@@ -21,7 +21,8 @@ pub enum GatewayEvent {
     MessageCreate(Message),
     TypingStart { channel_id: String, user_id: String },
     PresenceUpdate(Presence),
-    MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String>, call: Option<crate::models::CallInfo> },
+    MessageUpdate { channel_id: String, id: String, content: Option<String>, edited_timestamp: Option<String>, call: Option<crate::models::CallInfo>, poll: Option<crate::models::Poll> },
+    PollVote { channel_id: String, message_id: String, user_id: String, answer_id: u32, added: bool },
     MessageDelete { channel_id: String, id: String },
     ReactionAdd { channel_id: String, message_id: String, user_id: String, emoji: ReactionEmoji },
     ReactionRemove { channel_id: String, message_id: String, user_id: String, emoji: ReactionEmoji },
@@ -389,10 +390,13 @@ impl Gateway {
                     content: text("content"),
                     edited_timestamp: text("edited_timestamp"),
                     call: serde_json::from_value(data["call"].clone()).ok(),
+                    poll: serde_json::from_value(data["poll"].clone()).ok(),
                 }
             }
             Some(
                 name @ ("MESSAGE_DELETE_BULK"
+                | "MESSAGE_POLL_VOTE_ADD"
+                | "MESSAGE_POLL_VOTE_REMOVE"
                 | "GUILD_MEMBER_ADD"
                 | "GUILD_MEMBER_UPDATE"
                 | "GUILD_MEMBER_REMOVE"
@@ -541,6 +545,13 @@ fn parse_entity_dispatch(name: &str, data: &Value) -> Option<GatewayEvent> {
     let text = |key: &str| data[key].as_str().map(str::to_string);
     let guild_id = || text("guild_id");
     match name {
+        "MESSAGE_POLL_VOTE_ADD" | "MESSAGE_POLL_VOTE_REMOVE" => Some(GatewayEvent::PollVote {
+            channel_id: text("channel_id")?,
+            message_id: text("message_id")?,
+            user_id: text("user_id")?,
+            answer_id: u32::try_from(data["answer_id"].as_u64()?).ok()?,
+            added: name == "MESSAGE_POLL_VOTE_ADD",
+        }),
         "MESSAGE_DELETE_BULK" => {
             let ids = data["ids"].as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
             Some(GatewayEvent::MessageDeleteBulk { channel_id: text("channel_id")?, ids })
@@ -701,6 +712,17 @@ mod tests {
 
     fn user_json(id: &str) -> Value {
         json!({ "id": id, "username": "ada", "discriminator": "0", "avatar": null })
+    }
+
+    #[test]
+    fn poll_votes_parse_both_directions() {
+        let data = json!({ "channel_id": "c", "message_id": "m", "user_id": "u", "answer_id": 2, "guild_id": "g" });
+        assert!(matches!(
+            parse_entity_dispatch("MESSAGE_POLL_VOTE_ADD", &data),
+            Some(GatewayEvent::PollVote { answer_id: 2, added: true, .. })
+        ));
+        assert!(matches!(parse_entity_dispatch("MESSAGE_POLL_VOTE_REMOVE", &data), Some(GatewayEvent::PollVote { added: false, .. })));
+        assert!(parse_entity_dispatch("MESSAGE_POLL_VOTE_ADD", &json!({ "channel_id": "c" })).is_none());
     }
 
     #[test]
