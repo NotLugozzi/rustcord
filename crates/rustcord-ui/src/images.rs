@@ -368,6 +368,21 @@ impl TextureCache {
     }
 
     #[cfg(feature = "video")]
+    pub fn start_looping_video(&mut self, url: &str, size: [f32; 2], cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        self.start_video(url, size, cmd_tx);
+        if let Some(Entry::Loaded { kind: Kind::Video(video), .. }) = self.entries.get_mut(url) {
+            video.muted = true;
+        }
+    }
+
+    #[cfg(feature = "video")]
+    pub fn loop_video_if_ended(&mut self, url: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        if self.video_status(url).is_some_and(|status| status.ended) {
+            self.request_video_seek(url, 0.0, cmd_tx);
+        }
+    }
+
+    #[cfg(feature = "video")]
     pub fn start_video(&mut self, url: &str, size: [f32; 2], cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
         if self.entries.contains_key(url) {
             return;
@@ -567,7 +582,7 @@ impl TextureCache {
             if meta.has_audio && video.audio.is_none() {
                 video.audio = crate::video_audio::VideoAudio::start();
                 if let Some(audio) = &video.audio {
-                    audio.set_volume(video.volume);
+                    audio.set_volume(if video.muted { 0.0 } else { video.volume });
                 }
             }
         }

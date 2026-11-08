@@ -60,6 +60,7 @@ fn main() {
         window_focused: true,
         groups: app_state::load_groups(),
         notes: app_state::load_notes(),
+        frequently_used: app_state::FrequentlyUsed::load(),
         mic_gain: saved_settings.mic_gain.unwrap_or(1.0),
         denoise: saved_settings.denoise,
         share_system_audio: true,
@@ -68,6 +69,7 @@ fn main() {
         user_volumes: saved_settings.user_volumes,
         selected_input_device: saved_settings.input_device,
         selected_output_device: saved_settings.output_device,
+        camera_device: saved_settings.camera_device,
         keybinds: keybinds::Keybinds::from_map(&saved_settings.keybinds),
         rail_folders,
         rail_order,
@@ -97,17 +99,19 @@ fn main() {
 }
 
 fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
-    let Some(me) = &state.current_user else { return };
-    if !state.notifications_enabled || message.author.id == me.id {
+    if !state.notifications_enabled || !state.should_notify(message, chrono::Utc::now()) {
         return;
     }
-    let relevant = message.guild_id.is_none() || message.mentions.iter().any(|u| u.id == me.id);
     let watching = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
-    if !relevant || watching {
+    if watching {
         return;
     }
     let title = message.author.global_name.clone().unwrap_or_else(|| message.author.username.clone());
-    let body = if message.content.is_empty() { "[attachment]".to_string() } else { message.content.chars().take(160).collect() };
+    let body = match (message.content.is_empty(), message.sticker_items.first()) {
+        (false, _) => message.content.chars().take(160).collect(),
+        (true, Some(sticker)) => format!("[sticker: {}]", sticker.name),
+        (true, None) => "[attachment]".to_string(),
+    };
     let avatar_url = rustcord_client::cdn::avatar_url(&message.author, 64)
         .unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(&message.author));
     let _ = cmd_tx.send(UiCommand::ShowNotification { title, body, avatar_url });
@@ -226,6 +230,42 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::GuildDelete { guild_id }) => {
                 state.remove_guild(&guild_id);
             }
+            BackendEvent::Gateway(GatewayEvent::MessageDeleteBulk { channel_id, ids }) => {
+                state.delete_messages(&channel_id, &ids);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildMemberUpsert { guild_id, member }) => {
+                state.upsert_guild_member(&guild_id, member);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildMemberRemove { guild_id, user_id }) => {
+                state.remove_guild_member(&guild_id, &user_id);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildRoleUpsert { guild_id, role }) => {
+                state.upsert_role(&guild_id, role);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildRoleDelete { guild_id, role_id }) => {
+                state.remove_role(&guild_id, &role_id);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildEmojisUpdate { guild_id, emojis }) => {
+                state.guild_emojis.insert(guild_id, emojis);
+            }
+            BackendEvent::Gateway(GatewayEvent::InitialGuildStickers(guilds)) => {
+                state.guild_stickers.extend(guilds);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildStickersUpdate { guild_id, stickers }) => {
+                state.guild_stickers.insert(guild_id, stickers);
+            }
+            BackendEvent::Gateway(GatewayEvent::GuildSettings(settings)) => {
+                state.apply_guild_settings(settings);
+            }
+            BackendEvent::GuildSettingsUpdated(settings) => {
+                state.apply_guild_settings(vec![settings]);
+            }
+            BackendEvent::Gateway(GatewayEvent::RelationshipAdd(relationship)) => {
+                state.upsert_relationship(relationship);
+            }
+            BackendEvent::Gateway(GatewayEvent::RelationshipRemove { user_id }) => {
+                state.remove_relationship(&user_id);
+            }
             BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
                 state.note_typing(channel_id, user_id);
             }
@@ -331,10 +371,12 @@ pub fn drain_backend_events(
             BackendEvent::VoiceConnected => {
                 state.voice_connecting = false;
                 state.screen_sharing = false;
+                state.camera_on = false;
             }
             BackendEvent::VoiceDisconnected => {
                 state.voice_connecting = false;
                 state.screen_sharing = false;
+                state.camera_on = false;
                 state.connected_voice_channel = None;
                 state.pending_voice_channel = None;
                 state.voice_speaking_users.clear();
@@ -344,6 +386,16 @@ pub fn drain_backend_events(
                 state.screen_share_history.clear();
                 state.show_voice_info = false;
                 state.voice_joined_at = None;
+            }
+            BackendEvent::CameraStopped { error } => {
+                state.camera_on = false;
+                if let Some(error) = error {
+                    state.status_message = Some(format!("Camera stopped: {error}"));
+                }
+            }
+            BackendEvent::CamerasLoaded(cameras) => {
+                state.cameras = cameras;
+                state.cameras_loaded = true;
             }
             BackendEvent::ScreenShareStopped => {
                 state.screen_sharing = false;
@@ -402,6 +454,33 @@ pub fn drain_backend_events(
             BackendEvent::GuildJoined(guild) => {
                 state.add_joined_guild(guild);
             }
+            BackendEvent::MemberUpdated { guild_id, member } => {
+                state.upsert_guild_member(&guild_id, member);
+            }
+            BackendEvent::MemberRoleChanged { guild_id, user_id, role_id, add } => {
+                state.set_member_role(&guild_id, &user_id, &role_id, add);
+            }
+            BackendEvent::ChannelSaved(channel) => {
+                state.upsert_channel(channel);
+            }
+            BackendEvent::InviteCreated { code } => {
+                let link = format!("https://discord.gg/{code}");
+                state.status_message = Some(if crate::clipboard::write_text(&link) {
+                    format!("Invite link copied: {link}")
+                } else {
+                    format!("Invite created: {link}")
+                });
+            }
+            BackendEvent::GuildInvitesLoaded { guild_id, result } => {
+                if let Some(manager) = state.invite_manager.as_mut().filter(|m| m.guild_id == guild_id) {
+                    manager.invites = Some(result);
+                }
+            }
+            BackendEvent::InviteRevoked { code } => {
+                if let Some(Some(Ok(invites))) = state.invite_manager.as_mut().map(|m| m.invites.as_mut()) {
+                    invites.retain(|i| i.code != code);
+                }
+            }
             BackendEvent::MemberRemoved { guild_id, user_id } => {
                 if let Some(members) = state.guild_members.get_mut(&guild_id) {
                     members.retain(|m| m.user.id != user_id);
@@ -424,6 +503,15 @@ pub fn drain_backend_events(
             }
             BackendEvent::GuildEmojisLoaded { guild_id, emojis } => {
                 state.guild_emojis.insert(guild_id, emojis);
+            }
+            BackendEvent::GuildStickersLoaded { guild_id, stickers } => {
+                state.guild_stickers.insert(guild_id, stickers);
+            }
+            BackendEvent::StickerPacksLoaded(packs) => {
+                state.sticker_packs = packs;
+            }
+            BackendEvent::GifsLoaded { query, result } => {
+                state.gif_picker.apply(query, result);
             }
             BackendEvent::DmChannelsLoaded(channels) => {
                 state.dm_channels = channels;

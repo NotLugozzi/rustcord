@@ -13,47 +13,25 @@ Use at your own risk.
 
 ## Status
 
-- [x] Login (email + password + 2FA)
-- [x] hCaptcha challenge handling (embedded webview)
-- [x] Gateway connection, READY/MESSAGE_CREATE handling
-- [x] Server list, channel list (grouped by category), DM list, chat view
-- [x] Friends list, DM/friend search
-- [x] Sending messages, chronologically ordered with timestamps, scrollback (load older history)
-- [x] Image/GIF attachments: receive (static + animated, up to 3 concurrent animations) and send
-- [x] DM list sorted by most recent activity
-- [x] TOML-based theming (switchable live from Settings)
-- [x] Persisted login (OS keychain)
-- [x] Markdown: bold, italic, strikethrough, underline, spoilers, blockquotes (nested), headers, inline/block code, links, lists, tables
-- [x] Mentions: users, channels, roles, `@everyone`/`@here`, and `<t:>` timestamps
-- [x] Typing indicators (send + receive)
-- [x] Real avatars (users) and guild icons
-- [x] User bar with settings dialog (account info, logout, theme switcher)
-- [x] About panel (version, tag, commit hash)
-- [x] Server Calls
-- [x] Message editing/deleting
-- [x] Custom emote rendering/sending
-- [x] Subtext (`-# tiny text`)
-- [x] Guild folders
-- [x] Embed Rendering
-- [x] Voice calls (DMs: ring/answer/decline, call messages, participant panel)
-- [x] Non-image attachments/embeds rendering
-- [x] Per-user volume/mute in server calls
-- [x] Better statistics for voice chat (dropped frames, latency graph, encryption epoch)
-- [x] Trackpad scroll acceleration
-- [x] Per-channel permission filtering
-- [x] UI Gliphs for buttons and states
-- [x] App Keybinds
-- [x] Server users panel (low priority)
-- [x] VC Leave/Join sound
-- [x] Inline video attachment playback (optional `video` feature, needs ffmpeg)
-- [x] Reactions
-- [x] Quick switcher (Ctrl-K, with avatars)
-- [x] Message search (per-server and per-DM, author picker and attachment filters, jump to message)
-- [x] Per-channel unread indicators and mention badges
-- [ ] Sync guild folders with discord (or find a way to export server ordering and folders)
-- [x] Message read status sync
-- [ ] Video Calls, screen sharing
-- [ ] server admin actions (low priority)
+rustcord is close to feature parity with the official client for everyday
+use. That covers servers, DMs and group DMs, voice calls, screen sharing
+(Linux), message markdown and embeds, reactions, GIFs, stickers and
+emoji, search, unread and mention tracking, notification and mute
+settings, and most server admin actions. Video playback and screen sharing
+are behind the optional `video` and `screenshare` cargo features (both
+need ffmpeg).
+
+What's still missing:
+
+- Camera video in calls (sending and receiving webcams)
+- Screen sharing on Windows and macOS
+- Threads, and forum channels, which are built on threads
+- Slash commands and bot interactions (buttons, select menus)
+- Polls
+- Voice message sending and message forwarding
+- Push-to-talk and global hotkeys
+- Stage channels behave like ordinary voice channels
+- Server folders are local only and don't sync with your Discord account
 
 ## Credits
 

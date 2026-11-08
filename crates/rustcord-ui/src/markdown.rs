@@ -17,6 +17,7 @@ pub enum Block {
     Subtext(Vec<Span>),
     ListItem { depth: u8, marker: ListMarker, spans: Vec<Span> },
     Table(Table),
+    Blank,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,12 +131,18 @@ pub fn parse(input: &str) -> Vec<Block> {
         }
 
         if line.trim().is_empty() {
+            if !blocks.is_empty() {
+                blocks.push(Block::Blank);
+            }
             continue;
         }
 
         blocks.push(Block::Paragraph(parse_spans(line)));
     }
 
+    while matches!(blocks.last(), Some(Block::Blank)) {
+        blocks.pop();
+    }
     blocks
 }
 
@@ -909,6 +916,12 @@ normal again");
 
     fn blocks(input: &str) -> Vec<Block> {
         parse(input)
+    }
+
+    #[test]
+    fn blank_lines_between_paragraphs_are_kept_but_not_at_the_edges() {
+        let out = blocks("\n\nfirst\n\n\nsecond\n\n");
+        assert!(matches!(out.as_slice(), [Block::Paragraph(_), Block::Blank, Block::Blank, Block::Paragraph(_)]), "{out:?}");
     }
 
     fn plain(spans: &[Span]) -> String {

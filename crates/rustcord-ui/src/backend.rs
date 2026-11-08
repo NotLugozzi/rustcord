@@ -106,6 +106,17 @@ pub enum UiCommand {
     SelectChannel { channel_id: String },
     LoadOlderMessages { channel_id: String, before: String },
     SendMessage { channel_id: String, content: String, reply_to: Option<String> },
+    SendSticker { channel_id: String, sticker_id: String, reply_to: Option<String> },
+    LoadGuildStickers { guild_ids: Vec<String> },
+    LoadStickerPacks,
+    TimeoutMember { guild_id: String, user_id: String, duration_secs: Option<i64> },
+    SetMemberRole { guild_id: String, user_id: String, role_id: String, add: bool },
+    SaveChannel { guild_id: String, channel_id: Option<String>, name: String, topic: Option<String>, voice: bool, parent_id: Option<String> },
+    CreateInvite { channel_id: String },
+    LoadGuildInvites { guild_id: String },
+    RevokeInvite { code: String },
+    UpdateGuildSettings { guild_key: String, patch: serde_json::Value },
+    SearchGifs { query: String },
     SendAttachment {
         channel_id: String,
         content: String,
@@ -165,6 +176,9 @@ pub enum UiCommand {
     SetScreenSharing { enabled: bool, include_system_audio: bool, audio_source_pid: Option<u32>, max_height: u32, framerate: u32, guild_id: Option<String>, channel_id: String },
     #[cfg(feature = "screenshare")]
     LoadScreenAudioSources,
+    SetCamera { enabled: bool, guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
+    SetCameraDevice { device: Option<String> },
+    LoadCameras,
     WatchStream { stream_key: String },
     StopWatchingStream { stream_key: String },
     SetVoiceInputDevice { device: Option<String> },
@@ -204,6 +218,16 @@ pub enum BackendEvent {
     GuildRolesLoaded { guild_id: String, roles: Vec<rustcord_client::models::Role> },
     MyGuildMemberLoaded { guild_id: String, roles: Vec<String> },
     GuildEmojisLoaded { guild_id: String, emojis: Vec<rustcord_client::models::Emoji> },
+    GuildStickersLoaded { guild_id: String, stickers: Vec<rustcord_client::models::Sticker> },
+    StickerPacksLoaded(Vec<rustcord_client::models::StickerPack>),
+    MemberUpdated { guild_id: String, member: rustcord_client::models::GuildMember },
+    MemberRoleChanged { guild_id: String, user_id: String, role_id: String, add: bool },
+    ChannelSaved(rustcord_client::models::Channel),
+    InviteCreated { code: String },
+    GuildInvitesLoaded { guild_id: String, result: Result<Vec<rustcord_client::models::Invite>, String> },
+    InviteRevoked { code: String },
+    GuildSettingsUpdated(rustcord_client::models::GuildSettings),
+    GifsLoaded { query: String, result: Result<Vec<rustcord_client::models::Gif>, String> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
     MessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
     OlderMessagesLoaded { channel_id: String, messages: Vec<rustcord_client::models::Message> },
@@ -228,6 +252,8 @@ pub enum BackendEvent {
     VoiceConnected,
     VoiceDisconnected,
     ScreenShareStopped,
+    CameraStopped { error: Option<String> },
+    CamerasLoaded(Vec<(String, String)>),
     #[cfg(feature = "screenshare")]
     ScreenAudioSourcesLoaded { sources: Vec<(u32, String, bool)>, error: Option<String> },
     VoiceSpeaking { user_id: String, speaking: bool },
@@ -375,6 +401,51 @@ pub fn spawn(
                             tracing::warn!("send failed: {e}");
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to send message: {e}")));
                         }
+                    }
+                }
+                UiCommand::SendSticker { channel_id, sticker_id, reply_to } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.send_sticker(&channel_id, &sticker_id, reply_to.as_deref()).await {
+                            tracing::warn!("sticker send failed: {e}");
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to send sticker: {e}")));
+                        }
+                    }
+                }
+                UiCommand::LoadGuildStickers { guild_ids } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            for guild_id in guild_ids {
+                                match client.guild_stickers(&guild_id).await {
+                                    Ok(stickers) => {
+                                        let _ = event_tx.send(BackendEvent::GuildStickersLoaded { guild_id, stickers });
+                                    }
+                                    Err(e) => tracing::warn!("failed to load stickers for guild {guild_id}: {e}"),
+                                }
+                            }
+                        });
+                    }
+                }
+                UiCommand::LoadStickerPacks => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match client.sticker_packs().await {
+                                Ok(packs) => {
+                                    let _ = event_tx.send(BackendEvent::StickerPacksLoaded(packs));
+                                }
+                                Err(e) => tracing::warn!("failed to load sticker packs: {e}"),
+                            }
+                        });
+                    }
+                }
+                UiCommand::SearchGifs { query } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.gifs(&query).await.map_err(|e| e.to_string());
+                            let _ = event_tx.send(BackendEvent::GifsLoaded { query, result });
+                        });
                     }
                 }
                 UiCommand::SendAttachment { channel_id, content, path, reply_to, upload_id, progress } => {
@@ -731,6 +802,95 @@ pub fn spawn(
                         }
                     }
                 }
+                UiCommand::TimeoutMember { guild_id, user_id, duration_secs } => {
+                    if let Some(client) = &rest {
+                        let until = duration_secs.map(|secs| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339());
+                        match client.timeout_member(&guild_id, &user_id, until.as_deref()).await {
+                            Ok(member) => {
+                                let _ = event_tx.send(BackendEvent::MemberUpdated { guild_id, member });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to update timeout: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::SetMemberRole { guild_id, user_id, role_id, add } => {
+                    if let Some(client) = &rest {
+                        match client.set_member_role(&guild_id, &user_id, &role_id, add).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::MemberRoleChanged { guild_id, user_id, role_id, add });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to change role: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::SaveChannel { guild_id, channel_id, name, topic, voice, parent_id } => {
+                    if let Some(client) = &rest {
+                        let result = match &channel_id {
+                            Some(channel_id) => client.edit_channel(channel_id, &name, topic.as_deref()).await,
+                            None => {
+                                let kind = if voice { rustcord_client::models::ChannelType::GuildVoice } else { rustcord_client::models::ChannelType::GuildText };
+                                client.create_channel(&guild_id, &name, kind, parent_id.as_deref()).await
+                            }
+                        };
+                        match result {
+                            Ok(channel) => {
+                                let _ = event_tx.send(BackendEvent::ChannelSaved(channel));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to save channel: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::CreateInvite { channel_id } => {
+                    if let Some(client) = &rest {
+                        match client.create_invite(&channel_id, 7 * 24 * 60 * 60, 0).await {
+                            Ok(invite) => {
+                                let _ = event_tx.send(BackendEvent::InviteCreated { code: invite.code });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to create invite: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::LoadGuildInvites { guild_id } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.guild_invites(&guild_id).await.map_err(|e| e.to_string());
+                            let _ = event_tx.send(BackendEvent::GuildInvitesLoaded { guild_id, result });
+                        });
+                    }
+                }
+                UiCommand::RevokeInvite { code } => {
+                    if let Some(client) = &rest {
+                        match client.delete_invite(&code).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::InviteRevoked { code });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to revoke invite: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::UpdateGuildSettings { guild_key, patch } => {
+                    if let Some(client) = &rest {
+                        match client.update_guild_settings(&guild_key, &patch).await {
+                            Ok(settings) => {
+                                let _ = event_tx.send(BackendEvent::GuildSettingsUpdated(settings));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to update notification settings: {e}")));
+                            }
+                        }
+                    }
+                }
                 UiCommand::LoadProfile { user_id } => {
                     if let Some(client) = &rest {
                         match client.profile(&user_id).await {
@@ -772,6 +932,7 @@ pub fn spawn(
                             Some(&channel_id),
                             saved.self_mute || saved.self_deaf,
                             saved.self_deaf,
+                            false,
                         );
                         let _ = tx.send(frame);
                     }
@@ -809,7 +970,7 @@ pub fn spawn(
                         state.screen_sharing.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                        let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), None, false, false);
+                        let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), None, false, false, false);
                         let _ = tx.send(frame);
                         if let Some(stream_key) = ACTIVE_STREAM_KEY.lock().unwrap().take() {
                             let _ = tx.send(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }).to_string());
@@ -819,9 +980,14 @@ pub fn spawn(
                     let _ = event_tx.send(BackendEvent::VoiceDisconnected);
                 }
                 UiCommand::SetVoiceMuteDeaf { guild_id, channel_id, self_mute, self_deaf } => {
+                    let self_video = VOICE_MEDIA_STATE
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|state| state.camera_enabled.load(std::sync::atomic::Ordering::Relaxed));
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                         let frame =
-                            rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), self_mute, self_deaf);
+                            rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), self_mute, self_deaf, self_video);
                         let _ = tx.send(frame);
                     }
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
@@ -866,6 +1032,36 @@ pub fn spawn(
                             let _ = tx.send(frame.to_string());
                         }
                     }
+                }
+                UiCommand::SetCamera { enabled, guild_id, channel_id, self_mute, self_deaf } => {
+                    let connected = match VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        Some(media_state) => {
+                            media_state.camera_enabled.store(enabled, std::sync::atomic::Ordering::Relaxed);
+                            true
+                        }
+                        None => false,
+                    };
+                    if !connected && enabled {
+                        let _ = event_tx.send(BackendEvent::CameraStopped { error: Some("join a call before turning on your camera".into()) });
+                    } else if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                        let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), Some(&channel_id), self_mute, self_deaf, enabled);
+                        let _ = tx.send(frame);
+                    }
+                }
+                UiCommand::SetCameraDevice { device } => {
+                    if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
+                        *media_state.camera_device.lock().unwrap() = device;
+                    }
+                }
+                UiCommand::LoadCameras => {
+                    let events = event_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        #[cfg(feature = "screenshare")]
+                        let cameras = rustcord_client::camera_capture::list_cameras().into_iter().map(|c| (c.id, c.name)).collect();
+                        #[cfg(not(feature = "screenshare"))]
+                        let cameras = Vec::new();
+                        let _ = events.send(BackendEvent::CamerasLoaded(cameras));
+                    });
                 }
                 UiCommand::WatchStream { stream_key } => {
                     *WATCH_STREAM_KEY.lock().unwrap() = Some(stream_key.clone());
@@ -1070,6 +1266,7 @@ fn try_spawn_voice_gateway(
         user_volumes: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.user_volumes)),
         muted: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved_settings.self_mute || saved_settings.self_deaf)),
         deafened: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(saved_settings.self_deaf)),
+        camera_device: std::sync::Arc::new(std::sync::Mutex::new(saved_settings.camera_device)),
         ..Default::default()
     };
     media_state.mic.set_gain(saved_settings.mic_gain.unwrap_or(1.0));
@@ -1096,10 +1293,13 @@ fn try_spawn_voice_gateway(
                 VoiceGatewayEvent::ScreenShareStopped => {
                     let _ = forward_tx.send(BackendEvent::ScreenShareStopped);
                 }
+                VoiceGatewayEvent::CameraStopped { error } => {
+                    let _ = forward_tx.send(BackendEvent::CameraStopped { error });
+                }
                 #[cfg(feature = "screenshare")]
                 VoiceGatewayEvent::VideoFrame { user_id, width, height, rgba } => {
                     if let Some(image) = image::RgbaImage::from_raw(width, height, rgba) {
-                        let _ = forward_tx.send(BackendEvent::RemoteVideoFrame { user_id, rgba: image });
+                        let _ = forward_tx.send(BackendEvent::RemoteVideoFrame { user_id: crate::app_state::camera_video_key(&user_id), rgba: image });
                     }
                 }
                 VoiceGatewayEvent::Speaking { user_id: Some(user_id), speaking, .. } => {
@@ -1371,10 +1571,6 @@ async fn start_session(
 #[cfg(feature = "video")]
 struct ParkedDecoder(crate::video::VideoDecoder, u64);
 
-// SAFETY: the decoder's ffmpeg contexts hold raw pointers that are not Send,
-// but they are only unsafe to use from two threads at once, not to move. Every
-// access removes the decoder from the map, decodes on one blocking thread, and
-// puts it back, so no two threads ever hold the same decoder.
 #[cfg(feature = "video")]
 unsafe impl Send for ParkedDecoder {}
 

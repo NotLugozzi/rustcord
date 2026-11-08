@@ -153,6 +153,198 @@ pub fn load_rail() -> (Vec<GuildFolder>, Vec<RailItem>) {
     (file.folders, file.order)
 }
 
+fn frequently_used_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join("frequently_used.toml"))
+}
+
+const FREQUENT_KEEP: usize = 200;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Usage {
+    pub count: u32,
+    pub last_used: i64,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct FrequentlyUsed {
+    #[serde(default)]
+    pub emojis: HashMap<String, Usage>,
+    #[serde(default)]
+    pub stickers: HashMap<String, Usage>,
+}
+
+impl FrequentlyUsed {
+    pub fn load() -> Self {
+        let text = frequently_used_path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        toml::from_str(&text).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = frequently_used_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = toml::to_string(self) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+
+    pub fn record(counts: &mut HashMap<String, Usage>, key: &str, now: i64) {
+        let usage = counts.entry(key.to_string()).or_default();
+        usage.count = usage.count.saturating_add(1);
+        usage.last_used = now;
+        if counts.len() > FREQUENT_KEEP {
+            let keep: std::collections::HashSet<String> = Self::ranked(counts).into_iter().take(FREQUENT_KEEP).map(str::to_string).collect();
+            counts.retain(|k, _| keep.contains(k));
+        }
+    }
+
+    pub fn ranked(counts: &HashMap<String, Usage>) -> Vec<&str> {
+        let mut entries: Vec<(&String, &Usage)> = counts.iter().collect();
+        entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(b.1.last_used.cmp(&a.1.last_used)).then(a.0.cmp(b.0)));
+        entries.into_iter().map(|(k, _)| k.as_str()).collect()
+    }
+}
+
+pub struct StickerSection<'a> {
+    pub key: String,
+    pub name: &'a str,
+    pub stickers: Vec<&'a rustcord_client::models::Sticker>,
+}
+
+pub fn camera_video_key(user_id: &str) -> String {
+    format!("camera:{user_id}")
+}
+
+pub const FREQUENT_SECTION: &str = "frequent";
+const FREQUENT_STICKERS_SHOWN: usize = 12;
+const FREQUENT_EMOJIS_SHOWN: usize = 24;
+
+pub enum FrequentEmoji<'a> {
+    Unicode(&'static emojis::Emoji),
+    Custom(&'a Emoji),
+}
+
+fn custom_emoji_id(glyph: &str) -> Option<&str> {
+    let inner = glyph.strip_prefix('<')?.strip_suffix('>')?;
+    inner.rsplit(':').next().filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub struct ChannelEditor {
+    pub guild_id: String,
+    pub channel_id: Option<String>,
+    pub name: String,
+    pub topic: String,
+    pub voice: bool,
+    pub parent_id: Option<String>,
+    pub focus: bool,
+}
+
+impl ChannelEditor {
+    pub fn create(guild_id: String, parent_id: Option<String>) -> Self {
+        Self { guild_id, channel_id: None, name: String::new(), topic: String::new(), voice: false, parent_id, focus: true }
+    }
+
+    pub fn edit(guild_id: String, channel: &Channel) -> Self {
+        Self {
+            guild_id,
+            channel_id: Some(channel.id.clone()),
+            name: channel.name.clone().unwrap_or_default(),
+            topic: channel.topic.clone().unwrap_or_default(),
+            voice: matches!(channel.kind, rustcord_client::models::ChannelType::GuildVoice | rustcord_client::models::ChannelType::GuildStageVoice),
+            parent_id: channel.parent_id.clone(),
+            focus: true,
+        }
+    }
+}
+
+pub struct InviteManager {
+    pub guild_id: String,
+    pub invites: Option<Result<Vec<rustcord_client::models::Invite>, String>>,
+}
+
+pub const MUTE_CHOICES: &[(&str, i64)] = &[
+    ("For 15 minutes", 15 * 60),
+    ("For 1 hour", 60 * 60),
+    ("For 3 hours", 3 * 60 * 60),
+    ("For 8 hours", 8 * 60 * 60),
+    ("For 24 hours", 24 * 60 * 60),
+    ("Until I turn it back on", -1),
+];
+
+pub fn mute_active(muted: bool, config: Option<&rustcord_client::models::MuteConfig>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if !muted {
+        return false;
+    }
+    match config.and_then(|c| c.end_time.as_deref()) {
+        Some(end) => chrono::DateTime::parse_from_rfc3339(end).map_or(true, |end| end.with_timezone(&chrono::Utc) > now),
+        None => true,
+    }
+}
+
+pub fn mute_patch(muted: bool, window_secs: i64, now: chrono::DateTime<chrono::Utc>) -> serde_json::Value {
+    let end_time = (muted && window_secs > 0).then(|| (now + chrono::Duration::seconds(window_secs)).to_rfc3339());
+    rustcord_client::models::mute_fields(muted, end_time, window_secs)
+}
+
+pub const TIMEOUT_CHOICES: &[(&str, i64)] = &[
+    ("60 seconds", 60),
+    ("5 minutes", 5 * 60),
+    ("10 minutes", 10 * 60),
+    ("1 hour", 60 * 60),
+    ("1 day", 24 * 60 * 60),
+    ("1 week", 7 * 24 * 60 * 60),
+];
+
+pub fn active_timeout(until: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let until = chrono::DateTime::parse_from_rfc3339(until?).ok()?.with_timezone(&chrono::Utc);
+    (until > now).then_some(until)
+}
+
+pub const GIF_SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(350);
+
+#[derive(Default)]
+pub struct GifPicker {
+    pub query: String,
+    pub edited_at: Option<std::time::Instant>,
+    pub requested: Option<String>,
+    pub shown_query: Option<String>,
+    pub results: Vec<rustcord_client::models::Gif>,
+    pub error: Option<String>,
+}
+
+impl GifPicker {
+    pub fn due_query(&self, now: std::time::Instant) -> Option<String> {
+        let query = self.query.trim();
+        if self.requested.as_deref() == Some(query) {
+            return None;
+        }
+        if self.edited_at.is_some_and(|edited| now.duration_since(edited) < GIF_SEARCH_DEBOUNCE) {
+            return None;
+        }
+        Some(query.to_string())
+    }
+
+    pub fn apply(&mut self, query: String, result: Result<Vec<rustcord_client::models::Gif>, String>) -> bool {
+        if self.requested.as_deref() != Some(query.as_str()) {
+            return false;
+        }
+        match result {
+            Ok(gifs) => {
+                self.results = gifs;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+        self.shown_query = Some(query);
+        true
+    }
+
+    pub fn loading(&self) -> bool {
+        self.requested.is_some() && self.requested != self.shown_query
+    }
+}
+
 pub struct SearchState {
     pub scope: crate::backend::SearchScope,
     pub query: String,
@@ -256,6 +448,14 @@ pub struct AppState {
     pub reply_target: Option<Message>,
     pub presences: HashMap<String, Presence>,
     pub guild_emojis: HashMap<String, Vec<Emoji>>,
+    pub guild_stickers: HashMap<String, Vec<rustcord_client::models::Sticker>>,
+    pub guild_stickers_requested: std::collections::HashSet<String>,
+    pub sticker_packs: Vec<rustcord_client::models::StickerPack>,
+    pub sticker_packs_requested: bool,
+    pub sticker_picker_filter: String,
+    pub sticker_picker_section: Option<String>,
+    pub frequently_used: FrequentlyUsed,
+    pub gif_picker: GifPicker,
     pub switcher_open: bool,
     pub switcher_focus_input: bool,
     pub switcher_query: String,
@@ -286,6 +486,10 @@ pub struct AppState {
     pub pending_voice_channel: Option<(Option<String>, String)>,
     pub voice_connecting: bool,
     pub screen_sharing: bool,
+    pub camera_on: bool,
+    pub camera_device: Option<String>,
+    pub cameras: Vec<(String, String)>,
+    pub cameras_loaded: bool,
     pub share_system_audio: bool,
     pub screen_audio_sources: Vec<(u32, String, bool)>,
     pub screen_audio_sources_loaded: bool,
@@ -315,6 +519,11 @@ pub struct AppState {
     pub join_invite_input: String,
     pub create_server_input: String,
     pub show_hidden_channels: bool,
+    pub channel_context: Option<String>,
+    pub channel_editor: Option<ChannelEditor>,
+    pub invite_manager: Option<InviteManager>,
+    pub guild_settings: HashMap<String, rustcord_client::models::GuildSettings>,
+    pub guild_context: Option<(String, Option<usize>)>,
     pub keybinds: crate::keybinds::Keybinds,
     pub rebinding_action: Option<crate::keybinds::Action>,
     pub mic_test_running: bool,
@@ -698,6 +907,7 @@ impl AppState {
         self.guild_roles.remove(guild_id);
         self.my_guild_roles.remove(guild_id);
         self.guild_emojis.remove(guild_id);
+        self.guild_stickers.remove(guild_id);
         self.guild_members.remove(guild_id);
         if self.selected_guild.as_deref() == Some(guild_id) {
             self.selected_guild = None;
@@ -863,11 +1073,96 @@ impl AppState {
     }
 
     pub fn guild_has_unread(&self, guild_id: &str) -> bool {
+        let now = chrono::Utc::now();
+        if self.is_guild_muted(guild_id, now) {
+            return false;
+        }
         let Some(channels) = self.guild_channels.get(guild_id) else { return false };
         channels
             .iter()
             .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement))
-            .any(|c| self.channel_is_unread(&c.id, c.last_message_id.as_deref()))
+            .any(|c| !self.is_channel_muted(Some(guild_id), &c.id, now) && self.channel_is_unread(&c.id, c.last_message_id.as_deref()))
+    }
+
+    pub fn channel_shows_unread(&self, guild_id: Option<&str>, channel_id: &str, last_message_id: Option<&str>) -> bool {
+        !self.is_channel_muted(guild_id, channel_id, chrono::Utc::now()) && self.channel_is_unread(channel_id, last_message_id)
+    }
+
+    pub fn is_guild_muted(&self, guild_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.guild_settings.get(guild_id).is_some_and(|s| mute_active(s.muted, s.mute_config.as_ref(), now))
+    }
+
+    fn channel_parent(&self, guild_id: &str, channel_id: &str) -> Option<&str> {
+        self.guild_channels.get(guild_id)?.iter().find(|c| c.id == channel_id)?.parent_id.as_deref()
+    }
+
+    fn channel_and_parent_overrides(&self, guild_id: Option<&str>, channel_id: &str) -> Vec<&rustcord_client::models::ChannelOverride> {
+        let Some(settings) = self.guild_settings.get(guild_id.unwrap_or("@me")) else { return Vec::new() };
+        let parent = guild_id.and_then(|g| self.channel_parent(g, channel_id));
+        [Some(channel_id), parent].into_iter().flatten().filter_map(|id| settings.channel_override(id)).collect()
+    }
+
+    pub fn is_channel_muted(&self, guild_id: Option<&str>, channel_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.channel_and_parent_overrides(guild_id, channel_id)
+            .iter()
+            .any(|o| mute_active(o.muted, o.mute_config.as_ref(), now))
+    }
+
+    pub fn channel_mute_is_direct(&self, guild_id: Option<&str>, channel_id: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.guild_settings
+            .get(guild_id.unwrap_or("@me"))
+            .and_then(|s| s.channel_override(channel_id))
+            .is_some_and(|o| mute_active(o.muted, o.mute_config.as_ref(), now))
+    }
+
+    pub fn guild_notification_level(&self, guild_id: &str) -> u8 {
+        use rustcord_client::models::{NOTIFY_INHERIT, NOTIFY_MENTIONS};
+        match self.guild_settings.get(guild_id).map(|s| s.message_notifications) {
+            Some(level) if level != NOTIFY_INHERIT => level,
+            _ => NOTIFY_MENTIONS,
+        }
+    }
+
+    pub fn channel_notification_override(&self, guild_id: &str, channel_id: &str) -> u8 {
+        self.guild_settings
+            .get(guild_id)
+            .and_then(|s| s.channel_override(channel_id))
+            .map_or(rustcord_client::models::NOTIFY_INHERIT, |o| o.message_notifications)
+    }
+
+    pub fn notification_level(&self, guild_id: &str, channel_id: &str) -> u8 {
+        self.channel_and_parent_overrides(Some(guild_id), channel_id)
+            .iter()
+            .map(|o| o.message_notifications)
+            .find(|level| *level != rustcord_client::models::NOTIFY_INHERIT)
+            .unwrap_or_else(|| self.guild_notification_level(guild_id))
+    }
+
+    pub fn should_notify(&self, message: &Message, now: chrono::DateTime<chrono::Utc>) -> bool {
+        use rustcord_client::models::{NOTIFY_ALL, NOTIFY_MENTIONS};
+        let Some(me) = &self.current_user else { return false };
+        if message.author.id == me.id {
+            return false;
+        }
+        let guild_id = message.guild_id.as_deref();
+        if self.is_channel_muted(guild_id, &message.channel_id, now) {
+            return false;
+        }
+        let Some(guild_id) = guild_id else { return true };
+        if self.is_guild_muted(guild_id, now) {
+            return false;
+        }
+        match self.notification_level(guild_id, &message.channel_id) {
+            NOTIFY_ALL => true,
+            NOTIFY_MENTIONS => message.mentions.iter().any(|u| u.id == me.id),
+            _ => false,
+        }
+    }
+
+    pub fn apply_guild_settings(&mut self, settings: Vec<rustcord_client::models::GuildSettings>) {
+        for entry in settings {
+            self.guild_settings.insert(entry.key().to_string(), entry);
+        }
     }
 
     pub fn folder_has_unread(&self, folder: &GuildFolder) -> bool {
@@ -916,6 +1211,140 @@ impl AppState {
             list.retain(|m| m.id != id);
             self.message_rows.remove(channel_id);
         }
+    }
+
+    pub fn request_stickers(&mut self, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        if !self.sticker_packs_requested {
+            self.sticker_packs_requested = true;
+            let _ = cmd_tx.send(crate::backend::UiCommand::LoadStickerPacks);
+        }
+        let mut guild_ids: Vec<String> = self.selected_guild.iter().chain(self.guilds.iter().map(|g| &g.id)).cloned().collect();
+        guild_ids.retain(|id| !self.guild_stickers.contains_key(id) && self.guild_stickers_requested.insert(id.clone()));
+        if !guild_ids.is_empty() {
+            let _ = cmd_tx.send(crate::backend::UiCommand::LoadGuildStickers { guild_ids });
+        }
+    }
+
+    fn find_sticker(&self, id: &str) -> Option<&rustcord_client::models::Sticker> {
+        self.guild_stickers
+            .values()
+            .flatten()
+            .chain(self.sticker_packs.iter().flat_map(|p| &p.stickers))
+            .find(|s| s.id == id)
+    }
+
+    pub fn sticker_sections(&self, filter: &str) -> Vec<StickerSection<'_>> {
+        let filter = filter.trim().to_lowercase();
+        let frequent: Vec<&rustcord_client::models::Sticker> = FrequentlyUsed::ranked(&self.frequently_used.stickers)
+            .into_iter()
+            .filter_map(|id| self.find_sticker(id))
+            .take(FREQUENT_STICKERS_SHOWN)
+            .collect();
+        let selected = self.selected_guild.as_deref();
+        let guilds = selected
+            .and_then(|id| self.guilds.iter().find(|g| g.id == id))
+            .into_iter()
+            .chain(self.guilds.iter().filter(|g| Some(g.id.as_str()) != selected))
+            .filter_map(|g| self.guild_stickers.get(&g.id).map(|stickers| (g.id.clone(), g.name.as_str(), stickers.iter().collect::<Vec<_>>())));
+        let packs = self.sticker_packs.iter().map(|pack| (format!("pack:{}", pack.id), pack.name.as_str(), pack.stickers.iter().collect()));
+        let frequent = filter.is_empty().then(|| (FREQUENT_SECTION.to_string(), "Frequently used", frequent));
+        frequent
+            .into_iter()
+            .chain(guilds)
+            .chain(packs)
+            .map(|(key, name, stickers)| StickerSection {
+                key,
+                name,
+                stickers: stickers.into_iter().filter(|s| s.available && s.matches(&filter)).collect(),
+            })
+            .filter(|section| !section.stickers.is_empty())
+            .collect()
+    }
+
+    pub fn record_sticker_use(&mut self, sticker_id: &str) {
+        FrequentlyUsed::record(&mut self.frequently_used.stickers, sticker_id, chrono::Utc::now().timestamp());
+        self.frequently_used.save();
+    }
+
+    pub fn record_emoji_use(&mut self, glyph: &str) {
+        FrequentlyUsed::record(&mut self.frequently_used.emojis, glyph, chrono::Utc::now().timestamp());
+        self.frequently_used.save();
+    }
+
+    pub fn frequent_emojis(&self) -> Vec<FrequentEmoji<'_>> {
+        let custom = self.available_emojis();
+        FrequentlyUsed::ranked(&self.frequently_used.emojis)
+            .into_iter()
+            .filter_map(|glyph| match custom_emoji_id(glyph) {
+                Some(id) => custom.iter().find(|(_, e)| e.id == id).map(|(_, e)| FrequentEmoji::Custom(e)),
+                None => emojis::get(glyph).map(FrequentEmoji::Unicode),
+            })
+            .take(FREQUENT_EMOJIS_SHOWN)
+            .collect()
+    }
+
+    pub fn delete_messages(&mut self, channel_id: &str, ids: &[String]) {
+        if let Some(list) = self.messages.get_mut(channel_id) {
+            list.retain(|m| !ids.contains(&m.id));
+            self.message_rows.remove(channel_id);
+        }
+    }
+
+    pub fn upsert_guild_member(&mut self, guild_id: &str, mut member: rustcord_client::models::GuildMember) {
+        if self.current_user.as_ref().is_some_and(|me| me.id == member.user.id) {
+            self.my_guild_roles.insert(guild_id.to_string(), member.roles.clone());
+        }
+        self.known_users.insert(member.user.id.clone(), member.user.clone());
+        let Some(members) = self.guild_members.get_mut(guild_id) else { return };
+        match members.iter_mut().find(|m| m.user.id == member.user.id) {
+            Some(existing) => {
+                if member.joined_at.is_empty() {
+                    member.joined_at = std::mem::take(&mut existing.joined_at);
+                }
+                *existing = member;
+            }
+            None => members.push(member),
+        }
+    }
+
+    pub fn remove_guild_member(&mut self, guild_id: &str, user_id: &str) {
+        if let Some(members) = self.guild_members.get_mut(guild_id) {
+            members.retain(|m| m.user.id != user_id);
+        }
+    }
+
+    pub fn upsert_role(&mut self, guild_id: &str, role: rustcord_client::models::Role) {
+        let roles = self.guild_roles.entry(guild_id.to_string()).or_default();
+        match roles.iter_mut().find(|r| r.id == role.id) {
+            Some(existing) => *existing = role,
+            None => roles.push(role),
+        }
+    }
+
+    pub fn remove_role(&mut self, guild_id: &str, role_id: &str) {
+        if let Some(roles) = self.guild_roles.get_mut(guild_id) {
+            roles.retain(|r| r.id != role_id);
+        }
+        if let Some(mine) = self.my_guild_roles.get_mut(guild_id) {
+            mine.retain(|r| r != role_id);
+        }
+        if let Some(members) = self.guild_members.get_mut(guild_id) {
+            for member in members {
+                member.roles.retain(|r| r != role_id);
+            }
+        }
+    }
+
+    pub fn upsert_relationship(&mut self, relationship: Relationship) {
+        self.known_users.insert(relationship.user.id.clone(), relationship.user.clone());
+        match self.relationships.iter_mut().find(|r| r.id == relationship.id) {
+            Some(existing) => *existing = relationship,
+            None => self.relationships.push(relationship),
+        }
+    }
+
+    pub fn remove_relationship(&mut self, user_id: &str) {
+        self.relationships.retain(|r| r.id != user_id);
     }
 
     pub fn ensure_invite(&mut self, code: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
@@ -1312,20 +1741,61 @@ impl AppState {
     }
 
     pub fn can_view_channel(&self, guild_id: &str, channel: &Channel) -> bool {
-        let Some(me) = &self.current_user else { return true };
-        if self.guild_roles.get(guild_id).is_none() {
+        if self.current_user.is_none() || self.guild_roles.get(guild_id).is_none() {
+            return true;
+        }
+        self.has_channel_permission(guild_id, channel, rustcord_client::permissions::VIEW_CHANNEL)
+    }
+
+    pub fn is_guild_owner(&self, guild_id: &str) -> bool {
+        let Some(me) = &self.current_user else { return false };
+        self.guilds.iter().any(|g| g.id == guild_id && g.owner_id.as_deref() == Some(me.id.as_str()))
+    }
+
+    pub fn has_guild_permission(&self, guild_id: &str, bit: u64) -> bool {
+        self.is_guild_owner(guild_id) || rustcord_client::permissions::has_permission(self.my_base_permissions(guild_id), bit)
+    }
+
+    pub fn has_channel_permission(&self, guild_id: &str, channel: &Channel, bit: u64) -> bool {
+        let Some(me) = &self.current_user else { return false };
+        if self.is_guild_owner(guild_id) {
             return true;
         }
         let my_role_ids = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
-        let base = self.my_base_permissions(guild_id);
         let permissions = rustcord_client::permissions::compute_channel_permissions(
-            base,
+            self.my_base_permissions(guild_id),
             &me.id,
             my_role_ids,
             guild_id,
             &channel.permission_overwrites,
         );
-        rustcord_client::permissions::has_permission(permissions, rustcord_client::permissions::VIEW_CHANNEL)
+        rustcord_client::permissions::has_permission(permissions, bit)
+    }
+
+    pub fn assignable_roles(&self, guild_id: &str) -> Vec<&rustcord_client::models::Role> {
+        let Some(roles) = self.guild_roles.get(guild_id) else { return Vec::new() };
+        let owner = self.is_guild_owner(guild_id);
+        let mine = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
+        let my_top = roles.iter().filter(|r| mine.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
+        let mut assignable: Vec<_> = roles
+            .iter()
+            .filter(|r| r.id != guild_id && !r.managed && (owner || r.position < my_top))
+            .collect();
+        assignable.sort_by(|a, b| b.position.cmp(&a.position));
+        assignable
+    }
+
+    pub fn set_member_role(&mut self, guild_id: &str, user_id: &str, role_id: &str, add: bool) {
+        let Some(member) = self.guild_members.get_mut(guild_id).and_then(|m| m.iter_mut().find(|m| m.user.id == user_id)) else {
+            return;
+        };
+        member.roles.retain(|r| r != role_id);
+        if add {
+            member.roles.push(role_id.to_string());
+        }
+        if self.current_user.as_ref().is_some_and(|me| me.id == user_id) {
+            self.my_guild_roles.insert(guild_id.to_string(), member.roles.clone());
+        }
     }
 
     pub fn grouped_channels_for_selected_guild(&self) -> Vec<ChannelGroup<'_>> {
@@ -1479,7 +1949,370 @@ mod tests {
             nick: nick.map(str::to_string),
             roles: Vec::new(),
             joined_at: "2026-01-01T00:00:00+00:00".into(),
+            communication_disabled_until: None,
         }
+    }
+
+    fn test_role(id: &str, permissions: u64) -> rustcord_client::models::Role {
+        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions, position: 1, color: 0, managed: false }
+    }
+
+    #[test]
+    fn a_role_update_changes_channel_visibility_live() {
+        let view = rustcord_client::permissions::VIEW_CHANNEL;
+        let mut state = AppState { current_user: Some(test_user("me", "me", None)), ..Default::default() };
+        state.guild_roles.insert("g".into(), vec![test_role("g", view)]);
+        let channel = test_channel("c", "g");
+        assert!(state.can_view_channel("g", &channel));
+        state.upsert_role("g", test_role("g", 0));
+        assert!(!state.can_view_channel("g", &channel));
+        state.upsert_role("g", test_role("g", view));
+        assert!(state.can_view_channel("g", &channel));
+    }
+
+    #[test]
+    fn my_own_member_update_replaces_my_roles() {
+        let mut state = AppState { current_user: Some(test_user("me", "me", None)), ..Default::default() };
+        state.my_guild_roles.insert("g".into(), vec!["old".into()]);
+        let mut me = test_member("me", "me", None);
+        me.roles = vec!["new".into()];
+        state.upsert_guild_member("g", me);
+        assert_eq!(state.my_guild_roles["g"], ["new"]);
+    }
+
+    #[test]
+    fn member_update_keeps_joined_at_when_the_event_omits_it() {
+        let mut state = AppState::default();
+        state.guild_members.insert("g".into(), vec![test_member("1", "ada", None)]);
+        let mut update = test_member("1", "ada", Some("Countess"));
+        update.joined_at = String::new();
+        state.upsert_guild_member("g", update);
+        let members = &state.guild_members["g"];
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].nick.as_deref(), Some("Countess"));
+        assert_eq!(members[0].joined_at, "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn member_events_do_not_create_an_unloaded_member_list() {
+        let mut state = AppState::default();
+        state.upsert_guild_member("g", test_member("1", "ada", None));
+        assert!(!state.guild_members.contains_key("g"));
+    }
+
+    #[test]
+    fn deleting_a_role_strips_it_from_everyone() {
+        let mut state = AppState::default();
+        state.guild_roles.insert("g".into(), vec![test_role("r", 0), test_role("s", 0)]);
+        state.my_guild_roles.insert("g".into(), vec!["r".into(), "s".into()]);
+        let mut member = test_member("1", "ada", None);
+        member.roles = vec!["r".into()];
+        state.guild_members.insert("g".into(), vec![member]);
+        state.remove_role("g", "r");
+        assert_eq!(state.guild_roles["g"].len(), 1);
+        assert_eq!(state.my_guild_roles["g"], ["s"]);
+        assert!(state.guild_members["g"][0].roles.is_empty());
+    }
+
+    #[test]
+    fn relationships_upsert_by_id_and_remove() {
+        use rustcord_client::models::{Relationship, RelationshipType};
+        let mut state = AppState::default();
+        let request = Relationship { id: "1".into(), kind: RelationshipType::IncomingRequest, user: test_user("1", "ada", None), since: None };
+        state.upsert_relationship(request.clone());
+        state.upsert_relationship(Relationship { kind: RelationshipType::Friend, ..request });
+        assert_eq!(state.relationships.len(), 1);
+        assert_eq!(state.relationships[0].kind, RelationshipType::Friend);
+        state.remove_relationship("1");
+        assert!(state.relationships.is_empty());
+    }
+
+    fn settings(json: serde_json::Value) -> rustcord_client::models::GuildSettings {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn incoming(guild_id: Option<&str>, channel_id: &str, mentions_me: bool) -> Message {
+        let mentions = if mentions_me { serde_json::json!([{ "id": "me", "username": "me", "discriminator": "0" }]) } else { serde_json::json!([]) };
+        serde_json::from_value(serde_json::json!({
+            "id": "1", "channel_id": channel_id, "guild_id": guild_id,
+            "author": { "id": "them", "username": "them", "discriminator": "0" },
+            "content": "hi", "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null,
+            "mentions": mentions
+        }))
+        .unwrap()
+    }
+
+    fn noon() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-08T12:00:00+00:00").unwrap().with_timezone(&chrono::Utc)
+    }
+
+    fn notifying_state() -> AppState {
+        let mut state = AppState { current_user: Some(test_user("me", "me", None)), ..Default::default() };
+        let mut child = test_channel("c", "general");
+        child.parent_id = Some("cat".into());
+        state.guild_channels.insert("g".into(), vec![child]);
+        state
+    }
+
+    #[test]
+    fn without_settings_guilds_notify_on_mentions_and_dms_always() {
+        let state = notifying_state();
+        assert!(state.should_notify(&incoming(None, "dm", false), noon()));
+        assert!(!state.should_notify(&incoming(Some("g"), "c", false), noon()));
+        assert!(state.should_notify(&incoming(Some("g"), "c", true), noon()));
+    }
+
+    #[test]
+    fn a_muted_guild_is_silent_until_the_mute_expires() {
+        let mut state = notifying_state();
+        state.apply_guild_settings(vec![settings(serde_json::json!({
+            "guild_id": "g", "muted": true, "mute_config": { "end_time": "2026-11-08T13:00:00+00:00", "selected_time_window": 3600 }
+        }))]);
+        assert!(!state.should_notify(&incoming(Some("g"), "c", true), noon()));
+        let later = noon() + chrono::Duration::hours(2);
+        assert!(state.should_notify(&incoming(Some("g"), "c", true), later));
+    }
+
+    #[test]
+    fn a_category_mute_or_level_applies_to_its_channels() {
+        let mut state = notifying_state();
+        state.apply_guild_settings(vec![settings(serde_json::json!({
+            "guild_id": "g", "message_notifications": 2,
+            "channel_overrides": [{ "channel_id": "cat", "message_notifications": 0 }]
+        }))]);
+        assert!(state.should_notify(&incoming(Some("g"), "c", false), noon()));
+        state.apply_guild_settings(vec![settings(serde_json::json!({
+            "guild_id": "g", "channel_overrides": [{ "channel_id": "cat", "muted": true }]
+        }))]);
+        assert!(state.is_channel_muted(Some("g"), "c", noon()));
+        assert!(!state.channel_mute_is_direct(Some("g"), "c", noon()));
+        assert!(!state.should_notify(&incoming(Some("g"), "c", true), noon()));
+    }
+
+    #[test]
+    fn a_muted_dm_is_silent_and_shows_no_unread() {
+        let mut state = notifying_state();
+        state.apply_guild_settings(vec![settings(serde_json::json!({
+            "guild_id": null, "channel_overrides": [{ "channel_id": "dm", "muted": true }]
+        }))]);
+        assert!(!state.should_notify(&incoming(None, "dm", false), noon()));
+        assert!(!state.channel_shows_unread(None, "dm", Some("5")));
+        assert!(state.channel_shows_unread(None, "other", Some("5")));
+    }
+
+    #[test]
+    fn a_muted_guild_shows_no_unread_dot() {
+        let mut state = notifying_state();
+        state.guild_channels.get_mut("g").unwrap()[0].last_message_id = Some("5".into());
+        assert!(state.guild_has_unread("g"));
+        state.apply_guild_settings(vec![settings(serde_json::json!({ "guild_id": "g", "muted": true }))]);
+        assert!(!state.guild_has_unread("g"));
+    }
+
+    #[test]
+    fn a_timed_mute_patch_ends_after_the_window_and_a_permanent_one_has_no_end() {
+        let timed = mute_patch(true, 3600, noon());
+        assert_eq!(timed["mute_config"]["end_time"], "2026-11-08T13:00:00+00:00");
+        let forever = mute_patch(true, -1, noon());
+        assert!(forever["mute_config"]["end_time"].is_null());
+        assert!(mute_patch(false, -1, noon())["mute_config"].is_null());
+    }
+
+    fn ranked_role(id: &str, position: i32, managed: bool) -> rustcord_client::models::Role {
+        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions: 0, position, color: 0, managed }
+    }
+
+    fn moderator_state(owner: bool) -> AppState {
+        let mut state = AppState { current_user: Some(test_user("me", "me", None)), ..Default::default() };
+        let mut guild = test_guild("g", "Home");
+        guild.owner_id = owner.then(|| "me".to_string());
+        state.guilds.push(guild);
+        state.guild_roles.insert(
+            "g".into(),
+            vec![ranked_role("g", 0, false), ranked_role("low", 1, false), ranked_role("bot", 2, true), ranked_role("mod", 3, false), ranked_role("admin", 4, false)],
+        );
+        state.my_guild_roles.insert("g".into(), vec!["mod".into()]);
+        state
+    }
+
+    #[test]
+    fn only_roles_below_my_top_role_are_assignable() {
+        let state = moderator_state(false);
+        let ids: Vec<_> = state.assignable_roles("g").iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["low"]);
+    }
+
+    #[test]
+    fn the_owner_can_assign_every_unmanaged_role() {
+        let state = moderator_state(true);
+        let ids: Vec<_> = state.assignable_roles("g").iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["admin", "mod", "low"]);
+        assert!(state.has_guild_permission("g", rustcord_client::permissions::MANAGE_ROLES));
+    }
+
+    #[test]
+    fn toggling_a_role_updates_the_member_and_my_roles() {
+        let mut state = moderator_state(false);
+        state.guild_members.insert("g".into(), vec![test_member("me", "me", None)]);
+        state.set_member_role("g", "me", "low", true);
+        state.set_member_role("g", "me", "low", true);
+        assert_eq!(state.guild_members["g"][0].roles, ["low"]);
+        assert_eq!(state.my_guild_roles["g"], ["low"]);
+        state.set_member_role("g", "me", "low", false);
+        assert!(state.guild_members["g"][0].roles.is_empty());
+    }
+
+    #[test]
+    fn a_timeout_is_active_only_until_it_expires() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-08T12:00:00+00:00").unwrap().with_timezone(&chrono::Utc);
+        assert!(active_timeout(Some("2026-11-08T12:05:00+00:00"), now).is_some());
+        assert!(active_timeout(Some("2026-11-08T11:55:00+00:00"), now).is_none());
+        assert!(active_timeout(Some("garbage"), now).is_none());
+        assert!(active_timeout(None, now).is_none());
+    }
+
+    fn test_gif(url: &str) -> rustcord_client::models::Gif {
+        serde_json::from_value(serde_json::json!({ "url": url, "src": url })).unwrap()
+    }
+
+    #[test]
+    fn gif_search_waits_for_typing_to_settle() {
+        let start = std::time::Instant::now();
+        let mut picker = GifPicker::default();
+        assert_eq!(picker.due_query(start).as_deref(), Some(""));
+        picker.requested = Some(String::new());
+        assert_eq!(picker.due_query(start), None);
+        picker.query = "cat ".into();
+        picker.edited_at = Some(start);
+        assert_eq!(picker.due_query(start + GIF_SEARCH_DEBOUNCE / 2), None);
+        assert_eq!(picker.due_query(start + GIF_SEARCH_DEBOUNCE).as_deref(), Some("cat"));
+    }
+
+    #[test]
+    fn a_stale_gif_result_is_dropped() {
+        let mut picker = GifPicker { requested: Some("dog".into()), ..Default::default() };
+        assert!(picker.loading());
+        assert!(!picker.apply("do".into(), Ok(vec![test_gif("a")])));
+        assert!(picker.results.is_empty());
+        assert!(picker.apply("dog".into(), Ok(vec![test_gif("b")])));
+        assert_eq!(picker.results[0].url, "b");
+        assert!(!picker.loading());
+    }
+
+    #[test]
+    fn a_failed_gif_search_is_not_retried_every_frame() {
+        let mut picker = GifPicker { requested: Some("dog".into()), query: "dog".into(), ..Default::default() };
+        picker.apply("dog".into(), Err("boom".into()));
+        assert_eq!(picker.error.as_deref(), Some("boom"));
+        assert_eq!(picker.due_query(std::time::Instant::now()), None);
+    }
+
+    fn test_sticker(id: &str, name: &str, available: bool) -> rustcord_client::models::Sticker {
+        serde_json::from_value(serde_json::json!({ "id": id, "name": name, "format_type": 1, "available": available })).unwrap()
+    }
+
+    fn section_names<'a>(sections: &'a [StickerSection<'a>]) -> Vec<(&'a str, usize)> {
+        sections.iter().map(|s| (s.name, s.stickers.len())).collect()
+    }
+
+    #[test]
+    fn sticker_sections_put_the_open_server_first_then_other_servers_then_packs() {
+        let mut state = AppState { selected_guild: Some("g".into()), ..Default::default() };
+        state.guilds.push(test_guild("o", "Other"));
+        state.guilds.push(test_guild("g", "Home"));
+        state.guilds.push(test_guild("e", "Empty"));
+        state.guild_stickers.insert("g".into(), vec![test_sticker("1", "cat", true), test_sticker("2", "cat gone", false)]);
+        state.guild_stickers.insert("o".into(), vec![test_sticker("4", "dog", true)]);
+        state.guild_stickers.insert("e".into(), Vec::new());
+        state.sticker_packs = serde_json::from_value(serde_json::json!([
+            { "id": "p", "name": "Wumpus", "stickers": [{ "id": "3", "name": "wave", "format_type": 3 }] }
+        ]))
+        .unwrap();
+        let all = state.sticker_sections("");
+        assert_eq!(section_names(&all), [("Home", 1), ("Other", 1), ("Wumpus", 1)]);
+        assert_eq!(all.iter().map(|s| s.key.as_str()).collect::<Vec<_>>(), ["g", "o", "pack:p"]);
+        let cats = state.sticker_sections(" CAT ");
+        assert_eq!(section_names(&cats), [("Home", 1)]);
+    }
+
+    #[test]
+    fn frequently_used_stickers_lead_the_picker_but_not_a_search() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g", "Home"));
+        state.guild_stickers.insert("g".into(), vec![test_sticker("1", "cat", true), test_sticker("2", "dog", true)]);
+        state.record_sticker_use("2");
+        state.record_sticker_use("2");
+        state.record_sticker_use("1");
+        state.record_sticker_use("gone");
+        let all = state.sticker_sections("");
+        assert_eq!(all[0].key, FREQUENT_SECTION);
+        assert_eq!(all[0].stickers.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["2", "1"]);
+        assert!(state.sticker_sections("cat").iter().all(|s| s.key != FREQUENT_SECTION));
+    }
+
+    #[test]
+    fn usage_ranks_by_count_then_recency_and_stays_bounded() {
+        let mut counts = HashMap::new();
+        FrequentlyUsed::record(&mut counts, "a", 1);
+        FrequentlyUsed::record(&mut counts, "b", 2);
+        FrequentlyUsed::record(&mut counts, "a", 3);
+        FrequentlyUsed::record(&mut counts, "c", 4);
+        assert_eq!(FrequentlyUsed::ranked(&counts), ["a", "c", "b"]);
+        for i in 0..FREQUENT_KEEP + 10 {
+            FrequentlyUsed::record(&mut counts, &i.to_string(), 10 + i as i64);
+        }
+        assert_eq!(counts.len(), FREQUENT_KEEP);
+        assert!(counts.contains_key("a"));
+    }
+
+    #[test]
+    fn usage_survives_a_toml_round_trip_with_custom_emoji_keys() {
+        let mut used = FrequentlyUsed::default();
+        FrequentlyUsed::record(&mut used.emojis, "<a:blob:123>", 5);
+        FrequentlyUsed::record(&mut used.emojis, "\u{1F600}", 6);
+        let back: FrequentlyUsed = toml::from_str(&toml::to_string(&used).unwrap()).unwrap();
+        assert_eq!(back.emojis, used.emojis);
+    }
+
+    #[test]
+    fn frequent_emojis_drop_custom_ones_you_can_no_longer_use() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g", "Home"));
+        state.guild_emojis.insert("g".into(), vec![serde_json::from_value(serde_json::json!({ "id": "7", "name": "blob" })).unwrap()]);
+        state.record_emoji_use("<:blob:7>");
+        state.record_emoji_use("<:blob:7>");
+        state.record_emoji_use("<:gone:8>");
+        state.record_emoji_use("\u{1F600}");
+        let names: Vec<String> = state
+            .frequent_emojis()
+            .iter()
+            .map(|e| match e {
+                FrequentEmoji::Custom(e) => e.name.clone(),
+                FrequentEmoji::Unicode(e) => e.as_str().to_string(),
+            })
+            .collect();
+        assert_eq!(names, ["blob", "\u{1F600}"]);
+    }
+
+    #[test]
+    fn stickers_are_requested_once_for_every_server_missing_them() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = AppState { selected_guild: Some("g".into()), ..Default::default() };
+        state.guilds.push(test_guild("a", "A"));
+        state.guilds.push(test_guild("g", "G"));
+        state.guilds.push(test_guild("b", "B"));
+        state.guild_stickers.insert("b".into(), Vec::new());
+        state.request_stickers(&tx);
+        state.request_stickers(&tx);
+        let mut sent = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            sent.push(match cmd {
+                crate::backend::UiCommand::LoadGuildStickers { guild_ids } => guild_ids.join(","),
+                crate::backend::UiCommand::LoadStickerPacks => "packs".into(),
+                _ => "other".into(),
+            });
+        }
+        assert_eq!(sent, ["packs", "g,a"]);
     }
 
     #[test]
@@ -1738,7 +2571,7 @@ mod tests {
     #[test]
     fn leaving_a_guild_drops_its_channels_and_selection() {
         let mut state = AppState::default();
-        state.guilds.push(Guild { id: "g1".into(), name: "Guild".into(), icon: None, unavailable: false });
+        state.guilds.push(Guild { id: "g1".into(), name: "Guild".into(), icon: None, unavailable: false, owner_id: None });
         state.upsert_channel(guild_channel("c1", "g1", "general"));
         state.selected_guild = Some("g1".into());
         state.selected_channel = Some("c1".into());
@@ -1752,7 +2585,7 @@ mod tests {
     #[test]
     fn updating_a_guild_renames_it_in_place() {
         let mut state = AppState::default();
-        state.guilds.push(Guild { id: "g1".into(), name: "Old".into(), icon: None, unavailable: false });
+        state.guilds.push(Guild { id: "g1".into(), name: "Old".into(), icon: None, unavailable: false, owner_id: None });
         state.update_guild("g1", Some("New".into()), None);
         assert_eq!(state.guilds[0].name, "New");
     }
@@ -1812,7 +2645,7 @@ mod tests {
     }
 
     fn role(id: &str, name: &str, position: i32, color: u32) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color }
+        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color, managed: false }
     }
 
     #[test]
@@ -1957,7 +2790,7 @@ mod tests {
     }
 
     fn test_guild(id: &str, name: &str) -> rustcord_client::models::Guild {
-        rustcord_client::models::Guild { id: id.into(), name: name.into(), icon: None, unavailable: false }
+        rustcord_client::models::Guild { id: id.into(), name: name.into(), icon: None, unavailable: false, owner_id: None }
     }
 
     #[test]
