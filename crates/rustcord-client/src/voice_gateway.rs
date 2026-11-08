@@ -337,7 +337,11 @@ impl VoiceGateway {
             }
         });
 
+        let mut loop_pass = 0u64;
+        let mut rtc_idle_since: Option<u64> = None;
         let result = loop {
+            loop_pass += 1;
+            let rtc_has_work = rtc_needs_drive(rtc_idle_since, loop_pass);
             tokio::select! {
                 _ = speaking_check.tick() => {
                     const SPEAKING_TIMEOUT: Duration = Duration::from_millis(500);
@@ -1085,7 +1089,7 @@ impl VoiceGateway {
                         break Err(e.into());
                     }
                 }
-                drive_result = drive_rtc(rtc.as_mut()) => {
+                drive_result = drive_rtc(rtc.as_mut()), if rtc_has_work => {
                     {
                         let now = Instant::now();
                         if let Some(prev) = last_select_entry {
@@ -1099,6 +1103,7 @@ impl VoiceGateway {
                     let rtc_event = match drive_result {
                         Ok(crate::voice_rtc::DriveResult::WaitUntil(deadline)) => {
                             next_rtc_deadline = Some(deadline);
+                            rtc_idle_since = Some(loop_pass);
                             Ok(None)
                         }
                         Ok(crate::voice_rtc::DriveResult::Event(event)) => Ok(Some(event)),
@@ -1658,6 +1663,10 @@ fn encode_video_frames(
     Ok(())
 }
 
+fn rtc_needs_drive(idle_since: Option<u64>, pass: u64) -> bool {
+    idle_since.is_none_or(|idle| idle + 1 != pass)
+}
+
 async fn drive_rtc(rtc: Option<&mut VoiceRtc>) -> Result<crate::voice_rtc::DriveResult, ClientError> {
     match rtc {
         Some(rtc) => rtc.drive().await,
@@ -1932,5 +1941,17 @@ mod camera_tests {
         assert_eq!((width, height), (2, 1));
         assert_eq!(rgba, [30, 20, 10, 255, 30, 20, 10, 255]);
         assert_eq!(preview_rgba(&frame, 480).0, 4);
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::rtc_needs_drive;
+
+    #[test]
+    fn an_idle_rtc_is_only_driven_again_after_another_branch_has_run() {
+        assert!(rtc_needs_drive(None, 1));
+        assert!(!rtc_needs_drive(Some(4), 5), "the pass right after an idle drive skips driving");
+        assert!(rtc_needs_drive(Some(4), 6), "any later pass means another branch fired in between");
     }
 }

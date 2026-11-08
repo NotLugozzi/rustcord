@@ -12,3 +12,12 @@ license = "MIT"
 [profile.release]
 opt-level = 3
 lto = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
