@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Channel, Guild, GuildMember, MergedPresences, Message, Presence, ReactionEmoji, Role, User, VoiceState};
+use crate::models::{Channel, Emoji, Guild, GuildSettings, Sticker, GuildMember, MergedPresences, Message, Presence, ReactionEmoji, Relationship, Role, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,11 +36,22 @@ pub enum GatewayEvent {
     GuildMembersChunk { guild_id: String, members: Vec<GuildMember>, presences: Vec<Presence> },
     ReadState(Vec<ChannelReadState>),
     InitialGuildChannels(Vec<(String, Vec<crate::models::Channel>)>),
+    InitialGuildStickers(Vec<(String, Vec<Sticker>)>),
     ChannelUpsert(Channel),
     ChannelDelete { channel_id: String, guild_id: Option<String> },
     GuildUpdate { guild_id: String, name: Option<String>, icon: Option<String> },
     GuildDelete { guild_id: String },
     MessageAck { channel_id: String, message_id: String },
+    MessageDeleteBulk { channel_id: String, ids: Vec<String> },
+    GuildMemberUpsert { guild_id: String, member: GuildMember },
+    GuildMemberRemove { guild_id: String, user_id: String },
+    GuildRoleUpsert { guild_id: String, role: Role },
+    GuildRoleDelete { guild_id: String, role_id: String },
+    GuildEmojisUpdate { guild_id: String, emojis: Vec<Emoji> },
+    GuildStickersUpdate { guild_id: String, stickers: Vec<Sticker> },
+    GuildSettings(Vec<GuildSettings>),
+    RelationshipAdd(Relationship),
+    RelationshipRemove { user_id: String },
     Unknown { op_name: String, raw: Value },
 }
 
@@ -86,7 +97,7 @@ pub fn presence_frame(status: &str, activities: &[Value]) -> String {
     json!({ "op": 3, "d": { "since": 0, "activities": activities, "status": status, "afk": false } }).to_string()
 }
 
-pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>, self_mute: bool, self_deaf: bool) -> String {
+pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>, self_mute: bool, self_deaf: bool, self_video: bool) -> String {
     json!({
         "op": 4,
         "d": {
@@ -94,6 +105,7 @@ pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>
             "channel_id": channel_id,
             "self_mute": self_mute,
             "self_deaf": self_deaf,
+            "self_video": self_video,
         }
     })
     .to_string()
@@ -322,6 +334,16 @@ impl Gateway {
                 if !guild_channels.is_empty() {
                     let _ = tx.send(GatewayEvent::InitialGuildChannels(guild_channels));
                 }
+                let guild_stickers = parse_initial_guild_stickers(data.get("guilds"));
+                tracing::info!("READY supplied stickers for {} guilds", guild_stickers.len());
+                if !guild_stickers.is_empty() {
+                    let _ = tx.send(GatewayEvent::InitialGuildStickers(guild_stickers));
+                }
+                let guild_settings = parse_versioned_entries::<GuildSettings>(data.get("user_guild_settings"));
+                tracing::info!("READY supplied {} notification settings", guild_settings.len());
+                if !guild_settings.is_empty() {
+                    let _ = tx.send(GatewayEvent::GuildSettings(guild_settings));
+                }
                 let read_state = parse_read_state(data.get("read_state"));
                 tracing::info!("READY supplied {} channel read states", read_state.len());
                 if !read_state.is_empty() {
@@ -369,6 +391,26 @@ impl Gateway {
                     call: serde_json::from_value(data["call"].clone()).ok(),
                 }
             }
+            Some(
+                name @ ("MESSAGE_DELETE_BULK"
+                | "GUILD_MEMBER_ADD"
+                | "GUILD_MEMBER_UPDATE"
+                | "GUILD_MEMBER_REMOVE"
+                | "GUILD_ROLE_CREATE"
+                | "GUILD_ROLE_UPDATE"
+                | "GUILD_ROLE_DELETE"
+                | "GUILD_EMOJIS_UPDATE"
+                | "GUILD_STICKERS_UPDATE"
+                | "USER_GUILD_SETTINGS_UPDATE"
+                | "RELATIONSHIP_ADD"
+                | "RELATIONSHIP_REMOVE"),
+            ) => match parse_entity_dispatch(name, &data) {
+                Some(event) => event,
+                None => {
+                    tracing::debug!(event = name, "could not parse gateway dispatch");
+                    return Ok(());
+                }
+            },
             Some("MESSAGE_DELETE") => GatewayEvent::MessageDelete {
                 channel_id: data["channel_id"].as_str().unwrap_or_default().to_string(),
                 id: data["id"].as_str().unwrap_or_default().to_string(),
@@ -486,6 +528,55 @@ impl Gateway {
     }
 }
 
+fn parse_versioned_entries<T: serde::de::DeserializeOwned>(value: Option<&Value>) -> Vec<T> {
+    let entries = match value {
+        Some(Value::Array(items)) => items.as_slice(),
+        Some(other) => other.get("entries").and_then(Value::as_array).map_or(&[][..], Vec::as_slice),
+        None => &[],
+    };
+    entries.iter().filter_map(|entry| serde_json::from_value(entry.clone()).ok()).collect()
+}
+
+fn parse_entity_dispatch(name: &str, data: &Value) -> Option<GatewayEvent> {
+    let text = |key: &str| data[key].as_str().map(str::to_string);
+    let guild_id = || text("guild_id");
+    match name {
+        "MESSAGE_DELETE_BULK" => {
+            let ids = data["ids"].as_array()?.iter().filter_map(Value::as_str).map(str::to_string).collect();
+            Some(GatewayEvent::MessageDeleteBulk { channel_id: text("channel_id")?, ids })
+        }
+        "GUILD_MEMBER_ADD" | "GUILD_MEMBER_UPDATE" => {
+            let mut member = data.clone();
+            if member["joined_at"].is_null() {
+                member["joined_at"] = Value::String(String::new());
+            }
+            let member: GuildMember = serde_json::from_value(member).ok()?;
+            Some(GatewayEvent::GuildMemberUpsert { guild_id: guild_id()?, member })
+        }
+        "GUILD_MEMBER_REMOVE" => Some(GatewayEvent::GuildMemberRemove {
+            guild_id: guild_id()?,
+            user_id: data["user"]["id"].as_str()?.to_string(),
+        }),
+        "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => Some(GatewayEvent::GuildRoleUpsert {
+            guild_id: guild_id()?,
+            role: serde_json::from_value(data["role"].clone()).ok()?,
+        }),
+        "GUILD_ROLE_DELETE" => Some(GatewayEvent::GuildRoleDelete { guild_id: guild_id()?, role_id: text("role_id")? }),
+        "GUILD_EMOJIS_UPDATE" => Some(GatewayEvent::GuildEmojisUpdate {
+            guild_id: guild_id()?,
+            emojis: serde_json::from_value(data["emojis"].clone()).ok()?,
+        }),
+        "GUILD_STICKERS_UPDATE" => Some(GatewayEvent::GuildStickersUpdate {
+            guild_id: guild_id()?,
+            stickers: serde_json::from_value(data["stickers"].clone()).ok()?,
+        }),
+        "USER_GUILD_SETTINGS_UPDATE" => serde_json::from_value(data.clone()).ok().map(|s| GatewayEvent::GuildSettings(vec![s])),
+        "RELATIONSHIP_ADD" => serde_json::from_value(data.clone()).ok().map(GatewayEvent::RelationshipAdd),
+        "RELATIONSHIP_REMOVE" => Some(GatewayEvent::RelationshipRemove { user_id: text("id")? }),
+        _ => None,
+    }
+}
+
 fn parse_initial_voice_states(guilds: Option<&Value>) -> Vec<VoiceState> {
     let mut voice_states = Vec::new();
     let Some(guilds) = guilds.and_then(Value::as_array) else { return voice_states };
@@ -536,6 +627,18 @@ fn parse_initial_guild_channels(guilds: Option<&Value>) -> Vec<(String, Vec<crat
         }
     }
     out
+}
+
+fn parse_initial_guild_stickers(guilds: Option<&Value>) -> Vec<(String, Vec<Sticker>)> {
+    let Some(guilds) = guilds.and_then(Value::as_array) else { return Vec::new() };
+    guilds
+        .iter()
+        .filter_map(|guild| {
+            let id = guild.get("id").and_then(Value::as_str)?;
+            let raw = guild.get("stickers").and_then(Value::as_array)?;
+            Some((id.to_string(), raw.iter().filter_map(|s| serde_json::from_value(s.clone()).ok()).collect()))
+        })
+        .collect()
 }
 
 fn parse_read_state(value: Option<&Value>) -> Vec<ChannelReadState> {
@@ -595,6 +698,104 @@ fn deduplicate_presences(presences: &mut Vec<Presence>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn user_json(id: &str) -> Value {
+        json!({ "id": id, "username": "ada", "discriminator": "0", "avatar": null })
+    }
+
+    #[test]
+    fn ready_guild_stickers_keep_empty_lists_and_skip_guilds_without_the_field() {
+        let guilds = json!([
+            { "id": "a", "stickers": [{ "id": "1", "name": "wave", "format_type": 1 }] },
+            { "id": "b", "stickers": [] },
+            { "id": "c", "unavailable": true }
+        ]);
+        let parsed = parse_initial_guild_stickers(Some(&guilds));
+        assert_eq!(parsed.iter().map(|(id, s)| (id.as_str(), s.len())).collect::<Vec<_>>(), [("a", 1), ("b", 0)]);
+    }
+
+    #[test]
+    fn guild_settings_parse_in_both_ready_shapes() {
+        let entry = json!({ "guild_id": "g", "muted": true, "message_notifications": 2, "channel_overrides": [] });
+        let bare = parse_versioned_entries::<GuildSettings>(Some(&json!([entry.clone()])));
+        let wrapped = parse_versioned_entries::<GuildSettings>(Some(&json!({ "version": 4, "entries": [entry] })));
+        assert_eq!(bare.len(), 1);
+        assert_eq!(wrapped.len(), 1);
+        assert!(wrapped[0].muted);
+        assert!(parse_versioned_entries::<GuildSettings>(None).is_empty());
+    }
+
+    #[test]
+    fn bulk_delete_carries_every_id() {
+        let event = parse_entity_dispatch("MESSAGE_DELETE_BULK", &json!({ "channel_id": "c", "ids": ["1", "2", "3"] }));
+        match event {
+            Some(GatewayEvent::MessageDeleteBulk { channel_id, ids }) => {
+                assert_eq!(channel_id, "c");
+                assert_eq!(ids, ["1", "2", "3"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_update_with_null_joined_at_still_parses() {
+        let data = json!({ "guild_id": "g", "user": user_json("1"), "nick": "Countess", "roles": ["r"], "joined_at": null });
+        match parse_entity_dispatch("GUILD_MEMBER_UPDATE", &data) {
+            Some(GatewayEvent::GuildMemberUpsert { guild_id, member }) => {
+                assert_eq!(guild_id, "g");
+                assert_eq!(member.nick.as_deref(), Some("Countess"));
+                assert_eq!(member.roles, ["r"]);
+                assert!(member.joined_at.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_remove_takes_the_nested_user_id() {
+        let data = json!({ "guild_id": "g", "user": user_json("7") });
+        assert!(matches!(
+            parse_entity_dispatch("GUILD_MEMBER_REMOVE", &data),
+            Some(GatewayEvent::GuildMemberRemove { user_id, .. }) if user_id == "7"
+        ));
+    }
+
+    #[test]
+    fn role_update_parses_string_permissions() {
+        let data = json!({ "guild_id": "g", "role": { "id": "r", "name": "Mods", "permissions": "1024", "position": 2, "color": 255 } });
+        match parse_entity_dispatch("GUILD_ROLE_UPDATE", &data) {
+            Some(GatewayEvent::GuildRoleUpsert { role, .. }) => {
+                assert_eq!(role.permissions, 1024);
+                assert_eq!(role.color, 255);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn role_delete_and_emoji_update_parse() {
+        assert!(matches!(
+            parse_entity_dispatch("GUILD_ROLE_DELETE", &json!({ "guild_id": "g", "role_id": "r" })),
+            Some(GatewayEvent::GuildRoleDelete { role_id, .. }) if role_id == "r"
+        ));
+        let emojis = json!({ "guild_id": "g", "emojis": [{ "id": "e", "name": "blob", "animated": true }] });
+        assert!(matches!(
+            parse_entity_dispatch("GUILD_EMOJIS_UPDATE", &emojis),
+            Some(GatewayEvent::GuildEmojisUpdate { emojis, .. }) if emojis.len() == 1 && emojis[0].animated
+        ));
+    }
+
+    #[test]
+    fn relationship_add_parses_and_unknown_types_are_skipped() {
+        let friend = json!({ "id": "1", "type": 3, "user": user_json("1") });
+        assert!(matches!(parse_entity_dispatch("RELATIONSHIP_ADD", &friend), Some(GatewayEvent::RelationshipAdd(_))));
+        let implicit = json!({ "id": "1", "type": 5, "user": user_json("1") });
+        assert!(parse_entity_dispatch("RELATIONSHIP_ADD", &implicit).is_none());
+        assert!(matches!(
+            parse_entity_dispatch("RELATIONSHIP_REMOVE", &json!({ "id": "1", "type": 1 })),
+            Some(GatewayEvent::RelationshipRemove { user_id }) if user_id == "1"
+        ));
+    }
 
     fn ids(states: &[ChannelReadState]) -> Vec<(&str, &str)> {
         states.iter().map(|s| (s.channel_id.as_str(), s.last_message_id.as_str())).collect()

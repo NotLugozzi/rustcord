@@ -56,6 +56,99 @@ impl User {
 }
 
 #[cfg(test)]
+mod guild_settings_tests {
+    use super::*;
+
+    #[test]
+    fn overrides_parse_from_an_array_or_a_map() {
+        let from_array: GuildSettings = serde_json::from_value(serde_json::json!({
+            "guild_id": "g", "muted": false, "message_notifications": 1,
+            "channel_overrides": [{ "channel_id": "c", "muted": true, "message_notifications": 3 }]
+        }))
+        .unwrap();
+        assert!(from_array.channel_override("c").unwrap().muted);
+        let from_map: GuildSettings = serde_json::from_value(serde_json::json!({
+            "guild_id": null, "channel_overrides": { "d": { "muted": true } }
+        }))
+        .unwrap();
+        assert_eq!(from_map.key(), "@me");
+        assert_eq!(from_map.message_notifications, NOTIFY_INHERIT);
+        assert_eq!(from_map.channel_override("d").unwrap().message_notifications, NOTIFY_INHERIT);
+    }
+
+    #[test]
+    fn mute_patches_carry_a_config_only_when_muting() {
+        let on = mute_fields(true, Some("2026-11-08T13:00:00+00:00".into()), 3600);
+        assert_eq!(on["mute_config"]["selected_time_window"], 3600);
+        let off = mute_fields(false, None, -1);
+        assert!(off["mute_config"].is_null());
+        let channel = channel_override_patch("c", mute_fields(true, None, -1));
+        assert_eq!(channel["channel_overrides"]["c"]["muted"], true);
+    }
+}
+
+#[cfg(test)]
+mod sticker_tests {
+    use super::*;
+
+    fn gif_message(content: &str) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "1", "channel_id": "c", "author": { "id": "u", "username": "u", "discriminator": "0" },
+            "content": content, "timestamp": "2026-01-01T00:00:00+00:00", "edited_timestamp": null,
+            "embeds": [{ "type": "gifv", "url": "https://klipy.com/gifs/x", "video": { "url": "https://x/y.mp4" } }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_a_bare_gif_link_is_hidden() {
+        assert!(gif_message("https://klipy.com/gifs/x").is_only_gif_link());
+        assert!(gif_message(" https://klipy.com/gifs/x\n").is_only_gif_link());
+        assert!(!gif_message("look https://klipy.com/gifs/x").is_only_gif_link());
+        assert!(!gif_message("").is_only_gif_link());
+    }
+
+    #[test]
+    fn a_message_without_stickers_still_parses() {
+        let m: Message = serde_json::from_value(serde_json::json!({
+            "id": "1", "channel_id": "c", "author": { "id": "u", "username": "u", "discriminator": "0" },
+            "content": "hi", "timestamp": "2026-01-01T00:00:00+00:00", "edited_timestamp": null
+        }))
+        .unwrap();
+        assert!(m.sticker_items.is_empty());
+    }
+
+    #[test]
+    fn sticker_items_parse_from_a_message() {
+        let m: Message = serde_json::from_value(serde_json::json!({
+            "id": "1", "channel_id": "c", "author": { "id": "u", "username": "u", "discriminator": "0" },
+            "content": "", "timestamp": "2026-01-01T00:00:00+00:00", "edited_timestamp": null,
+            "sticker_items": [{ "id": "s", "name": "Wave", "format_type": 3 }]
+        }))
+        .unwrap();
+        assert_eq!(m.sticker_items[0].format_type, STICKER_FORMAT_LOTTIE);
+    }
+
+    #[test]
+    fn stickers_match_on_name_or_tags() {
+        let s: Sticker = serde_json::from_value(serde_json::json!({ "id": "1", "name": "Wumpus Wave", "format_type": 1, "tags": "hello, hi" })).unwrap();
+        assert!(s.available);
+        assert!(s.matches(""));
+        assert!(s.matches("wave"));
+        assert!(s.matches("hello"));
+        assert!(!s.matches("bye"));
+    }
+
+    #[test]
+    fn a_gif_thumbnail_prefers_the_static_preview() {
+        let g: Gif = serde_json::from_value(serde_json::json!({ "url": "https://tenor.com/x", "src": "a.gif", "gif_src": "b.gif", "preview": "c.png", "width": 1, "height": 1 })).unwrap();
+        assert_eq!(g.thumbnail(), "c.png");
+        let g: Gif = serde_json::from_value(serde_json::json!({ "url": "https://tenor.com/x", "src": "a.gif" })).unwrap();
+        assert_eq!(g.thumbnail(), "a.gif");
+    }
+}
+
+#[cfg(test)]
 mod user_tests {
     use super::*;
 
@@ -95,6 +188,8 @@ pub struct Guild {
     pub icon: Option<String>,
     #[serde(default)]
     pub unavailable: bool,
+    #[serde(default)]
+    pub owner_id: Option<Snowflake>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -108,6 +203,14 @@ pub struct Invite {
     pub approximate_member_count: Option<u64>,
     #[serde(default)]
     pub approximate_presence_count: Option<u64>,
+    #[serde(default)]
+    pub inviter: Option<User>,
+    #[serde(default)]
+    pub uses: Option<u32>,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -119,7 +222,7 @@ pub struct InviteGuild {
 
 impl InviteGuild {
     pub fn to_guild(&self) -> Guild {
-        Guild { id: self.id.clone(), name: self.name.clone(), icon: self.icon.clone(), unavailable: false }
+        Guild { id: self.id.clone(), name: self.name.clone(), icon: self.icon.clone(), unavailable: false, owner_id: None }
     }
 }
 
@@ -323,6 +426,8 @@ pub struct Role {
     pub position: i32,
     #[serde(default)]
     pub color: u32,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 impl Role {
@@ -347,6 +452,8 @@ pub struct GuildMember {
     #[serde(default)]
     pub roles: Vec<Snowflake>,
     pub joined_at: String,
+    #[serde(default)]
+    pub communication_disabled_until: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -425,6 +532,161 @@ pub struct Message {
     pub webhook_id: Option<Snowflake>,
     #[serde(default)]
     pub message_reference: Option<MessageReference>,
+    #[serde(default)]
+    pub sticker_items: Vec<StickerItem>,
+}
+
+impl Message {
+    pub fn is_only_gif_link(&self) -> bool {
+        let content = self.content.trim();
+        !content.is_empty()
+            && self
+                .embeds
+                .iter()
+                .any(|e| e.kind.as_deref() == Some("gifv") && e.url.as_deref() == Some(content))
+    }
+}
+
+pub const NOTIFY_ALL: u8 = 0;
+pub const NOTIFY_MENTIONS: u8 = 1;
+pub const NOTIFY_NOTHING: u8 = 2;
+pub const NOTIFY_INHERIT: u8 = 3;
+
+fn inherit_notifications() -> u8 {
+    NOTIFY_INHERIT
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct MuteConfig {
+    #[serde(default)]
+    pub end_time: Option<String>,
+    #[serde(default)]
+    pub selected_time_window: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChannelOverride {
+    pub channel_id: Snowflake,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub mute_config: Option<MuteConfig>,
+    #[serde(default = "inherit_notifications")]
+    pub message_notifications: u8,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GuildSettings {
+    #[serde(default)]
+    pub guild_id: Option<Snowflake>,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub mute_config: Option<MuteConfig>,
+    #[serde(default = "inherit_notifications")]
+    pub message_notifications: u8,
+    #[serde(default, deserialize_with = "lenient_overrides")]
+    pub channel_overrides: Vec<ChannelOverride>,
+}
+
+impl GuildSettings {
+    pub fn key(&self) -> &str {
+        self.guild_id.as_deref().unwrap_or("@me")
+    }
+
+    pub fn channel_override(&self, channel_id: &str) -> Option<&ChannelOverride> {
+        self.channel_overrides.iter().find(|o| o.channel_id == channel_id)
+    }
+}
+
+fn lenient_overrides<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<ChannelOverride>, D::Error> {
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let entries: Vec<serde_json::Value> = match raw {
+        Some(serde_json::Value::Array(items)) => items,
+        Some(serde_json::Value::Object(map)) => map
+            .into_iter()
+            .map(|(channel_id, mut entry)| {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.entry("channel_id").or_insert(serde_json::Value::String(channel_id));
+                }
+                entry
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Ok(entries.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
+}
+
+pub fn mute_fields(muted: bool, end_time: Option<String>, window_secs: i64) -> serde_json::Value {
+    let config = muted.then(|| serde_json::json!({ "selected_time_window": window_secs, "end_time": end_time }));
+    serde_json::json!({ "muted": muted, "mute_config": config })
+}
+
+pub fn channel_override_patch(channel_id: &str, fields: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "channel_overrides": { channel_id: fields } })
+}
+
+pub const STICKER_FORMAT_LOTTIE: u8 = 3;
+pub const STICKER_FORMAT_GIF: u8 = 4;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StickerItem {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub format_type: u8,
+}
+
+fn available_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Sticker {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub format_type: u8,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default = "available_by_default")]
+    pub available: bool,
+}
+
+impl Sticker {
+    pub fn matches(&self, filter: &str) -> bool {
+        filter.is_empty()
+            || self.name.to_lowercase().contains(filter)
+            || self.tags.as_deref().is_some_and(|t| t.to_lowercase().contains(filter))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StickerPack {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub stickers: Vec<Sticker>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Gif {
+    pub url: String,
+    pub src: String,
+    #[serde(default)]
+    pub gif_src: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
+impl Gif {
+    pub fn thumbnail(&self) -> &str {
+        self.preview.as_deref().or(self.gif_src.as_deref()).unwrap_or(&self.src)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -1,5 +1,5 @@
 use crate::error::ClientError;
-use crate::models::{Channel, Emoji, Guild, Message, User};
+use crate::models::{Channel, ChannelType, Emoji, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Sticker, StickerPack, User};
 use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
@@ -297,6 +297,43 @@ impl RestClient {
         self.post(&format!("/channels/{channel_id}/messages"), &body).await
     }
 
+    pub async fn send_sticker(&self, channel_id: &str, sticker_id: &str, reply_to: Option<&str>) -> Result<Message, ClientError> {
+        #[derive(Serialize)]
+        struct MessageReference<'a> {
+            message_id: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            content: &'a str,
+            sticker_ids: [&'a str; 1],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            message_reference: Option<MessageReference<'a>>,
+        }
+        let body = Body {
+            content: "",
+            sticker_ids: [sticker_id],
+            message_reference: reply_to.map(|id| MessageReference { message_id: id }),
+        };
+        self.post(&format!("/channels/{channel_id}/messages"), &body).await
+    }
+
+    pub async fn guild_stickers(&self, guild_id: &str) -> Result<Vec<Sticker>, ClientError> {
+        self.get(&format!("/guilds/{guild_id}/stickers")).await
+    }
+
+    pub async fn sticker_packs(&self) -> Result<Vec<StickerPack>, ClientError> {
+        #[derive(Deserialize)]
+        struct Packs {
+            sticker_packs: Vec<StickerPack>,
+        }
+        let packs: Packs = self.get("/sticker-packs").await?;
+        Ok(packs.sticker_packs)
+    }
+
+    pub async fn gifs(&self, query: &str) -> Result<Vec<Gif>, ClientError> {
+        self.get(&gif_path(query)).await
+    }
+
     pub async fn edit_message(&self, channel_id: &str, message_id: &str, content: &str) -> Result<Message, ClientError> {
         let body = serde_json::json!({ "content": content });
         self.request(Method::PATCH, &format!("/channels/{channel_id}/messages/{message_id}"), Some(&body)).await
@@ -342,6 +379,51 @@ impl RestClient {
             self.http.put(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}")).json(&serde_json::json!({}))
         })
         .await
+    }
+
+    pub async fn timeout_member(&self, guild_id: &str, user_id: &str, until: Option<&str>) -> Result<GuildMember, ClientError> {
+        let body = serde_json::json!({ "communication_disabled_until": until });
+        self.request(Method::PATCH, &format!("/guilds/{guild_id}/members/{user_id}"), Some(&body)).await
+    }
+
+    pub async fn set_member_role(&self, guild_id: &str, user_id: &str, role_id: &str, add: bool) -> Result<(), ClientError> {
+        let url = format!("{API_BASE}/guilds/{guild_id}/members/{user_id}/roles/{role_id}");
+        if add {
+            self.send_empty(|| self.http.put(&url).json(&serde_json::json!({}))).await
+        } else {
+            self.send_empty(|| self.http.delete(&url)).await
+        }
+    }
+
+    pub async fn create_channel(&self, guild_id: &str, name: &str, kind: ChannelType, parent_id: Option<&str>) -> Result<Channel, ClientError> {
+        let body = serde_json::json!({ "name": name, "type": kind, "parent_id": parent_id });
+        self.post(&format!("/guilds/{guild_id}/channels"), &body).await
+    }
+
+    pub async fn edit_channel(&self, channel_id: &str, name: &str, topic: Option<&str>) -> Result<Channel, ClientError> {
+        let mut body = serde_json::json!({ "name": name });
+        if let Some(topic) = topic {
+            body["topic"] = serde_json::Value::String(topic.to_string());
+        }
+        self.request(Method::PATCH, &format!("/channels/{channel_id}"), Some(&body)).await
+    }
+
+    pub async fn create_invite(&self, channel_id: &str, max_age_secs: u32, max_uses: u32) -> Result<Invite, ClientError> {
+        let body = serde_json::json!({ "max_age": max_age_secs, "max_uses": max_uses });
+        self.post(&format!("/channels/{channel_id}/invites"), &body).await
+    }
+
+    pub async fn guild_invites(&self, guild_id: &str) -> Result<Vec<Invite>, ClientError> {
+        self.get(&format!("/guilds/{guild_id}/invites")).await
+    }
+
+    pub async fn delete_invite(&self, code: &str) -> Result<(), ClientError> {
+        let code = encode_path_segment(code);
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/invites/{code}"))).await
+    }
+
+    pub async fn update_guild_settings(&self, guild_key: &str, patch: &serde_json::Value) -> Result<GuildSettings, ClientError> {
+        self.request(Method::PATCH, &format!("/users/@me/guilds/{guild_key}/settings"), Some(patch)).await
     }
 
     pub async fn ack_message(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
@@ -612,6 +694,16 @@ struct IndexingBody {
 
 pub const SEARCH_PAGE_SIZE: u32 = 25;
 
+fn gif_path(query: &str) -> String {
+    let query = query.trim();
+    let params = "media_format=gif&provider=tenor&locale=en-US";
+    if query.is_empty() {
+        format!("/gifs/trending-gifs?{params}")
+    } else {
+        format!("/gifs/search?q={}&{params}", encode_path_segment(query))
+    }
+}
+
 pub fn encode_path_segment(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -639,6 +731,12 @@ const SUPER_PROPERTIES_B64: &str = "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21l
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_gif_query_asks_for_trending() {
+        assert_eq!(gif_path("  "), "/gifs/trending-gifs?media_format=gif&provider=tenor&locale=en-US");
+        assert_eq!(gif_path("cat & dog"), "/gifs/search?q=cat%20%26%20dog&media_format=gif&provider=tenor&locale=en-US");
+    }
 
     #[test]
     fn unreserved_characters_pass_through() {

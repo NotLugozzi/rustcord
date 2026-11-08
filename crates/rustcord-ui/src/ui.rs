@@ -4072,6 +4072,24 @@ fn persist_settings(state: &AppState) {
     });
 }
 
+#[cfg(feature = "screenshare")]
+fn toggle_camera(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
+    state.camera_on = !state.camera_on;
+    let _ = cmd_tx.send(UiCommand::SetCamera {
+        enabled: state.camera_on,
+        guild_id,
+        channel_id,
+        self_mute: state.self_muted,
+        self_deaf: state.self_deafened,
+    });
+}
+
+#[cfg(feature = "screenshare")]
+fn camera_tooltip(on: bool) -> &'static str {
+    if on { "Turn off camera" } else { "Turn on camera" }
+}
+
 fn toggle_voice(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, toggle: VoiceToggle) {
     match toggle {
         VoiceToggle::Mute => state.toggle_mute(),
@@ -5021,7 +5039,7 @@ fn icon_button_sized(
 
 #[cfg(feature = "screenshare")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ServerCallIcon { Microphone, Headphones, Screen, Info, Hangup }
+enum ServerCallIcon { Microphone, Headphones, Camera, Screen, Info, Hangup }
 
 #[cfg(feature = "screenshare")]
 fn draw_server_call_button(ui: &Ui, textures: &TextureCache, id: &str, tooltip: &str, icon: ServerCallIcon, active: Option<[f32; 4]>, x: f32, y: f32, size: f32) -> bool {
@@ -5043,6 +5061,7 @@ fn draw_server_call_button(ui: &Ui, textures: &TextureCache, id: &str, tooltip: 
         (ServerCallIcon::Microphone, true) => crate::icons::Icon::MicOff,
         (ServerCallIcon::Headphones, false) => crate::icons::Icon::Headphones,
         (ServerCallIcon::Headphones, true) => crate::icons::Icon::HeadphoneOff,
+        (ServerCallIcon::Camera, _) => crate::icons::Icon::Video,
         (ServerCallIcon::Screen, _) => crate::icons::Icon::MonitorUp,
         (ServerCallIcon::Info, _) => crate::icons::Icon::Info,
         (ServerCallIcon::Hangup, _) => crate::icons::Icon::PhoneOff,
@@ -5058,7 +5077,7 @@ fn draw_server_call_button(ui: &Ui, textures: &TextureCache, id: &str, tooltip: 
 fn draw_server_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str) {
     const SIZE: f32 = 60.0;
     const GAP: f32 = 14.0;
-    const COUNT: f32 = 5.0;
+    const COUNT: f32 = 6.0;
     let width = ui.window_size()[0];
     let x = ((width - (COUNT * SIZE + (COUNT - 1.0) * GAP)) * 0.5).max(0.0);
     let y = (ui.window_size()[1] - 88.0).max(8.0);
@@ -5082,6 +5101,10 @@ fn draw_server_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCa
     if draw_server_call_button(ui, textures, "server_call_deafen", if deafened { "Undeafen" } else { "Deafen" }, ServerCallIcon::Headphones, deafened.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
         toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
     }
+    let camera = state.camera_on;
+    if draw_server_call_button(ui, textures, "server_call_camera", camera_tooltip(camera), ServerCallIcon::Camera, camera.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
+        toggle_camera(state, cmd_tx);
+    }
     let sharing = state.screen_sharing;
     if draw_server_call_button(ui, textures, "server_call_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
         if sharing {
@@ -5103,7 +5126,7 @@ fn draw_server_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCa
 fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str) {
     const SIZE: f32 = 34.0;
     const GAP: f32 = 5.0;
-    const COUNT: f32 = 5.0;
+    const COUNT: f32 = 6.0;
     let width = ui.window_size()[0];
     let x = ((width - (COUNT * SIZE + (COUNT - 1.0) * GAP)) * 0.5).max(0.0);
     let y = ui.cursor_pos()[1] + 1.0;
@@ -5121,6 +5144,10 @@ fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureC
     if draw_server_call_button(ui, textures, "server_call_sidebar_deafen", if deafened { "Undeafen" } else { "Deafen" }, ServerCallIcon::Headphones, deafened.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
         toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
     }
+    let camera = state.camera_on;
+    if draw_server_call_button(ui, textures, "server_call_sidebar_camera", camera_tooltip(camera), ServerCallIcon::Camera, camera.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
+        toggle_camera(state, cmd_tx);
+    }
     let sharing = state.screen_sharing;
     if draw_server_call_button(ui, textures, "server_call_sidebar_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
         if sharing {
@@ -5135,6 +5162,21 @@ fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureC
     }
     if draw_server_call_button(ui, textures, "server_call_sidebar_hangup", "Leave voice channel", ServerCallIcon::Hangup, None, next_x(), y, SIZE) {
         let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
+    }
+}
+
+#[cfg(any(test, feature = "screenshare"))]
+fn cover_uv(source: [f32; 2], target: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+    let source_aspect = source[0].max(1.0) / source[1].max(1.0);
+    let target_aspect = target[0].max(1.0) / target[1].max(1.0);
+    if source_aspect > target_aspect {
+        let visible = target_aspect / source_aspect;
+        let inset = (1.0 - visible) / 2.0;
+        ([inset, 0.0], [1.0 - inset, 1.0])
+    } else {
+        let visible = source_aspect / target_aspect;
+        let inset = (1.0 - visible) / 2.0;
+        ([0.0, inset], [1.0, 1.0 - inset])
     }
 }
 
@@ -5183,6 +5225,7 @@ fn draw_call_participant_tiles(
         let avatar_url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
         let avatar = textures.get_still(&avatar_url).map(|(id, _)| id);
         if avatar.is_none() { textures.request(&avatar_url, cmd_tx); }
+        let camera = textures.live_video(&crate::app_state::camera_video_key(&user.id));
         let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
         let display_name = truncate_to_width(ui, &name, tile_w - if large { 32.0 } else { 82.0 }).unwrap_or(name);
         let speaking_color = [0.26, 0.83, 0.44, 1.0];
@@ -5192,7 +5235,11 @@ fn draw_call_participant_tiles(
             let dl = ui.get_window_draw_list();
             dl.add_rect(p_min, p_max, border).filled(true).rounding(if large { 16.0 } else { 12.0 }).build();
             dl.add_rect([p_min[0] + 2.0, p_min[1] + 2.0], [p_max[0] - 2.0, p_max[1] - 2.0], fill).filled(true).rounding(if large { 14.0 } else { 10.0 }).build();
-            if let Some(texture_id) = avatar {
+            if let Some((texture_id, source)) = camera {
+                let (inner_min, inner_max) = ([p_min[0] + 2.0, p_min[1] + 2.0], [p_max[0] - 2.0, p_max[1] - 2.0]);
+                let (uv_min, uv_max) = cover_uv(source, [inner_max[0] - inner_min[0], inner_max[1] - inner_min[1]]);
+                dl.add_image_rounded(texture_id, inner_min, inner_max, if large { 14.0 } else { 10.0 }).uv_min(uv_min).uv_max(uv_max).build();
+            } else if let Some(texture_id) = avatar {
                 dl.add_image_rounded(texture_id, avatar_min, avatar_max, avatar_size * 0.5).build();
             } else {
                 dl.add_circle([avatar_min[0] + avatar_size * 0.5, avatar_min[1] + avatar_size * 0.5], avatar_size * 0.5, [0.35, 0.35, 0.40, 1.0]).filled(true).build();
@@ -5400,6 +5447,11 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
     ui.same_line_with_spacing(0.0, GAP);
     #[cfg(feature = "screenshare")]
     {
+        let camera = state.camera_on;
+        if icon_button(ui, textures, "vc_camera", crate::icons::Icon::Video, camera_tooltip(camera), camera.then_some(GREEN)) {
+            toggle_camera(state, cmd_tx);
+        }
+        ui.same_line_with_spacing(0.0, GAP);
         let active = state.screen_sharing;
         if icon_button(ui, textures, "vc_screenshare", SCREENSHARE_ICON, if active { "Stop screen sharing" } else { "Share your screen" }, active.then_some(GREEN)) {
             if active {
@@ -5583,7 +5635,10 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
         .collect();
     let in_call = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
     #[cfg(feature = "screenshare")]
-    let live_videos: Vec<_> = members.iter().map(|(user, _)| textures.live_video(&user.id)).collect();
+    let live_videos: Vec<_> = members
+        .iter()
+        .map(|(user, _)| textures.live_video(&user.id).or_else(|| textures.live_video(&crate::app_state::camera_video_key(&user.id))))
+        .collect();
     ui.child_window("dm_call_panel").size([0.0, CALL_PANEL_HEIGHT]).build(|| {
         let width = ui.window_size()[0];
         #[cfg(feature = "screenshare")]
@@ -5798,13 +5853,21 @@ fn draw_channel_header(
                 }
             }
             ui.same_line_with_spacing(0.0, ICON_GAP);
+            #[cfg(feature = "screenshare")]
+            {
+                let disabled = ui.begin_disabled(!is_connected);
+                let tint = state.camera_on.then_some(state.theme.accent);
+                let clicked = icon_button(ui, textures, "header_camera", HEADER_ICONS[1], camera_tooltip(state.camera_on), tint);
+                drop(disabled);
+                if clicked && is_connected {
+                    toggle_camera(state, cmd_tx);
+                }
+            }
+            #[cfg(not(feature = "screenshare"))]
             {
                 let disabled = ui.begin_disabled(true);
-                icon_button(ui, textures, "header_camera", HEADER_ICONS[1], "Video calls aren't supported yet", None);
+                icon_button(ui, textures, "header_camera", HEADER_ICONS[1], "Video calls aren't available in this build", None);
                 drop(disabled);
-                if ui.is_item_hovered_with_flags(imgui::ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
-                    ui.tooltip_text("Video calls aren't supported yet");
-                }
             }
             ui.same_line_with_spacing(0.0, ICON_GAP);
 
@@ -6882,6 +6945,48 @@ fn draw_settings_voice(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
         });
         let _ = cmd_tx.send(UiCommand::SetMicProcessing { gain: state.mic_gain, denoise: state.denoise });
     }
+
+    #[cfg(feature = "screenshare")]
+    draw_camera_settings(ui, state, cmd_tx);
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_camera_settings(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    if !state.cameras_loaded {
+        state.cameras_loaded = true;
+        let _ = cmd_tx.send(UiCommand::LoadCameras);
+    }
+    ui.spacing();
+    ui.text_colored(state.theme.text_muted, "Camera");
+    let current = match &state.camera_device {
+        None => "Default".to_string(),
+        Some(id) => state.cameras.iter().find(|(cid, _)| cid == id).map_or_else(|| id.clone(), |(_, name)| name.clone()),
+    };
+    let mut picked: Option<Option<String>> = None;
+    ui.set_next_item_width(-80.0);
+    if let Some(_token) = ui.begin_combo("##camera_device", &current) {
+        if ui.selectable_config("Default").selected(state.camera_device.is_none()).build() {
+            picked = Some(None);
+        }
+        for (id, name) in &state.cameras {
+            if ui.selectable_config(format!("{name}##{id}")).selected(state.camera_device.as_deref() == Some(id.as_str())).build() {
+                picked = Some(Some(id.clone()));
+            }
+        }
+    }
+    ui.same_line();
+    if ui.button("Refresh##cameras") {
+        let _ = cmd_tx.send(UiCommand::LoadCameras);
+    }
+    if state.cameras_loaded && state.cameras.is_empty() {
+        ui.text_disabled("No cameras found.");
+    }
+    if let Some(device) = picked {
+        state.camera_device = device.clone();
+        persist_settings(state);
+        let _ = cmd_tx.send(UiCommand::SetCameraDevice { device });
+    }
+    ui.text_disabled("A new camera applies the next time you turn your camera on.");
 }
 
 fn draw_settings_keybinds(ui: &Ui, state: &mut AppState) {
@@ -7674,5 +7779,29 @@ mod line_break_tests {
     #[test]
     fn leading_whitespace_is_not_a_break_point() {
         assert_eq!(line_break(" abc def", 4.0, false, chars), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod cover_uv_tests {
+    use super::cover_uv;
+
+    #[test]
+    fn a_wide_source_is_cropped_at_the_sides() {
+        let (min, max) = cover_uv([1280.0, 720.0], [100.0, 100.0]);
+        assert!((min[0] - 0.21875).abs() < 1e-4 && (max[0] - 0.78125).abs() < 1e-4, "{min:?} {max:?}");
+        assert_eq!((min[1], max[1]), (0.0, 1.0));
+    }
+
+    #[test]
+    fn a_tall_source_is_cropped_top_and_bottom() {
+        let (min, max) = cover_uv([100.0, 200.0], [200.0, 100.0]);
+        assert_eq!((min[0], max[0]), (0.0, 1.0));
+        assert!((min[1] - 0.375).abs() < 1e-4 && (max[1] - 0.625).abs() < 1e-4, "{min:?} {max:?}");
+    }
+
+    #[test]
+    fn matching_aspects_use_the_whole_image() {
+        assert_eq!(cover_uv([1280.0, 720.0], [640.0, 360.0]), ([0.0, 0.0], [1.0, 1.0]));
     }
 }

@@ -212,6 +212,7 @@ pub struct StickerSection<'a> {
     pub stickers: Vec<&'a rustcord_client::models::Sticker>,
 }
 
+#[cfg(feature = "screenshare")]
 pub fn camera_video_key(user_id: &str) -> String {
     format!("camera:{user_id}")
 }
@@ -1614,6 +1615,7 @@ impl AppState {
             clock_24h: self.clock_24h,
             self_mute: self.self_muted,
             self_deaf: self.self_deafened,
+            camera_device: self.camera_device.clone(),
             ..Default::default()
         }
     }
