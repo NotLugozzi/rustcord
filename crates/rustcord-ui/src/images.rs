@@ -181,6 +181,36 @@ struct LiveVideoTexture {
 }
 
 impl TextureCache {
+    pub fn stats(&self) -> crate::devtools::TextureStats {
+        let mut stats = crate::devtools::TextureStats { bytes: self.total_bytes, icons: self.icons.len(), ..Default::default() };
+        stats.icon_bytes = self.icons.keys().map(|(_, size)| (*size as usize).pow(2) * 4).sum();
+        for entry in self.entries.values() {
+            match entry {
+                Entry::Loaded { kind: Kind::Static { .. }, bytes, .. } => {
+                    stats.images += 1;
+                    stats.image_bytes += bytes;
+                }
+                Entry::Loaded { kind: Kind::Animated { .. }, bytes, .. } => {
+                    stats.animated += 1;
+                    stats.animated_bytes += bytes;
+                }
+                #[cfg(feature = "video")]
+                Entry::Loaded { kind: Kind::Video(_), bytes, .. } => {
+                    stats.videos += 1;
+                    stats.video_bytes += bytes;
+                }
+                Entry::Pending => stats.pending += 1,
+                Entry::Failed => stats.failed += 1,
+            }
+        }
+        #[cfg(feature = "screenshare")]
+        {
+            stats.live_videos = self.live_videos.len();
+            stats.live_video_bytes = self.live_videos.values().map(|live| (live.dimensions.0 * live.dimensions.1 * 4) as usize).sum();
+        }
+        stats
+    }
+
     #[cfg(feature = "screenshare")]
     pub fn ingest_live_video(
         &mut self,

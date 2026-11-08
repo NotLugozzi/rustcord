@@ -442,6 +442,7 @@ pub struct AppState {
     pub poll_views: HashMap<String, PollView>,
     pub poll_card_heights: HashMap<String, f32>,
     pub poll_draft: Option<PollDraft>,
+    pub devtools_requested: bool,
     pub next_attachment_id: u64,
     pub attachment_previews_requested: std::collections::HashSet<u64>,
     pub revealed_spoilers: std::collections::HashSet<usize>,

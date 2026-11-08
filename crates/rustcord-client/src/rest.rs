@@ -72,12 +72,10 @@ impl LoginSession {
             captcha_key: captcha.map(|(token, _)| token),
             captcha_rqtoken: captcha.and_then(|(_, c)| c.captcha_rqtoken.as_deref()),
         };
-        let resp = self
+        let resp = dispatch(self
             .http
             .post(format!("{API_BASE}/auth/login"))
-            .json(&body)
-            .send()
-            .await?;
+            .json(&body)).await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
 
@@ -109,12 +107,10 @@ impl LoginSession {
         struct Resp {
             token: String,
         }
-        let resp = self
+        let resp = dispatch(self
             .http
             .post(format!("{API_BASE}/auth/mfa/totp"))
-            .json(&Body { code, ticket })
-            .send()
-            .await?;
+            .json(&Body { code, ticket })).await?;
         let status = resp.status();
         if !status.is_success() {
             let message = resp.text().await.unwrap_or_default();
@@ -122,6 +118,44 @@ impl LoginSession {
         }
         Ok(resp.json::<Resp>().await?.token)
     }
+}
+
+async fn dispatch(builder: reqwest::RequestBuilder) -> Result<Response, reqwest::Error> {
+    if !crate::devtools::capturing() {
+        return builder.send().await;
+    }
+    let (client, request) = builder.build_split();
+    let request = request?;
+    let path = match request.url().query() {
+        Some(query) => format!("{}?{query}", request.url().path()),
+        None => request.url().path().to_string(),
+    };
+    let body = request.body().map(|body| body.as_bytes().unwrap_or(b"[streamed multipart body]"));
+    let id = crate::devtools::begin_http(request.method().as_str(), &path, body);
+    let started = std::time::Instant::now();
+    let response = match client.execute(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            crate::devtools::finish_http(id, None, started.elapsed(), Err(error.to_string()));
+            return Err(error);
+        }
+    };
+    let status = response.status();
+    let version = response.version();
+    let headers = response.headers().clone();
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            crate::devtools::finish_http(id, Some(status.as_u16()), started.elapsed(), Err(error.to_string()));
+            return Err(error);
+        }
+    };
+    crate::devtools::finish_http(id, Some(status.as_u16()), started.elapsed(), Ok(&bytes));
+    let mut rebuilt = http::Response::new(bytes);
+    *rebuilt.status_mut() = status;
+    *rebuilt.version_mut() = version;
+    *rebuilt.headers_mut() = headers;
+    Ok(Response::from(rebuilt))
 }
 
 #[derive(Debug, Clone)]
@@ -579,12 +613,10 @@ impl RestClient {
             form = form.part(format!("files[{index}]"), part);
         }
 
-        let resp = self
+        let resp = dispatch(self
             .http
             .post(format!("{API_BASE}/channels/{channel_id}/messages"))
-            .multipart(form)
-            .send()
-            .await?;
+            .multipart(form)).await?;
         let status = resp.status();
         if !status.is_success() {
             let message = resp.text().await.unwrap_or_default();
@@ -639,7 +671,7 @@ impl RestClient {
         F: Fn() -> reqwest::RequestBuilder,
     {
         for attempt in 1..=MAX_RATE_LIMIT_ATTEMPTS {
-            let resp = build().send().await?;
+            let resp = dispatch(build()).await?;
             let status = resp.status();
             if status.is_success() {
                 return Ok(resp);

@@ -176,7 +176,17 @@ impl VoiceGateway {
         if self.stream_media {
             tracing::info!("screen share voice websocket connected");
         }
-        let (mut write, mut read) = ws_stream.split();
+        let (write, read) = ws_stream.split();
+        let socket_kind = if self.stream_media { crate::devtools::SocketKind::Stream } else { crate::devtools::SocketKind::Voice };
+        let mut write = write.with(move |message: WsMessage| {
+            crate::devtools::record_ws_message(socket_kind, crate::devtools::Direction::Outgoing, &message);
+            futures_util::future::ready(Ok::<_, tokio_tungstenite::tungstenite::Error>(message))
+        });
+        let mut read = read.inspect(move |frame| {
+            if let Ok(message) = frame {
+                crate::devtools::record_ws_message(socket_kind, crate::devtools::Direction::Incoming, message);
+            }
+        });
 
         let hello = read
             .next()

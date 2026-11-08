@@ -6750,6 +6750,7 @@ dependencies = [
  "futures-util",
  "ghash",
  "hmac 0.12.1",
+ "http",
  "libspa-sys",
  "nnnoiseless",
  "openmls",

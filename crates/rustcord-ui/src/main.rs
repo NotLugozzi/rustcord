@@ -2,6 +2,7 @@ mod app_state;
 mod build_info;
 mod backend;
 mod clipboard;
+mod devtools;
 mod emoji;
 mod icons;
 mod images;
@@ -44,7 +45,17 @@ pub(crate) fn show_notification(notification: &notify_rust::Notification) {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::{EnvFilter, Layer};
+        let console = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let captured = EnvFilter::new("info,rustcord=debug,rustcord_client=debug");
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_filter(console))
+            .with(devtools::LogCapture.with_filter(captured))
+            .init();
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();

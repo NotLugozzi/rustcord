@@ -173,7 +173,16 @@ impl Gateway {
     ) -> Result<(), ClientError> {
         let url = session.resume_gateway_url.as_deref().unwrap_or(GATEWAY_URL);
         let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
-        let (mut write, mut read) = ws_stream.split();
+        let (write, read) = ws_stream.split();
+        let mut write = write.with(|message: WsMessage| {
+            crate::devtools::record_ws_message(crate::devtools::SocketKind::Gateway, crate::devtools::Direction::Outgoing, &message);
+            futures_util::future::ready(Ok::<_, tokio_tungstenite::tungstenite::Error>(message))
+        });
+        let mut read = read.inspect(|frame| {
+            if let Ok(message) = frame {
+                crate::devtools::record_ws_message(crate::devtools::SocketKind::Gateway, crate::devtools::Direction::Incoming, message);
+            }
+        });
 
         let hello = read
             .next()

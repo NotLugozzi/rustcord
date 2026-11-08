@@ -4,6 +4,7 @@ pub mod camera_capture;
 pub mod cdn;
 pub mod dave;
 pub mod dave_frame_crypto;
+pub mod devtools;
 pub mod error;
 pub mod models;
 pub mod permissions;

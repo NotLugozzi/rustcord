@@ -480,31 +480,23 @@ fn draw_reaction_row(
     }
 }
 
+fn last_fitting(candidates: &[usize], fits: impl Fn(usize) -> bool) -> Option<usize> {
+    let count = candidates.partition_point(|&end| fits(end));
+    count.checked_sub(1).map(|index| candidates[index])
+}
+
 fn line_break(text: &str, avail: f32, at_line_start: bool, measure: impl Fn(&str) -> f32) -> Option<usize> {
     if measure(text) <= avail {
         return Some(text.len());
     }
-    let mut best = None;
-    for (idx, ch) in text.char_indices() {
-        if !ch.is_whitespace() || idx == 0 {
-            continue;
-        }
-        if measure(&text[..idx]) > avail {
-            break;
-        }
-        best = Some(idx);
-    }
+    let fits = |end: usize| measure(&text[..end]) <= avail;
+    let spaces: Vec<usize> = text.char_indices().filter(|&(idx, ch)| idx > 0 && ch.is_whitespace()).map(|(idx, _)| idx).collect();
+    let best = last_fitting(&spaces, &fits);
     if best.is_some() || !at_line_start {
         return best;
     }
-    let mut end = text.chars().next().map_or(text.len(), char::len_utf8);
-    for (idx, _) in text.char_indices().skip(1) {
-        if measure(&text[..idx]) > avail {
-            break;
-        }
-        end = idx;
-    }
-    Some(end)
+    let boundaries: Vec<usize> = text.char_indices().skip(1).map(|(idx, _)| idx).collect();
+    Some(last_fitting(&boundaries, &fits).unwrap_or_else(|| text.chars().next().map_or(text.len(), char::len_utf8)))
 }
 
 fn flow_wrap(ui: &Ui, width: f32, line_start: f32) {
@@ -2889,6 +2881,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             right,
             left,
         );
+    }
+    if ui.io().key_ctrl && ui.io().key_shift && ui.is_key_pressed(imgui::Key::I) {
+        state.devtools_requested = true;
     }
     if !state.logged_in {
         draw_login(ui, state, cmd_tx);
@@ -7195,7 +7190,7 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                     SettingsCategory::VoiceVideo => draw_settings_voice(ui, state, cmd_tx),
                     SettingsCategory::Keybinds => draw_settings_keybinds(ui, state),
                     SettingsCategory::Appearance => draw_settings_appearance(ui, state),
-                    SettingsCategory::About => draw_settings_about(ui, textures),
+                    SettingsCategory::About => draw_settings_about(ui, state, textures),
                 }
             });
         });
@@ -7460,7 +7455,7 @@ fn draw_settings_keybinds(ui: &Ui, state: &mut AppState) {
     }
 }
 
-fn draw_settings_about(ui: &Ui, textures: &TextureCache) {
+fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache) {
     use crate::build_info;
 
     const LOGO_SIZE: f32 = 44.0;
@@ -7511,6 +7506,16 @@ fn draw_settings_about(ui: &Ui, textures: &TextureCache) {
         row("Committed", date, false);
     }
     row("Video playback", if cfg!(feature = "video") { "enabled" } else { "not built in" }, false);
+
+    ui.dummy([0.0, 10.0]);
+    ui.separator();
+    ui.dummy([0.0, 6.0]);
+    if ui.button("Open developer tools") {
+        state.devtools_requested = true;
+    }
+    ui.same_line();
+    ui.text_disabled("Ctrl+Shift+I");
+    ui.text_disabled("Logs, API requests and gateway/voice socket frames. Tokens and passwords are redacted.");
 }
 
 fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
