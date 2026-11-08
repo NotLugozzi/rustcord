@@ -14,20 +14,18 @@ Use at your own risk.
 ## Status
 
 rustcord is close to feature parity with the official client for everyday
-use. That covers servers, DMs and group DMs, voice calls, screen sharing
-(Linux), message markdown and embeds, reactions, GIFs, stickers and
+use. That covers servers, DMs and group DMs, voice calls, screen sharing and
+camera video (Linux), polls, message markdown and embeds, reactions, GIFs, stickers and
 emoji, search, unread and mention tracking, notification and mute
-settings, and most server admin actions. Video playback and screen sharing
+settings, and most server admin actions. Video playback, screen sharing and camera
 are behind the optional `video` and `screenshare` cargo features (both
 need ffmpeg).
 
 What's still missing:
 
-- Camera video in calls (sending and receiving webcams)
-- Screen sharing on Windows and macOS
+- Screen sharing and camera on Windows and macOS
 - Threads, and forum channels, which are built on threads
 - Slash commands and bot interactions (buttons, select menus)
-- Polls
 - Voice message sending and message forwarding
 - Push-to-talk and global hotkeys
 - Stage channels behave like ordinary voice channels
