@@ -2790,6 +2790,338 @@ fn draw_attachments(
     }
 }
 
+const VOICE_CARD_MAX_WIDTH: f32 = 400.0;
+const VOICE_CARD_HEIGHT: f32 = 52.0;
+const VOICE_PLAY_SIZE: f32 = 34.0;
+const WAVEFORM_BAR: f32 = 3.0;
+const WAVEFORM_GAP: f32 = 2.0;
+const RECORDING_RED: [f32; 4] = [0.93, 0.26, 0.27, 1.0];
+
+fn format_clip_time(secs: f64) -> String {
+    let secs = secs.max(0.0).round() as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+fn waveform_bar_count(width: f32) -> usize {
+    ((width + WAVEFORM_GAP) / (WAVEFORM_BAR + WAVEFORM_GAP)).floor().max(0.0) as usize
+}
+
+fn draw_waveform_bars(dl: &imgui::DrawListMut, min: [f32; 2], height: f32, levels: &[f32], played: f32, played_color: [f32; 4], rest_color: [f32; 4]) {
+    let mid = min[1] + height / 2.0;
+    let count = levels.len().max(1) as f32;
+    for (index, level) in levels.iter().enumerate() {
+        let x = min[0] + index as f32 * (WAVEFORM_BAR + WAVEFORM_GAP);
+        let half = (level.clamp(0.0, 1.0) * height / 2.0).max(1.5);
+        let color = if (index as f32 + 0.5) / count <= played { played_color } else { rest_color };
+        dl.add_rect([x, mid - half], [x + WAVEFORM_BAR, mid + half], color).filled(true).rounding(WAVEFORM_BAR / 2.0).build();
+    }
+}
+
+fn draw_voice_messages(
+    ui: &Ui,
+    state: &mut AppState,
+    textures: &TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    attachments: &[rustcord_client::models::Attachment],
+) {
+    for attachment in attachments {
+        draw_voice_message(ui, state, textures, cmd_tx, attachment);
+    }
+}
+
+fn draw_voice_message(
+    ui: &Ui,
+    state: &mut AppState,
+    textures: &TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    attachment: &rustcord_client::models::Attachment,
+) {
+    use crate::app_state::VoiceClip;
+    let url = attachment.url.as_str();
+    let _id = ui.push_id(url);
+    let theme = state.theme.clone();
+    let width = ui.content_region_avail()[0].min(VOICE_CARD_MAX_WIDTH).max(220.0);
+    let origin = ui.cursor_screen_pos();
+    let max = [origin[0] + width, origin[1] + VOICE_CARD_HEIGHT];
+    ui.get_window_draw_list().add_rect(origin, max, theme.panel).filled(true).rounding(10.0).build();
+
+    let progress = state.voice_clip_progress(url);
+    let playing = progress.is_some_and(|(_, playing)| playing);
+    let fraction = progress.map_or(0.0, |(fraction, _)| fraction);
+    let (loading, failed, loaded_secs) = match state.voice_clips.get(url) {
+        Some(VoiceClip::Loading) => (true, None, None),
+        Some(VoiceClip::Failed(e)) => (false, Some(e.clone()), None),
+        Some(VoiceClip::Ready(samples)) => (false, None, Some(rustcord_client::voice_message::duration_secs(samples))),
+        None => (false, None, None),
+    };
+    let duration = attachment.duration_secs.or(loaded_secs).unwrap_or(0.0);
+
+    let pad = (VOICE_CARD_HEIGHT - VOICE_PLAY_SIZE) / 2.0;
+    let button_min = [origin[0] + pad, origin[1] + pad];
+    ui.set_cursor_screen_pos(button_min);
+    let play_clicked = ui.invisible_button("voice_play", [VOICE_PLAY_SIZE, VOICE_PLAY_SIZE]);
+    let play_hovered = ui.is_item_hovered();
+    let center = [button_min[0] + VOICE_PLAY_SIZE / 2.0, button_min[1] + VOICE_PLAY_SIZE / 2.0];
+    let fill = if play_hovered { theme.accent_hover } else { theme.accent };
+    let dl = ui.get_window_draw_list();
+    dl.add_circle(center, VOICE_PLAY_SIZE / 2.0, fill).filled(true).build();
+    let icon = if playing {
+        crate::icons::Icon::Pause
+    } else if progress.is_some_and(|(fraction, _)| fraction >= 1.0) {
+        crate::icons::Icon::Replay
+    } else {
+        crate::icons::Icon::Play
+    };
+    let icon_size = VOICE_PLAY_SIZE * 0.5;
+    let icon_alpha = if loading { 0.45 + 0.35 * (ui.time() as f32 * 4.0).sin().abs() } else { 1.0 };
+    draw_icon_at(ui, textures, icon, [center[0] - icon_size / 2.0, center[1] - icon_size / 2.0], icon_size, [1.0, 1.0, 1.0, icon_alpha]);
+    if play_hovered {
+        ui.tooltip_text(match (&failed, playing) {
+            (Some(_), _) => "Retry",
+            (None, true) => "Pause",
+            (None, false) => "Play",
+        });
+    }
+
+    let label = match (&failed, progress) {
+        (Some(_), _) => "Failed".to_string(),
+        (None, Some((fraction, _))) if fraction > 0.0 && fraction < 1.0 => format_clip_time(fraction as f64 * duration),
+        _ => format_clip_time(duration),
+    };
+    let label_size = ui.calc_text_size(&label);
+    let label_pos = [max[0] - pad - label_size[0], origin[1] + (VOICE_CARD_HEIGHT - label_size[1]) / 2.0];
+    dl.add_text(label_pos, if failed.is_some() { RECORDING_RED } else { theme.text_muted }, &label);
+
+    let wave_min = [button_min[0] + VOICE_PLAY_SIZE + 12.0, origin[1] + 12.0];
+    let wave_width = (label_pos[0] - 12.0 - wave_min[0]).max(0.0);
+    let wave_height = VOICE_CARD_HEIGHT - 24.0;
+    let source = attachment.waveform.as_deref().map(rustcord_client::voice_message::decode_waveform).unwrap_or_default();
+    let bars = waveform_bar_count(wave_width);
+    let levels = if source.is_empty() { vec![0.25; bars] } else { rustcord_client::voice_message::resample_waveform(&source, bars) };
+    let rest = [theme.text_muted[0], theme.text_muted[1], theme.text_muted[2], theme.text_muted[3] * 0.55];
+    draw_waveform_bars(&dl, wave_min, wave_height, &levels, fraction, theme.accent, rest);
+
+    ui.set_cursor_screen_pos(wave_min);
+    let seek_clicked = ui.invisible_button("voice_seek", [wave_width.max(1.0), wave_height]);
+    if ui.is_item_hovered() {
+        ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+        if let Some(e) = &failed {
+            ui.tooltip_text(e);
+        }
+    }
+    if seek_clicked {
+        let fraction = ((ui.io().mouse_pos[0] - wave_min[0]) / wave_width.max(1.0)).clamp(0.0, 1.0);
+        if matches!(state.voice_clips.get(url), Some(VoiceClip::Ready(_))) {
+            state.seek_voice_clip(url, fraction);
+        } else {
+            state.toggle_voice_clip(url, cmd_tx);
+        }
+    } else if play_clicked {
+        state.toggle_voice_clip(url, cmd_tx);
+    }
+
+    ui.set_cursor_screen_pos(origin);
+    ui.dummy([width, VOICE_CARD_HEIGHT]);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_forwarded(
+    ui: &Ui,
+    fonts: &Fonts,
+    state: &mut AppState,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    msg: &rustcord_client::models::Message,
+    snapshot: &rustcord_client::models::SnapshotMessage,
+    channel_names: &HashMap<String, String>,
+    role_names: &HashMap<String, (String, Option<[f32; 4]>)>,
+) {
+    let start = ui.cursor_screen_pos();
+    ui.indent_by(FORWARD_INDENT);
+    ui.group(|| {
+        draw_icon(ui, textures, crate::icons::Icon::Forward, 14.0, state.theme.text_muted);
+        ui.same_line_with_spacing(0.0, 4.0);
+        timestamp_text(ui, state.theme.text_muted, "Forwarded", "Forwarded message", 0.85);
+        if !snapshot.content.is_empty() {
+            let seed = format!("{}_fwd", msg.id);
+            draw_markdown(ui, fonts, &state.theme, &snapshot.content, &mut state.revealed_spoilers, &seed, textures, cmd_tx, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names, role_names });
+        }
+        for (embed_idx, embed) in snapshot.embeds.iter().enumerate() {
+            draw_embed(ui, fonts, &state.theme, embed, &format!("{}_fwd_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names, role_names });
+        }
+        if snapshot.is_voice_message() {
+            draw_voice_messages(ui, state, textures, cmd_tx, &snapshot.attachments);
+        } else {
+            draw_attachments(ui, cmd_tx, textures, &snapshot.attachments, &mut state.image_lightbox);
+        }
+        draw_sticker_items(ui, &state.theme, textures, cmd_tx, &snapshot.sticker_items);
+        let reference = msg.message_reference.as_ref();
+        let source_channel = reference.and_then(|r| r.channel_id.clone());
+        let when = chrono::DateTime::parse_from_rfc3339(&snapshot.timestamp)
+            .map(|dt| crate::timefmt::TimeFormat::resolve(state.clock_24h).short_datetime(&dt.with_timezone(&chrono::Local)))
+            .unwrap_or_default();
+        let footer = match source_channel.as_ref().and_then(|id| channel_names.get(id)) {
+            Some(name) if when.is_empty() => format!("#{name}"),
+            Some(name) => format!("#{name}  \u{2022}  {when}"),
+            None => when,
+        };
+        if !footer.is_empty() {
+            ui.set_window_font_scale(0.8);
+            let jump = reference.and_then(|r| Some((r.channel_id.clone()?, r.message_id.clone()?)));
+            let clicked = clickable_text(ui, &format!("fwd_src_{}", msg.id), &footer, state.theme.text_muted);
+            ui.set_window_font_scale(1.0);
+            if let (true, Some((channel_id, message_id))) = (clicked, jump) {
+                let _ = cmd_tx.send(UiCommand::JumpToMessage { channel_id, message_id });
+            }
+        }
+    });
+    ui.unindent_by(FORWARD_INDENT);
+    let end = ui.item_rect_max()[1];
+    ui.get_window_draw_list()
+        .add_rect([start[0], start[1]], [start[0] + 3.0, end], state.theme.border)
+        .filled(true)
+        .rounding(1.5)
+        .build();
+}
+
+const FORWARD_INDENT: f32 = 12.0;
+
+#[allow(clippy::too_many_arguments)]
+fn draw_message_media(
+    ui: &Ui,
+    fonts: &Fonts,
+    state: &mut AppState,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    msg: &rustcord_client::models::Message,
+    channel_names: &HashMap<String, String>,
+    role_names: &HashMap<String, (String, Option<[f32; 4]>)>,
+) {
+    if let Some(snapshot) = msg.forwarded() {
+        draw_forwarded(ui, fonts, state, textures, cmd_tx, msg, snapshot, channel_names, role_names);
+    }
+    if msg.poll.is_some() {
+        draw_poll(ui, fonts, state, textures, cmd_tx, msg);
+    }
+    if msg.is_voice_message() {
+        draw_voice_messages(ui, state, textures, cmd_tx, &msg.attachments);
+    } else {
+        draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
+    }
+    draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
+}
+
+fn draw_recording_bar(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, start: [f32; 2], width: f32) {
+    let height = ui.frame_height();
+    let spacing = ui.clone_style().item_spacing[0];
+    let theme = state.theme.clone();
+    let Some(recording) = state.voice_recording.as_mut() else { return };
+    recording.sample_level();
+    let elapsed = recording.recorder.duration_secs();
+    let levels: Vec<f32> = recording.levels.iter().map(|l| l.sqrt()).collect();
+
+    let discard = icon_button_sized(ui, textures, "voice_discard", crate::icons::Icon::Trash, "Discard (Esc)", Some(RECORDING_RED), height);
+    ui.same_line();
+    let x0 = ui.cursor_screen_pos()[0];
+    let mid = start[1] + height / 2.0;
+    let dl = ui.get_window_draw_list();
+    let pulse = 0.55 + 0.45 * (ui.time() as f32 * 3.0).sin().abs();
+    dl.add_circle([x0 + 6.0, mid], 5.0, [RECORDING_RED[0], RECORDING_RED[1], RECORDING_RED[2], pulse]).filled(true).build();
+    let time = format_clip_time(elapsed);
+    let time_size = ui.calc_text_size(&time);
+    dl.add_text([x0 + 18.0, mid - time_size[1] / 2.0], theme.text, &time);
+
+    let send_x = start[0] + width - height;
+    let bars_min = x0 + 18.0 + time_size[0] + 14.0;
+    let bars_width = (send_x - spacing - 8.0 - bars_min).max(0.0);
+    let count = waveform_bar_count(bars_width).min(levels.len());
+    let shown = &levels[levels.len() - count..];
+    let bars_x = bars_min + bars_width - count as f32 * (WAVEFORM_BAR + WAVEFORM_GAP);
+    draw_waveform_bars(&dl, [bars_x, start[1] + 8.0], height - 16.0, shown, 1.0, theme.accent, theme.accent);
+    if count == 0 {
+        let hint = "Recording... Enter to send, Esc to discard";
+        dl.add_text([bars_min, mid - ui.text_line_height() / 2.0], theme.text_muted, hint);
+    }
+
+    ui.set_cursor_screen_pos([send_x, start[1]]);
+    let send = icon_button_sized(ui, textures, "voice_send", crate::icons::Icon::Send, "Send (Enter)", Some(theme.accent), height);
+    let enter = ui.is_key_pressed(imgui::Key::Enter) || ui.is_key_pressed(imgui::Key::KeypadEnter);
+    let limit = elapsed >= rustcord_client::voice_message::MAX_RECORDING_SECS;
+    if send || enter || limit {
+        state.finish_voice_recording(true, cmd_tx);
+    } else if discard || ui.is_key_pressed(imgui::Key::Escape) {
+        state.finish_voice_recording(false, cmd_tx);
+    }
+}
+
+fn draw_forward_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some(query) = state.forward_dialog.as_ref().map(|d| d.query.clone()) else { return };
+    let targets = state.forward_targets(&query);
+    let theme = state.theme.clone();
+    let Some(dialog) = state.forward_dialog.as_mut() else { return };
+    let mut open = true;
+    let mut send = false;
+    let display = ui.io().display_size;
+    ui.window("Forward To")
+        .opened(&mut open)
+        .size([440.0, 0.0], imgui::Condition::Always)
+        .position([display[0] / 2.0, display[1] / 2.0], imgui::Condition::Appearing)
+        .position_pivot([0.5, 0.5])
+        .collapsible(false)
+        .resizable(false)
+        .build(|| {
+            ui.text_colored(theme.text_muted, format!("Select where you want to share this message (up to {}).", crate::app_state::MAX_FORWARD_TARGETS));
+            ui.set_next_item_width(-1.0);
+            if ui.is_window_appearing() {
+                ui.set_keyboard_focus_here();
+            }
+            ui.input_text("##forward_query", &mut dialog.query).hint("Search").build();
+            ui.child_window("forward_targets").size([0.0, 260.0]).border(true).build(|| {
+                if targets.is_empty() {
+                    ui.text_disabled("No matching conversations");
+                }
+                for target in &targets {
+                    let selected = dialog.selected.contains(&target.channel_id);
+                    let full = !selected && dialog.selected.len() >= crate::app_state::MAX_FORWARD_TARGETS;
+                    let disabled = ui.begin_disabled(full);
+                    if ui.selectable_config(format!("{}##fwd_{}", target.label, target.channel_id)).selected(selected).build() {
+                        dialog.toggle(&target.channel_id);
+                    }
+                    drop(disabled);
+                    if let Some(detail) = &target.detail {
+                        ui.same_line();
+                        let width = ui.calc_text_size(detail)[0];
+                        let right = ui.content_region_max()[0];
+                        ui.set_cursor_pos([(right - width).max(ui.cursor_pos()[0]), ui.cursor_pos()[1]]);
+                        ui.text_colored(theme.text_muted, detail);
+                    }
+                }
+            });
+            ui.spacing();
+            ui.text_colored(theme.text_muted, "Message");
+            ui.text_wrapped(&dialog.preview);
+            ui.spacing();
+            ui.set_next_item_width(-1.0);
+            ui.input_text("##forward_note", &mut dialog.note).hint("Add an optional message...").build();
+            ui.spacing();
+            let disabled = ui.begin_disabled(dialog.selected.is_empty());
+            let label = match dialog.selected.len() {
+                0 | 1 => "Send".to_string(),
+                n => format!("Send to {n}"),
+            };
+            if ui.button(label) {
+                send = true;
+            }
+            drop(disabled);
+        });
+    if send {
+        let dialog = state.forward_dialog.take().expect("dialog present");
+        let _ = cmd_tx.send(UiCommand::ForwardMessage { source: dialog.source, targets: dialog.selected, note: dialog.note });
+    } else if !open {
+        state.forward_dialog = None;
+    }
+}
+
 fn draw_image_mosaic(
     ui: &Ui,
     cmd_tx: &UnboundedSender<UiCommand>,
@@ -3291,7 +3623,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let extra_banner_height = (typing_visible as u32 as f32
                 + state.reply_target.is_some() as u32 as f32
                 + state.editing.is_some() as u32 as f32
-                + state.uploads.len() as f32)
+                + state.uploads.len() as f32
+                + state.voice_messages_sending.contains(&channel_key) as u32 as f32)
                 * line_height
                 + if state.pending_attachments.contains_key(&channel_key) { ATTACHMENT_TRAY_HEIGHT + ui.clone_style().item_spacing[1] } else { 0.0 };
 
@@ -3423,11 +3756,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
                                     draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
-                                if msg.poll.is_some() {
-                                    draw_poll(ui, fonts, state, textures, cmd_tx, msg);
-                                }
-                                draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
-                                draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
+                                draw_message_media(ui, fonts, state, textures, cmd_tx, msg, &channel_names, &role_names);
                                 for code in &row.invites {
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
@@ -3449,11 +3778,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
                                     draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
-                                if msg.poll.is_some() {
-                                    draw_poll(ui, fonts, state, textures, cmd_tx, msg);
-                                }
-                                draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
-                                draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
+                                draw_message_media(ui, fonts, state, textures, cmd_tx, msg, &channel_names, &role_names);
                                 for code in &row.invites {
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
@@ -3485,6 +3810,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         ui.popup(format!("msg_ctx_menu_{}", msg.id), || {
                             if ui.menu_item("Reply") {
                                 state.reply_target = Some((**msg).clone());
+                            }
+                            if ui.menu_item("Forward") {
+                                state.forward_dialog = Some(crate::app_state::ForwardDialog::for_message(msg));
                             }
                             if ui.menu_item("Add Reaction") {
                                 state.emoji_picker_target = Some((msg.channel_id.clone(), msg.id.clone()));
@@ -3615,6 +3943,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if let Some(channel_id) = state.selected_channel.clone() {
                 draw_attachment_tray(ui, state, textures, cmd_tx, &channel_id);
             }
+            if state.selected_channel.as_ref().is_some_and(|c| state.voice_messages_sending.contains(c)) {
+                ui.text_colored(state.theme.text_muted, "Sending voice message...");
+            }
 
             let mut cancelled_upload = None;
             for upload in &state.uploads {
@@ -3653,6 +3984,13 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .rounding(COMPOSER_ROUNDING)
                 .build();
 
+            if state.voice_recording.as_ref().is_some_and(|r| state.selected_channel.as_ref() != Some(&r.channel_id)) {
+                state.finish_voice_recording(false, cmd_tx);
+            }
+            if state.voice_recording.is_some() {
+                draw_recording_bar(ui, state, textures, cmd_tx, bar_start, bar_width);
+                return;
+            }
             let composer_icon = ui.frame_height();
             let attach_tint = state.selected_channel.as_ref().is_some_and(|c| state.pending_attachments.contains_key(c)).then_some(state.theme.accent);
             if icon_button_sized(ui, textures, "compose_attach", crate::icons::Icon::CirclePlus, "Upload files or create a poll", attach_tint, composer_icon) {
@@ -3686,6 +4024,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 ("compose_gif", crate::icons::Icon::Gif, "GIFs"),
                 ("compose_sticker", crate::icons::Icon::Sticker, "Stickers"),
                 ("compose_emoji", crate::icons::Icon::Smile, "Emoji"),
+                ("compose_voice", crate::icons::Icon::Mic, "Record a voice message"),
             ];
             let right_width = right_pickers.len() as f32 * (composer_icon + spacing);
             ui.same_line();
@@ -3734,6 +4073,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         crate::icons::Icon::Sticker => {
                             state.request_stickers(cmd_tx);
                             ui.open_popup("sticker_picker");
+                        }
+                        crate::icons::Icon::Mic => {
+                            if let Some(channel_id) = state.selected_channel.clone() {
+                                state.start_voice_recording(channel_id);
+                            }
                         }
                         _ => ui.open_popup("emoji_picker"),
                     }
@@ -3847,6 +4191,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_channel_editor(ui, state, cmd_tx, display_w, display_h);
     draw_invite_manager(ui, state, cmd_tx, display_w, display_h);
     draw_poll_creator(ui, state, cmd_tx);
+    draw_forward_dialog(ui, state, cmd_tx);
 }
 
 fn format_bitrate(bps: u32) -> String {
@@ -8352,6 +8697,27 @@ mod mosaic_tests {
         for count in 0..=10 {
             assert_eq!(mosaic_rows(count).iter().sum::<usize>(), count);
         }
+    }
+}
+
+#[cfg(test)]
+mod voice_message_ui_tests {
+    use super::{format_clip_time, waveform_bar_count};
+
+    #[test]
+    fn clip_times_read_as_minutes_and_seconds() {
+        assert_eq!(format_clip_time(0.0), "0:00");
+        assert_eq!(format_clip_time(4.6), "0:05");
+        assert_eq!(format_clip_time(125.0), "2:05");
+        assert_eq!(format_clip_time(-3.0), "0:00");
+    }
+
+    #[test]
+    fn waveform_bars_fill_the_width_without_a_trailing_gap() {
+        assert_eq!(waveform_bar_count(0.0), 0);
+        assert_eq!(waveform_bar_count(3.0), 1);
+        assert_eq!(waveform_bar_count(8.0), 2);
+        assert_eq!(waveform_bar_count(7.9), 1);
     }
 }
 

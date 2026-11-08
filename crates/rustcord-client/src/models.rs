@@ -536,9 +536,56 @@ pub struct Message {
     pub sticker_items: Vec<StickerItem>,
     #[serde(default)]
     pub poll: Option<Poll>,
+    #[serde(default)]
+    pub flags: u64,
+    #[serde(default)]
+    pub message_snapshots: Vec<MessageSnapshot>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageSnapshot {
+    pub message: SnapshotMessage,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SnapshotMessage {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub timestamp: String,
+    #[serde(default)]
+    pub edited_timestamp: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+    #[serde(default, deserialize_with = "lenient_embeds")]
+    pub embeds: Vec<Embed>,
+    #[serde(default)]
+    pub sticker_items: Vec<StickerItem>,
+    #[serde(default)]
+    pub flags: u64,
+}
+
+impl SnapshotMessage {
+    pub fn is_voice_message(&self) -> bool {
+        self.flags & crate::voice_message::FLAG_IS_VOICE_MESSAGE != 0
+    }
+}
+
+pub const MESSAGE_REFERENCE_FORWARD: u8 = 1;
+
 impl Message {
+    pub fn is_voice_message(&self) -> bool {
+        self.flags & crate::voice_message::FLAG_IS_VOICE_MESSAGE != 0
+    }
+
+    pub fn forwarded(&self) -> Option<&SnapshotMessage> {
+        let reference = self.message_reference.as_ref()?;
+        if reference.kind != MESSAGE_REFERENCE_FORWARD {
+            return None;
+        }
+        self.message_snapshots.first().map(|snapshot| &snapshot.message)
+    }
+
     pub fn is_only_gif_link(&self) -> bool {
         let content = self.content.trim();
         !content.is_empty()
@@ -812,6 +859,8 @@ impl Gif {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageReference {
+    #[serde(rename = "type", default)]
+    pub kind: u8,
     pub message_id: Option<Snowflake>,
     pub channel_id: Option<Snowflake>,
     pub guild_id: Option<Snowflake>,
@@ -1079,6 +1128,53 @@ pub struct Attachment {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
+    #[serde(default)]
+    pub waveform: Option<String>,
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    fn message(extra: serde_json::Value) -> Message {
+        let mut value = serde_json::json!({
+            "id": "2", "channel_id": "9", "content": "", "timestamp": "2026-11-08T12:00:00+00:00",
+            "edited_timestamp": null, "author": { "id": "1", "username": "luna", "discriminator": "0" }
+        });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_forward_exposes_its_snapshot() {
+        let msg = message(serde_json::json!({
+            "message_reference": { "type": 1, "channel_id": "5", "message_id": "4" },
+            "message_snapshots": [{ "message": { "content": "hello", "timestamp": "2026-11-07T10:00:00+00:00", "attachments": [], "embeds": [{ "bogus": true, "type": 3 }], "flags": 8192 } }]
+        }));
+        let snapshot = msg.forwarded().expect("forward");
+        assert_eq!(snapshot.content, "hello");
+        assert!(snapshot.is_voice_message());
+    }
+
+    #[test]
+    fn a_reply_is_not_a_forward() {
+        let msg = message(serde_json::json!({ "message_reference": { "channel_id": "5", "message_id": "4" } }));
+        assert!(msg.forwarded().is_none());
+        assert!(!msg.is_voice_message());
+    }
+
+    #[test]
+    fn voice_message_attachments_carry_duration_and_waveform() {
+        let msg = message(serde_json::json!({
+            "flags": 8192,
+            "attachments": [{ "id": "3", "filename": "voice-message.ogg", "url": "u", "size": 10, "content_type": "audio/ogg", "duration_secs": 4.5, "waveform": "AAD/" }]
+        }));
+        assert!(msg.is_voice_message());
+        assert_eq!(msg.attachments[0].duration_secs, Some(4.5));
+        assert_eq!(msg.attachments[0].waveform.as_deref(), Some("AAD/"));
+    }
 }
 
 #[cfg(test)]

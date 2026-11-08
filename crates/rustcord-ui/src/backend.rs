@@ -50,6 +50,26 @@ async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+async fn load_voice_clip(url: &str) -> Result<std::sync::Arc<Vec<i16>>, String> {
+    let client = HTTP.get_or_init(reqwest::Client::new);
+    let resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let samples = tokio::task::spawn_blocking(move || rustcord_client::voice_message::decode_ogg(&bytes))
+        .await
+        .map_err(|e| e.to_string())??;
+    Ok(std::sync::Arc::new(samples))
+}
+
+async fn send_voice_message(client: &RestClient, channel_id: &str, samples: Vec<i16>, reply_to: Option<&str>) -> Result<(), String> {
+    use rustcord_client::voice_message as vm;
+    let (ogg, duration, waveform) = tokio::task::spawn_blocking(move || {
+        vm::encode_ogg(&samples).map(|ogg| (ogg, vm::duration_secs(&samples), vm::waveform_base64(&samples)))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    client.send_voice_message(channel_id, ogg, duration, waveform, reply_to).await.map(|_| ()).map_err(|e| e.to_string())
+}
+
 async fn save_attachment(url: &str, filename: &str) -> Result<std::path::PathBuf, String> {
     use tokio::io::AsyncWriteExt;
     let dir = directories::UserDirs::new()
@@ -129,6 +149,9 @@ pub enum UiCommand {
     SendPoll { channel_id: String, poll: serde_json::Value },
     VotePoll { channel_id: String, message_id: String, answer_ids: Vec<u32> },
     EndPoll { channel_id: String, message_id: String },
+    LoadVoiceClip { url: String },
+    SendVoiceMessage { channel_id: String, samples: Vec<i16>, reply_to: Option<String> },
+    ForwardMessage { source: rustcord_client::models::MessageReference, targets: Vec<String>, note: String },
     PreviewAttachment { key: String, source: crate::app_state::AttachmentSource },
     DownloadImage { url: String },
     ShowNotification { title: String, body: String, avatar_url: String },
@@ -265,6 +288,9 @@ pub enum BackendEvent {
     GuildJoined(rustcord_client::models::Guild),
     RelationshipSettled { user_id: String },
     UploadFinished { upload_id: u64 },
+    VoiceClipLoaded { url: String, result: Result<std::sync::Arc<Vec<i16>>, String> },
+    VoiceMessageSent { channel_id: String, error: Option<String> },
+    MessageForwarded { sent: usize, failed: Vec<String> },
     PinsLoaded { channel_id: String, pins: Option<Vec<rustcord_client::models::Message>> },
     MicTestStarted,
     MicTestFinished,
@@ -495,6 +521,51 @@ pub fn spawn(
                             if let Err(e) = client.send_poll(&channel_id, poll).await {
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to post poll: {e}")));
                             }
+                        });
+                    }
+                }
+                UiCommand::LoadVoiceClip { url } => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let result = load_voice_clip(&url).await;
+                        if let Err(e) = &result {
+                            tracing::warn!("voice message {url} failed to load: {e}");
+                        }
+                        let _ = event_tx.send(BackendEvent::VoiceClipLoaded { url, result });
+                    });
+                }
+                UiCommand::SendVoiceMessage { channel_id, samples, reply_to } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let error = send_voice_message(&client, &channel_id, samples, reply_to.as_deref()).await.err();
+                            let _ = event_tx.send(BackendEvent::VoiceMessageSent { channel_id, error });
+                        });
+                    }
+                }
+                UiCommand::ForwardMessage { source, targets, note } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let mut sent = 0;
+                            let mut failed = Vec::new();
+                            for target in targets {
+                                match client.forward_message(&target, &source).await {
+                                    Ok(_) => {
+                                        sent += 1;
+                                        if !note.trim().is_empty() {
+                                            if let Err(e) = client.send_message(&target, note.trim()).await {
+                                                tracing::warn!("forward note to {target} failed: {e}");
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("forward to {target} failed: {e}");
+                                        failed.push(e.to_string());
+                                    }
+                                }
+                            }
+                            let _ = event_tx.send(BackendEvent::MessageForwarded { sent, failed });
                         });
                     }
                 }

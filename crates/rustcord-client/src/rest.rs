@@ -175,6 +175,35 @@ fn attachments_payload(content: &str, filenames: &[&str], reply_to: Option<&str>
     Ok(serde_json::to_string(&payload)?)
 }
 
+fn forward_payload(source: &crate::models::MessageReference) -> serde_json::Value {
+    let mut reference = serde_json::json!({
+        "type": crate::models::MESSAGE_REFERENCE_FORWARD,
+        "message_id": source.message_id,
+        "channel_id": source.channel_id,
+    });
+    if let Some(guild_id) = &source.guild_id {
+        reference["guild_id"] = serde_json::json!(guild_id);
+    }
+    serde_json::json!({ "message_reference": reference })
+}
+
+fn voice_message_payload(duration_secs: f64, waveform: &str, reply_to: Option<&str>) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "content": "",
+        "flags": crate::voice_message::FLAG_IS_VOICE_MESSAGE,
+        "attachments": [{
+            "id": "0",
+            "filename": crate::voice_message::FILENAME,
+            "duration_secs": (duration_secs * 100.0).round() / 100.0,
+            "waveform": waveform,
+        }],
+    });
+    if let Some(message_id) = reply_to {
+        payload["message_reference"] = serde_json::json!({ "message_id": message_id });
+    }
+    payload
+}
+
 #[derive(Debug, Default)]
 pub struct UploadProgress {
     pub sent: std::sync::atomic::AtomicU64,
@@ -371,6 +400,34 @@ impl RestClient {
     pub async fn send_poll(&self, channel_id: &str, poll: serde_json::Value) -> Result<Message, ClientError> {
         let body = serde_json::json!({ "content": "", "poll": poll });
         self.post(&format!("/channels/{channel_id}/messages"), &body).await
+    }
+
+    pub async fn forward_message(&self, target_channel_id: &str, source: &crate::models::MessageReference) -> Result<Message, ClientError> {
+        let body = forward_payload(source);
+        self.post(&format!("/channels/{target_channel_id}/messages"), &body).await
+    }
+
+    pub async fn send_voice_message(
+        &self,
+        channel_id: &str,
+        ogg: Vec<u8>,
+        duration_secs: f64,
+        waveform: String,
+        reply_to: Option<&str>,
+    ) -> Result<Message, ClientError> {
+        let payload_json = serde_json::to_string(&voice_message_payload(duration_secs, &waveform, reply_to))?;
+        let part = reqwest::multipart::Part::bytes(ogg)
+            .file_name(crate::voice_message::FILENAME)
+            .mime_str(crate::voice_message::CONTENT_TYPE)
+            .map_err(|e| ClientError::Api { status: 0, message: e.to_string() })?;
+        let form = reqwest::multipart::Form::new().text("payload_json", payload_json).part("files[0]", part);
+        let resp = dispatch(self.http.post(format!("{API_BASE}/channels/{channel_id}/messages")).multipart(form)).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(resp.json::<Message>().await?)
     }
 
     pub async fn vote_poll(&self, channel_id: &str, message_id: &str, answer_ids: &[u32]) -> Result<(), ClientError> {
@@ -788,6 +845,26 @@ const SUPER_PROPERTIES_B64: &str = "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21l
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_forward_references_the_source_with_type_one() {
+        let source = crate::models::MessageReference { kind: 0, message_id: Some("4".into()), channel_id: Some("5".into()), guild_id: None };
+        let body = forward_payload(&source);
+        assert_eq!(body, serde_json::json!({ "message_reference": { "type": 1, "message_id": "4", "channel_id": "5" } }));
+        let source = crate::models::MessageReference { guild_id: Some("6".into()), ..source };
+        assert_eq!(forward_payload(&source)["message_reference"]["guild_id"], "6");
+    }
+
+    #[test]
+    fn a_voice_message_is_flagged_and_carries_its_waveform() {
+        let body = voice_message_payload(3.14159, "AAD/", Some("7"));
+        assert_eq!(body["flags"], 8192);
+        assert_eq!(body["content"], "");
+        assert_eq!(body["attachments"][0]["filename"], "voice-message.ogg");
+        assert_eq!(body["attachments"][0]["duration_secs"], 3.14);
+        assert_eq!(body["attachments"][0]["waveform"], "AAD/");
+        assert_eq!(body["message_reference"]["message_id"], "7");
+    }
 
     #[test]
     fn an_empty_gif_query_asks_for_trending() {

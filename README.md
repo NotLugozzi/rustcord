@@ -15,7 +15,7 @@ Use at your own risk.
 
 rustcord is close to feature parity with the official client for everyday
 use. That covers servers, DMs and group DMs, voice calls, screen sharing and
-camera video (Linux), polls, message markdown and embeds, reactions, GIFs, stickers and
+camera video (Linux), polls, voice messages, message forwarding, message markdown and embeds, reactions, GIFs, stickers and
 emoji, search, unread and mention tracking, notification and mute
 settings, and most server admin actions. Video playback, screen sharing and camera
 are behind the optional `video` and `screenshare` cargo features (both
@@ -26,7 +26,6 @@ What's still missing:
 - Screen sharing and camera on Windows and macOS
 - Threads, and forum channels, which are built on threads
 - Slash commands and bot interactions (buttons, select menus)
-- Voice message sending and message forwarding
 - Push-to-talk and global hotkeys
 - Stage channels behave like ordinary voice channels
 - Server folders are local only and don't sync with your Discord account

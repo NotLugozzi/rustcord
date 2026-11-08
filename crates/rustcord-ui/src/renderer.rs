@@ -394,6 +394,7 @@ fn render_frame(
 
     drop(rpass);
     queue.submit(Some(encoder.finish()));
+    let _ = device.poll(wgpu::PollType::Poll);
     let submitted = Instant::now();
     frame.present();
     let presented = Instant::now();
@@ -614,7 +615,7 @@ impl ApplicationHandler for App {
             }
         }
         let active = self.last_input.elapsed() < Duration::from_millis(400);
-        let animating = window.textures.animating || window.textures.has_wanted_icons();
+        let animating = window.textures.animating || window.textures.has_wanted_icons() || self.state.voice_audio_active();
         let typing = self.state.selected_channel.as_deref().is_some_and(|channel| {
             self.state.typing_users_for(channel).iter().any(|id| self.state.current_user.as_ref().is_none_or(|me| me.id != *id))
         });

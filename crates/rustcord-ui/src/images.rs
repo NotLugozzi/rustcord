@@ -132,7 +132,28 @@ struct VideoEntry {
     awaiting_data: bool,
     retry_at: Option<Instant>,
     undecoded: std::collections::VecDeque<crate::video::VideoFrame>,
+    spare_textures: Vec<imgui::TextureId>,
 }
+
+#[cfg(feature = "video")]
+impl VideoEntry {
+    fn recycle(&mut self, texture_id: imgui::TextureId, renderer: &mut imgui_wgpu::Renderer) {
+        if self.spare_textures.len() < MAX_SPARE_VIDEO_TEXTURES {
+            self.spare_textures.push(texture_id);
+        } else {
+            renderer.textures.remove(texture_id);
+        }
+    }
+
+    fn release(self, renderer: &mut imgui_wgpu::Renderer) {
+        for texture_id in self.frames.into_iter().map(|f| f.texture_id).chain(self.spare_textures) {
+            renderer.textures.remove(texture_id);
+        }
+    }
+}
+
+#[cfg(feature = "video")]
+const MAX_SPARE_VIDEO_TEXTURES: usize = 8;
 
 enum Entry {
     Loaded { kind: Kind, size: [f32; 2], bytes: usize, last_used: Cell<Instant> },
@@ -360,9 +381,7 @@ impl TextureCache {
                     }
                     #[cfg(feature = "video")]
                     Kind::Video(video) => {
-                        for f in video.frames {
-                            renderer.textures.remove(f.texture_id);
-                        }
+                        video.release(renderer);
                         let _ = cmd_tx.send(crate::backend::UiCommand::CloseVideo { url: url.clone() });
                     }
                 }
@@ -442,6 +461,7 @@ impl TextureCache {
                     awaiting_data: false,
                     retry_at: None,
                     undecoded: std::collections::VecDeque::new(),
+                    spare_textures: Vec::new(),
                 }),
                 size,
                 bytes: 0,
@@ -577,9 +597,7 @@ impl TextureCache {
 
             if let Some(Entry::Loaded { kind: Kind::Video(video), bytes, .. }) = self.entries.remove(&url) {
                 self.total_bytes = self.total_bytes.saturating_sub(bytes);
-                for f in video.frames {
-                    renderer.textures.remove(f.texture_id);
-                }
+                video.release(renderer);
             }
         }
     }
@@ -598,8 +616,8 @@ impl TextureCache {
         if video.pending_clear {
             video.pending_clear = false;
             video.undecoded.clear();
-            for frame in video.frames.drain(..) {
-                renderer.textures.remove(frame.texture_id);
+            for frame in std::mem::take(&mut video.frames) {
+                video.recycle(frame.texture_id, renderer);
                 *bytes = bytes.saturating_sub(frame.bytes);
                 self.total_bytes = self.total_bytes.saturating_sub(frame.bytes);
             }
@@ -639,8 +657,9 @@ impl TextureCache {
             for _ in 0..budget {
                 let Some(frame) = video.undecoded.pop_front() else { break };
                 let frame_bytes = frame.image.as_raw().len();
+                let texture_id = reuse_texture(device, queue, renderer, &mut video.spare_textures, &frame.image);
                 video.frames.push_back(DecodedFrame {
-                    texture_id: upload_texture(device, queue, renderer, &frame.image),
+                    texture_id,
                     delay: frame.delay,
                     bytes: frame_bytes,
                     pts_secs: frame.pts_secs,
@@ -670,7 +689,7 @@ impl TextureCache {
 
             let mut drop_front = |video: &mut VideoEntry, bytes: &mut usize, total: &mut usize| {
                 let done = video.frames.pop_front().expect("caller checked len");
-                renderer.textures.remove(done.texture_id);
+                video.recycle(done.texture_id, renderer);
                 *bytes = bytes.saturating_sub(done.bytes);
                 *total = total.saturating_sub(done.bytes);
             };
@@ -856,6 +875,29 @@ fn advance_decision(front_delay: Option<Duration>, queued: usize, elapsed: Durat
     } else {
         Advance::Starved
     }
+}
+
+#[cfg(feature = "video")]
+fn reuse_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    renderer: &mut imgui_wgpu::Renderer,
+    spare: &mut Vec<imgui::TextureId>,
+    rgba: &image::RgbaImage,
+) -> imgui::TextureId {
+    let (width, height) = rgba.dimensions();
+    while let Some(texture_id) = spare.pop() {
+        match renderer.textures.get(texture_id) {
+            Some(texture) if texture.width() == width && texture.height() == height => {
+                texture.write(queue, rgba.as_raw(), width, height);
+                return texture_id;
+            }
+            _ => {
+                renderer.textures.remove(texture_id);
+            }
+        }
+    }
+    upload_texture(device, queue, renderer, rgba)
 }
 
 fn upload_texture(

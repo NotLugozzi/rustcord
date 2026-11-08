@@ -10,6 +10,7 @@ circle-help.svg      unsupported system message fallback
 file-text.svg        text/document attachments
 film.svg             video attachments
 folder.svg           other attachments
+forward.svg          forward a message, forwarded message header
 gif.svg              GIF picker (composer) - ORIGINAL ARTWORK, not Lucide; MIT like the project
 headphone-off.svg    deafened (controls, voice member badge)
 headphones.svg       deafen toggle
@@ -33,6 +34,7 @@ pin.svg              pinned message rows, pinned messages popover
 play.svg             video play
 rotate-ccw.svg       video replay
 search.svg           search
+send.svg             send a voice message
 settings.svg         user settings
 smile.svg            emoji picker (composer)
 sticker.svg          sticker picker (composer)
@@ -43,6 +45,7 @@ users.svg            member list
 video.svg            video call
 volume-2.svg         video volume, voice channels
 volume-x.svg         video muted
+trash-2.svg          discard a voice recording
 x.svg                close settings
 
 The artwork uses stroke="currentColor"; the renderer rasterizes it as a white

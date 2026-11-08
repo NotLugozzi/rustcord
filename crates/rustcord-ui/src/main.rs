@@ -11,6 +11,7 @@ mod invites;
 mod ipc;
 mod keybinds;
 mod markdown;
+mod memory;
 mod message_rows;
 mod presence;
 mod renderer;
@@ -46,6 +47,7 @@ pub(crate) fn show_notification(notification: &notify_rust::Notification) {
 }
 
 fn main() {
+    memory::configure();
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
@@ -474,6 +476,21 @@ pub fn drain_backend_events(
             }
             BackendEvent::UploadFinished { upload_id } => {
                 state.uploads.retain(|u| u.id != upload_id);
+            }
+            BackendEvent::VoiceClipLoaded { url, result } => state.on_voice_clip_loaded(url, result),
+            BackendEvent::VoiceMessageSent { channel_id, error } => {
+                state.voice_messages_sending.remove(&channel_id);
+                if let Some(e) = error {
+                    state.status_message = Some(format!("Couldn't send the voice message: {e}"));
+                }
+            }
+            BackendEvent::MessageForwarded { sent, failed } => {
+                state.status_message = Some(match (sent, failed.first()) {
+                    (_, None) if sent == 1 => "Message forwarded".to_string(),
+                    (_, None) => format!("Message forwarded to {sent} conversations"),
+                    (0, Some(e)) => format!("Couldn't forward the message: {e}"),
+                    (_, Some(e)) => format!("Forwarded to {sent}, {} failed: {e}", failed.len()),
+                });
             }
             BackendEvent::RelationshipSettled { user_id } => {
                 state.relationship_busy.remove(&user_id);

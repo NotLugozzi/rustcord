@@ -933,7 +933,14 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
                 kv(ui, "Cached messages", runtime.cached_messages.to_string());
                 kv(ui, "Devtools log buffer", format!("{} lines · {}", view.logs.len(), human_size(capture_bytes)));
                 kv(ui, "Devtools captures", format!("{} requests · {} frames", view.http.len(), view.sockets.len()));
+                if let Some(heap) = crate::memory::stats() {
+                    kv(ui, "Heap in use", human_size(heap.in_use + heap.mmapped));
+                    kv(ui, "Heap free but held", human_size(heap.free_held));
+                }
             });
+            if crate::memory::stats().is_some() && ui.button("Trim heap now") {
+                crate::memory::trim();
+            }
         }
         if ui.collapsing_header("Rendering (main window)", imgui::TreeNodeFlags::DEFAULT_OPEN) {
             let now = std::time::Instant::now();

@@ -20,6 +20,7 @@ pub mod screen_encode;
 pub mod gateway;
 pub mod voice_audio;
 pub mod voice_gateway;
+pub mod voice_message;
 pub mod voice_rtc;
 pub mod voice_sdp;
 

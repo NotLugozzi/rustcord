@@ -15,7 +15,7 @@ fn low_latency_buffer_size() -> cpal::BufferSize {
     cpal::BufferSize::Fixed(FRAME_SAMPLES as u32 * 2)
 }
 
-fn audio_host() -> cpal::Host {
+pub(crate) fn audio_host() -> cpal::Host {
     #[cfg(target_os = "linux")]
     {
         if let Ok(host) = cpal::host_from_id(cpal::HostId::PulseAudio) {
@@ -297,7 +297,7 @@ fn list_devices(input: bool) -> Vec<String> {
         .collect()
 }
 
-fn find_device(host: &cpal::Host, name: Option<&str>, input: bool) -> Option<cpal::Device> {
+pub(crate) fn find_device(host: &cpal::Host, name: Option<&str>, input: bool) -> Option<cpal::Device> {
     if let Some(name) = name {
         let Ok(devices) = host.devices() else { return None };
         let found = devices

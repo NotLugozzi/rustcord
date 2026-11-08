@@ -551,6 +551,108 @@ pub struct AppState {
     pub show_profile_panel: bool,
     pub add_people_selected: std::collections::HashSet<String>,
     pub add_people_filter: String,
+    pub voice_clips: HashMap<String, VoiceClip>,
+    pub voice_player: Option<VoicePlayback>,
+    pub voice_play_pending: Option<String>,
+    pub voice_recording: Option<VoiceRecording>,
+    pub voice_messages_sending: std::collections::HashSet<String>,
+    pub forward_dialog: Option<ForwardDialog>,
+}
+
+pub enum VoiceClip {
+    Loading,
+    Ready(std::sync::Arc<Vec<i16>>),
+    Failed(String),
+}
+
+pub struct VoicePlayback {
+    pub url: String,
+    pub player: rustcord_client::voice_message::ClipPlayer,
+}
+
+pub struct VoiceRecording {
+    pub channel_id: String,
+    pub reply_to: Option<String>,
+    pub recorder: rustcord_client::voice_message::ClipRecorder,
+    pub levels: std::collections::VecDeque<f32>,
+    pub last_level: std::time::Instant,
+}
+
+impl VoiceRecording {
+    pub fn sample_level(&mut self) {
+        if self.last_level.elapsed() < RECORDING_LEVEL_INTERVAL {
+            return;
+        }
+        self.last_level = std::time::Instant::now();
+        if self.levels.len() >= RECORDING_LEVEL_HISTORY {
+            self.levels.pop_front();
+        }
+        self.levels.push_back(self.recorder.level());
+    }
+}
+
+const RECORDING_LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+const RECORDING_LEVEL_HISTORY: usize = 160;
+
+pub struct ForwardDialog {
+    pub source: rustcord_client::models::MessageReference,
+    pub preview: String,
+    pub query: String,
+    pub selected: Vec<String>,
+    pub note: String,
+}
+
+pub const MAX_FORWARD_TARGETS: usize = 5;
+pub const MIN_VOICE_MESSAGE_SECS: f64 = 0.5;
+
+impl ForwardDialog {
+    pub fn for_message(message: &Message) -> Self {
+        let preview = match message.forwarded() {
+            Some(snapshot) => forward_preview(&snapshot.content, snapshot.attachments.len(), snapshot.is_voice_message()),
+            None => forward_preview(&message.content, message.attachments.len(), message.is_voice_message()),
+        };
+        Self {
+            source: rustcord_client::models::MessageReference {
+                kind: rustcord_client::models::MESSAGE_REFERENCE_FORWARD,
+                message_id: Some(message.id.clone()),
+                channel_id: Some(message.channel_id.clone()),
+                guild_id: message.guild_id.clone(),
+            },
+            preview,
+            query: String::new(),
+            selected: Vec::new(),
+            note: String::new(),
+        }
+    }
+
+    pub fn toggle(&mut self, channel_id: &str) {
+        match self.selected.iter().position(|id| id == channel_id) {
+            Some(index) => {
+                self.selected.remove(index);
+            }
+            None if self.selected.len() < MAX_FORWARD_TARGETS => self.selected.push(channel_id.to_string()),
+            None => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForwardTarget {
+    pub channel_id: String,
+    pub label: String,
+    pub detail: Option<String>,
+}
+
+fn forward_preview(content: &str, attachments: usize, voice: bool) -> String {
+    let text: String = content.chars().take(120).collect();
+    let text = if content.chars().count() > 120 { format!("{text}...") } else { text };
+    match (text.is_empty(), voice, attachments) {
+        (_, true, _) => "Voice message".to_string(),
+        (true, _, 0) => "Message".to_string(),
+        (true, _, 1) => "1 attachment".to_string(),
+        (true, _, n) => format!("{n} attachments"),
+        (false, _, _) => text,
+    }
 }
 
 pub enum PinsState {
@@ -641,6 +743,140 @@ pub struct PendingUpload {
 const TYPING_EXPIRY: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl AppState {
+    pub fn toggle_voice_clip(&mut self, url: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        if let Some(playback) = self.voice_player.as_ref().filter(|p| p.url == url) {
+            if playback.player.finished() {
+                playback.player.seek(0.0);
+                playback.player.set_paused(false);
+            } else {
+                playback.player.set_paused(!playback.player.paused());
+            }
+            return;
+        }
+        match self.voice_clips.get(url) {
+            Some(VoiceClip::Ready(samples)) => {
+                let samples = samples.clone();
+                self.start_voice_playback(url, samples, 0.0);
+            }
+            Some(VoiceClip::Loading) => self.voice_play_pending = Some(url.to_string()),
+            None | Some(VoiceClip::Failed(_)) => {
+                self.voice_clips.insert(url.to_string(), VoiceClip::Loading);
+                self.voice_play_pending = Some(url.to_string());
+                let _ = cmd_tx.send(crate::backend::UiCommand::LoadVoiceClip { url: url.to_string() });
+            }
+        }
+    }
+
+    pub fn seek_voice_clip(&mut self, url: &str, fraction: f32) {
+        if let Some(playback) = self.voice_player.as_ref().filter(|p| p.url == url) {
+            playback.player.seek(fraction);
+            playback.player.set_paused(false);
+        } else if let Some(VoiceClip::Ready(samples)) = self.voice_clips.get(url) {
+            let samples = samples.clone();
+            self.start_voice_playback(url, samples, fraction);
+        }
+    }
+
+    fn start_voice_playback(&mut self, url: &str, samples: std::sync::Arc<Vec<i16>>, fraction: f32) {
+        self.voice_player = None;
+        let start_at = (fraction.clamp(0.0, 1.0) * samples.len() as f32) as usize;
+        match rustcord_client::voice_message::ClipPlayer::start(samples, start_at, self.selected_output_device.as_deref()) {
+            Ok(player) => self.voice_player = Some(VoicePlayback { url: url.to_string(), player }),
+            Err(e) => self.status_message = Some(format!("Couldn't play the voice message: {e}")),
+        }
+    }
+
+    pub fn on_voice_clip_loaded(&mut self, url: String, result: Result<std::sync::Arc<Vec<i16>>, String>) {
+        match result {
+            Ok(samples) => {
+                if self.voice_play_pending.as_deref() == Some(url.as_str()) {
+                    self.voice_play_pending = None;
+                    self.start_voice_playback(&url, samples.clone(), 0.0);
+                }
+                self.voice_clips.insert(url, VoiceClip::Ready(samples));
+            }
+            Err(e) => {
+                if self.voice_play_pending.as_deref() == Some(url.as_str()) {
+                    self.voice_play_pending = None;
+                }
+                self.voice_clips.insert(url, VoiceClip::Failed(e));
+            }
+        }
+    }
+
+    pub fn voice_clip_progress(&self, url: &str) -> Option<(f32, bool)> {
+        let playback = self.voice_player.as_ref().filter(|p| p.url == url)?;
+        Some((playback.player.progress(), !playback.player.paused() && !playback.player.finished()))
+    }
+
+    pub fn start_voice_recording(&mut self, channel_id: String) {
+        if self.voice_recording.is_some() {
+            return;
+        }
+        match rustcord_client::voice_message::ClipRecorder::start(self.selected_input_device.as_deref()) {
+            Ok(recorder) => {
+                if let Some(playback) = &self.voice_player {
+                    playback.player.set_paused(true);
+                }
+                let reply_to = self.reply_target.as_ref().map(|m| m.id.clone());
+                self.voice_recording = Some(VoiceRecording {
+                    channel_id,
+                    reply_to,
+                    recorder,
+                    levels: std::collections::VecDeque::new(),
+                    last_level: std::time::Instant::now(),
+                });
+            }
+            Err(e) => self.status_message = Some(format!("Couldn't start recording: {e}")),
+        }
+    }
+
+    pub fn finish_voice_recording(&mut self, send: bool, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let Some(recording) = self.voice_recording.take() else { return };
+        let samples = recording.recorder.finish();
+        if !send {
+            return;
+        }
+        if rustcord_client::voice_message::duration_secs(&samples) < MIN_VOICE_MESSAGE_SECS {
+            self.status_message = Some("Voice message too short".into());
+            return;
+        }
+        if recording.reply_to.is_some() {
+            self.reply_target = None;
+        }
+        self.voice_messages_sending.insert(recording.channel_id.clone());
+        let _ = cmd_tx.send(crate::backend::UiCommand::SendVoiceMessage {
+            channel_id: recording.channel_id,
+            samples,
+            reply_to: recording.reply_to,
+        });
+    }
+
+    pub fn forward_targets(&self, query: &str) -> Vec<ForwardTarget> {
+        let query = query.trim().to_lowercase();
+        let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
+        let dms = self.dm_channels.iter().map(|dm| ForwardTarget { channel_id: dm.id.clone(), label: Self::dm_display_name(dm), detail: None });
+        let channels = self.guilds.iter().flat_map(|guild| {
+            self.guild_channels
+                .get(&guild.id)
+                .into_iter()
+                .flatten()
+                .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement) && self.can_view_channel(&guild.id, c))
+                .map(|c| ForwardTarget {
+                    channel_id: c.id.clone(),
+                    label: format!("#{}", c.name.as_deref().unwrap_or("unknown")),
+                    detail: Some(guild.name.clone()),
+                })
+        });
+        dms.chain(channels).filter(|t| matches(&t.label) || t.detail.as_deref().is_some_and(matches)).collect()
+    }
+
+    pub fn voice_audio_active(&self) -> bool {
+        self.voice_recording.is_some()
+            || self.voice_play_pending.is_some()
+            || self.voice_player.as_ref().is_some_and(|p| !p.player.paused() && !p.player.finished())
+    }
+
     pub fn presence_for(&self, user_id: &str) -> rustcord_client::models::PresenceStatus {
         if self.current_user.as_ref().is_some_and(|u| u.id == user_id) {
             return self.my_status;
@@ -3048,6 +3284,80 @@ mod tests {
         assert!(labels.contains(&"My Server"), "{labels:?}");
         assert!(labels.contains(&"#general"), "{labels:?}");
         assert!(labels.contains(&"friend"), "{labels:?}");
+    }
+
+    #[test]
+    fn forward_targets_list_dms_then_text_channels_and_filter_by_guild_name() {
+        let mut state = AppState::default();
+        state.guilds.push(test_guild("g1", "My Server"));
+        let mut voice = guild_channel("v1", "g1", "lounge");
+        voice.kind = ChannelType::GuildVoice;
+        state.guild_channels.insert("g1".into(), vec![guild_channel("c1", "g1", "general"), voice]);
+        let mut dm = guild_channel("d1", "", "");
+        dm.kind = ChannelType::Dm;
+        dm.guild_id = None;
+        dm.recipients = vec![test_user("u1", "friend", None)];
+        state.dm_channels.push(dm);
+
+        let labels: Vec<String> = state.forward_targets("").into_iter().map(|t| t.label).collect();
+        assert_eq!(labels, ["friend", "#general"]);
+        let by_guild = state.forward_targets("my serv");
+        assert_eq!(by_guild.len(), 1);
+        assert_eq!(by_guild[0].detail.as_deref(), Some("My Server"));
+        assert!(state.forward_targets("nobody").is_empty());
+    }
+
+    #[test]
+    fn a_forward_dialog_caps_its_targets_and_toggles_off() {
+        let mut dialog = ForwardDialog::for_message(&incoming(Some("g"), "c", false));
+        assert_eq!(dialog.source.kind, rustcord_client::models::MESSAGE_REFERENCE_FORWARD);
+        assert_eq!((dialog.source.message_id.as_deref(), dialog.source.guild_id.as_deref()), (Some("1"), Some("g")));
+        assert_eq!(dialog.preview, "hi");
+        for id in ["a", "b", "c", "d", "e", "f"] {
+            dialog.toggle(id);
+        }
+        assert_eq!(dialog.selected, ["a", "b", "c", "d", "e"]);
+        dialog.toggle("b");
+        assert_eq!(dialog.selected, ["a", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn forward_previews_describe_messages_without_text() {
+        assert_eq!(forward_preview("", 0, true), "Voice message");
+        assert_eq!(forward_preview("", 2, false), "2 attachments");
+        assert_eq!(forward_preview("", 1, false), "1 attachment");
+        assert_eq!(forward_preview("", 0, false), "Message");
+        assert!(forward_preview(&"x".repeat(200), 0, false).ends_with("..."));
+    }
+
+    #[test]
+    fn a_failed_clip_load_clears_the_pending_play() {
+        let mut state = AppState::default();
+        state.voice_play_pending = Some("u".into());
+        state.on_voice_clip_loaded("u".into(), Err("404".into()));
+        assert!(state.voice_play_pending.is_none());
+        assert!(matches!(state.voice_clips.get("u"), Some(VoiceClip::Failed(e)) if e == "404"));
+        assert!(!state.voice_audio_active());
+    }
+
+    #[test]
+    fn a_clip_that_loads_without_being_asked_for_is_only_cached() {
+        let mut state = AppState::default();
+        state.on_voice_clip_loaded("u".into(), Ok(std::sync::Arc::new(vec![0; 480])));
+        assert!(state.voice_player.is_none());
+        assert!(matches!(state.voice_clips.get("u"), Some(VoiceClip::Ready(s)) if s.len() == 480));
+    }
+
+    #[test]
+    fn playing_an_unloaded_clip_requests_it_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = AppState::default();
+        state.toggle_voice_clip("u", &tx);
+        state.toggle_voice_clip("u", &tx);
+        assert!(matches!(rx.try_recv(), Ok(crate::backend::UiCommand::LoadVoiceClip { url }) if url == "u"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.voice_play_pending.as_deref(), Some("u"));
+        assert!(state.voice_audio_active());
     }
 
     #[test]
