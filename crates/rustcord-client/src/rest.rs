@@ -124,6 +124,23 @@ impl LoginSession {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UploadFile {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+    pub content_type: String,
+}
+
+fn attachments_payload(content: &str, filenames: &[&str], reply_to: Option<&str>) -> Result<String, ClientError> {
+    let attachments: Vec<serde_json::Value> =
+        filenames.iter().enumerate().map(|(id, filename)| serde_json::json!({ "id": id, "filename": filename })).collect();
+    let mut payload = serde_json::json!({ "content": content, "attachments": attachments });
+    if let Some(message_id) = reply_to {
+        payload["message_reference"] = serde_json::json!({ "message_id": message_id });
+    }
+    Ok(serde_json::to_string(&payload)?)
+}
+
 #[derive(Debug, Default)]
 pub struct UploadProgress {
     pub sent: std::sync::atomic::AtomicU64,
@@ -509,50 +526,43 @@ impl RestClient {
         reply_to: Option<&str>,
         progress: Option<std::sync::Arc<UploadProgress>>,
     ) -> Result<Message, ClientError> {
-        #[derive(Serialize)]
-        struct PayloadAttachment<'a> {
-            id: u32,
-            filename: &'a str,
-        }
-        #[derive(Serialize)]
-        struct MessageReference<'a> {
-            message_id: &'a str,
-        }
-        #[derive(Serialize)]
-        struct Payload<'a> {
-            content: &'a str,
-            attachments: Vec<PayloadAttachment<'a>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            message_reference: Option<MessageReference<'a>>,
-        }
-        let payload = Payload {
-            content,
-            attachments: vec![PayloadAttachment { id: 0, filename }],
-            message_reference: reply_to.map(|id| MessageReference { message_id: id }),
-        };
-        let payload_json = serde_json::to_string(&payload)?;
+        let file = UploadFile { filename: filename.to_string(), bytes: file_bytes, content_type: content_type.to_string() };
+        self.send_message_with_files(channel_id, content, vec![file], reply_to, progress).await
+    }
 
-        let file_part = match progress {
-            Some(progress) => {
-                const CHUNK: usize = 64 * 1024;
-                let total = file_bytes.len() as u64;
-                let bytes = bytes::Bytes::from(file_bytes);
-                let chunks: Vec<bytes::Bytes> =
-                    (0..bytes.len()).step_by(CHUNK).map(|start| bytes.slice(start..(start + CHUNK).min(bytes.len()))).collect();
-                let stream = futures_util::stream::iter(chunks.into_iter().map(move |chunk| {
-                    progress.sent.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                    Ok::<_, std::io::Error>(chunk)
-                }));
-                reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), total)
+    pub async fn send_message_with_files(
+        &self,
+        channel_id: &str,
+        content: &str,
+        files: Vec<UploadFile>,
+        reply_to: Option<&str>,
+        progress: Option<std::sync::Arc<UploadProgress>>,
+    ) -> Result<Message, ClientError> {
+        let filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
+        let payload_json = attachments_payload(content, &filenames, reply_to)?;
+        let mut form = reqwest::multipart::Form::new().text("payload_json", payload_json);
+        for (index, file) in files.into_iter().enumerate() {
+            let part = match &progress {
+                Some(progress) => {
+                    const CHUNK: usize = 64 * 1024;
+                    let total = file.bytes.len() as u64;
+                    let bytes = bytes::Bytes::from(file.bytes);
+                    let chunks: Vec<bytes::Bytes> =
+                        (0..bytes.len()).step_by(CHUNK).map(|start| bytes.slice(start..(start + CHUNK).min(bytes.len()))).collect();
+                    let progress = progress.clone();
+                    let stream = futures_util::stream::iter(chunks.into_iter().map(move |chunk| {
+                        progress.sent.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        Ok::<_, std::io::Error>(chunk)
+                    }));
+                    reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(stream), total)
+                }
+                None => reqwest::multipart::Part::bytes(file.bytes),
             }
-            None => reqwest::multipart::Part::bytes(file_bytes),
-        }
-        .file_name(filename.to_string())
-            .mime_str(content_type)
+            .file_name(file.filename)
+            .mime_str(&file.content_type)
             .map_err(|e| ClientError::Api { status: 0, message: e.to_string() })?;
-        let form = reqwest::multipart::Form::new()
-            .text("payload_json", payload_json)
-            .part("files[0]", file_part);
+            form = form.part(format!("files[{index}]"), part);
+        }
 
         let resp = self
             .http
@@ -748,6 +758,19 @@ mod tests {
     fn a_unicode_emoji_is_percent_encoded_per_utf8_byte() {
         assert_eq!(encode_path_segment("\u{1F44D}"), "%F0%9F%91%8D");
         assert_eq!(encode_path_segment("\u{2764}"), "%E2%9D%A4");
+    }
+
+    #[test]
+    fn every_file_gets_an_attachment_entry_matching_its_part_index() {
+        let payload: serde_json::Value = serde_json::from_str(&attachments_payload("hi", &["a.png", "b.png"], Some("9")).unwrap()).unwrap();
+        assert_eq!(payload["content"], "hi");
+        assert_eq!(
+            payload["attachments"],
+            serde_json::json!([{ "id": 0, "filename": "a.png" }, { "id": 1, "filename": "b.png" }])
+        );
+        assert_eq!(payload["message_reference"]["message_id"], "9");
+        let bare: serde_json::Value = serde_json::from_str(&attachments_payload("", &["a.png"], None).unwrap()).unwrap();
+        assert!(bare.get("message_reference").is_none());
     }
 
     #[test]

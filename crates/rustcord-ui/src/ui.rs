@@ -2420,6 +2420,164 @@ fn draw_video_attachment(
     }
 }
 
+const ATTACHMENT_TRAY_HEIGHT: f32 = 168.0;
+const ATTACHMENT_CARD_WIDTH: f32 = 160.0;
+const ATTACHMENT_THUMB_HEIGHT: f32 = 104.0;
+
+fn draw_attachment_tray(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, channel_id: &str) {
+    let Some(queue) = state.pending_attachments.get(channel_id).cloned() else { return };
+    let mut removed = None;
+    let bg = ui.push_style_color(imgui::StyleColor::ChildBg, state.theme.panel);
+    ui.child_window("attachment_tray")
+        .size([0.0, ATTACHMENT_TRAY_HEIGHT])
+        .horizontal_scrollbar(true)
+        .always_use_window_padding(true)
+        .build(|| {
+            for (index, attachment) in queue.iter().enumerate() {
+                if index > 0 {
+                    ui.same_line_with_spacing(0.0, 10.0);
+                }
+                let card_min = ui.cursor_screen_pos();
+                let card_max = [card_min[0] + ATTACHMENT_CARD_WIDTH, card_min[1] + ATTACHMENT_TRAY_HEIGHT - 20.0];
+                let thumb_min = [card_min[0] + 8.0, card_min[1] + 8.0];
+                let thumb_max = [card_max[0] - 8.0, thumb_min[1] + ATTACHMENT_THUMB_HEIGHT];
+                let thumbnail = if attachment.is_image() {
+                    let key = attachment.preview_key();
+                    if state.attachment_previews_requested.insert(attachment.id) {
+                        let _ = cmd_tx.send(UiCommand::PreviewAttachment { key: key.clone(), source: attachment.source.clone() });
+                    }
+                    textures.get(&key)
+                } else {
+                    None
+                };
+                {
+                    let dl = ui.get_window_draw_list();
+                    dl.add_rect(card_min, card_max, state.theme.background).filled(true).rounding(8.0).build();
+                    dl.add_rect(card_min, card_max, state.theme.border).rounding(8.0).build();
+                    match thumbnail {
+                        Some((texture_id, size)) => {
+                            let (uv_min, uv_max) = cover_uv(size, [thumb_max[0] - thumb_min[0], thumb_max[1] - thumb_min[1]]);
+                            dl.add_image_rounded(texture_id, thumb_min, thumb_max, 6.0).uv_min(uv_min).uv_max(uv_max).build();
+                        }
+                        None => {
+                            dl.add_rect(thumb_min, thumb_max, state.theme.panel).filled(true).rounding(6.0).build();
+                        }
+                    }
+                }
+                if thumbnail.is_none() {
+                    let icon = if attachment.is_image() { crate::icons::Icon::Image } else { crate::icons::Icon::FileText };
+                    let glyph = 32.0;
+                    draw_icon_at(
+                        ui,
+                        textures,
+                        icon,
+                        [(thumb_min[0] + thumb_max[0] - glyph) / 2.0, (thumb_min[1] + thumb_max[1] - glyph) / 2.0],
+                        glyph,
+                        state.theme.text_muted,
+                    );
+                }
+                let name = truncate_to_width(ui, &attachment.filename, ATTACHMENT_CARD_WIDTH - 16.0).unwrap_or_else(|| attachment.filename.clone());
+                ui.get_window_draw_list().add_text([thumb_min[0], thumb_max[1] + 8.0], state.theme.text, &name);
+                ui.set_cursor_screen_pos([card_max[0] - 34.0, card_min[1] + 4.0]);
+                if icon_button(ui, textures, &format!("remove_attachment_{}", attachment.id), crate::icons::Icon::Close, "Remove attachment", None) {
+                    removed = Some(attachment.id);
+                }
+                let remove_hovered = ui.is_item_hovered();
+                ui.set_cursor_screen_pos(card_min);
+                ui.dummy([ATTACHMENT_CARD_WIDTH, card_max[1] - card_min[1]]);
+                if ui.is_item_hovered() && !remove_hovered {
+                    ui.tooltip_text(&attachment.filename);
+                }
+            }
+        });
+    bg.pop();
+    if let Some(id) = removed {
+        state.remove_attachment(channel_id, id);
+    }
+}
+
+const MOSAIC_MAX_WIDTH: f32 = 520.0;
+const MOSAIC_GAP: f32 = 4.0;
+
+fn mosaic_rows(count: usize) -> Vec<usize> {
+    match count {
+        0 => Vec::new(),
+        1 | 2 => vec![count],
+        3 => vec![1, 2],
+        4 => vec![2, 2],
+        _ => {
+            let lead = count % 3;
+            let lead = if lead == 0 { None } else { Some(lead) };
+            lead.into_iter().chain(std::iter::repeat_n(3, count / 3)).collect()
+        }
+    }
+}
+
+fn draw_attachments(
+    ui: &Ui,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    attachments: &[rustcord_client::models::Attachment],
+    lightbox: &mut Option<String>,
+) {
+    let (images, others): (Vec<_>, Vec<_>) =
+        attachments.iter().partition(|a| is_image_attachment(a.content_type.as_deref(), &a.filename));
+    if images.len() >= 2 {
+        draw_image_mosaic(ui, cmd_tx, textures, &images, lightbox);
+    } else {
+        for attachment in images {
+            draw_attachment(ui, cmd_tx, textures, attachment, lightbox);
+        }
+    }
+    for attachment in others {
+        draw_attachment(ui, cmd_tx, textures, attachment, lightbox);
+    }
+}
+
+fn draw_image_mosaic(
+    ui: &Ui,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    textures: &mut TextureCache,
+    images: &[&rustcord_client::models::Attachment],
+    lightbox: &mut Option<String>,
+) {
+    let width = ui.content_region_avail()[0].min(MOSAIC_MAX_WIDTH).max(120.0);
+    let _spacing = ui.push_style_var(imgui::StyleVar::ItemSpacing([MOSAIC_GAP, MOSAIC_GAP]));
+    let mut remaining = images.iter();
+    for row in mosaic_rows(images.len()) {
+        let cell_width = (width - MOSAIC_GAP * (row as f32 - 1.0)) / row as f32;
+        let cell = [cell_width, if row == 1 { width * 0.5 } else { cell_width }];
+        for (column, attachment) in remaining.by_ref().take(row).enumerate() {
+            if column > 0 {
+                ui.same_line();
+            }
+            let clicked = ui.invisible_button(format!("##mosaic_{}", attachment.id), cell);
+            let (p_min, p_max) = (ui.item_rect_min(), ui.item_rect_max());
+            let hovered = ui.is_item_hovered();
+            let dl = ui.get_window_draw_list();
+            match textures.get(&attachment.url) {
+                Some((texture_id, size)) => {
+                    let (uv_min, uv_max) = cover_uv(size, cell);
+                    dl.add_image_rounded(texture_id, p_min, p_max, 6.0).uv_min(uv_min).uv_max(uv_max).build();
+                }
+                None => {
+                    if !textures.is_failed(&attachment.url) {
+                        textures.request(&attachment.url, cmd_tx);
+                    }
+                    dl.add_rect(p_min, p_max, [0.5, 0.5, 0.5, 0.15]).filled(true).rounding(6.0).build();
+                }
+            }
+            if hovered {
+                dl.add_rect(p_min, p_max, [1.0, 1.0, 1.0, 0.12]).filled(true).rounding(6.0).build();
+                ui.tooltip_text(&attachment.filename);
+            }
+            if clicked {
+                *lightbox = Some(attachment.url.clone());
+            }
+        }
+    }
+}
+
 fn draw_attachment(
     ui: &Ui,
     cmd_tx: &UnboundedSender<UiCommand>,
@@ -2891,10 +3049,10 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     .any(|id| state.current_user.as_ref().is_none_or(|u| u.id != *id));
             let extra_banner_height = (typing_visible as u32 as f32
                 + state.reply_target.is_some() as u32 as f32
-                + state.pending_attachment.is_some() as u32 as f32
                 + state.editing.is_some() as u32 as f32
                 + state.uploads.len() as f32)
-                * line_height;
+                * line_height
+                + if state.pending_attachments.contains_key(&channel_key) { ATTACHMENT_TRAY_HEIGHT + ui.clone_style().item_spacing[1] } else { 0.0 };
 
             let _history_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
             ui.child_window(format!("history_{channel_key}"))
@@ -3024,9 +3182,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
                                     draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
-                                for attachment in &msg.attachments {
-                                    draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
-                                }
+                                draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
                                 draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
                                 for code in &row.invites {
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
@@ -3049,9 +3205,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 for (embed_idx, embed) in msg.embeds.iter().enumerate() {
                                     draw_embed(ui, fonts, &state.theme, embed, &format!("{}_{embed_idx}", msg.id), textures, cmd_tx, &mut state.image_lightbox, &mut state.revealed_spoilers, &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names });
                                 }
-                                for attachment in &msg.attachments {
-                                    draw_attachment(ui, cmd_tx, textures, attachment, &mut state.image_lightbox);
-                                }
+                                draw_attachments(ui, cmd_tx, textures, &msg.attachments, &mut state.image_lightbox);
                                 draw_sticker_items(ui, &state.theme, textures, cmd_tx, &msg.sticker_items);
                                 for code in &row.invites {
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
@@ -3211,13 +3365,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 }
             }
 
-            if let Some(path) = state.pending_attachment.clone() {
-                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                ui.text_colored(state.theme.accent, format!("Attached: {name}"));
-                ui.same_line();
-                if ui.small_button("x") {
-                    state.pending_attachment = None;
-                }
+            if let Some(channel_id) = state.selected_channel.clone() {
+                draw_attachment_tray(ui, state, textures, cmd_tx, &channel_id);
             }
 
             let mut cancelled_upload = None;
@@ -3258,14 +3407,21 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .build();
 
             let composer_icon = ui.frame_height();
-            let attach_tint = state.pending_attachment.is_some().then_some(state.theme.accent);
-            if icon_button_sized(ui, textures, "compose_attach", crate::icons::Icon::CirclePlus, "Attach a file", attach_tint, composer_icon) {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("All files", &["*"])
-                    .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
-                    .pick_file()
-                {
-                    state.pending_attachment = Some(path);
+            let attach_tint = state.selected_channel.as_ref().is_some_and(|c| state.pending_attachments.contains_key(c)).then_some(state.theme.accent);
+            if icon_button_sized(ui, textures, "compose_attach", crate::icons::Icon::CirclePlus, "Attach files", attach_tint, composer_icon) {
+                if let (Some(channel_id), Some(paths)) = (
+                    state.selected_channel.clone(),
+                    rfd::FileDialog::new()
+                        .add_filter("All files", &["*"])
+                        .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"])
+                        .pick_files(),
+                ) {
+                    for path in paths {
+                        if !state.queue_attachment_path(&channel_id, path) {
+                            break;
+                        }
+                    }
+                    state.focus_compose = true;
                 }
             }
             let plus_width = composer_icon;
@@ -3337,16 +3493,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if compose_focused && ui.io().key_ctrl && ui.is_key_pressed(imgui::Key::V) {
                 if let Some(channel_id) = state.selected_channel.clone() {
                     if let Some((filename, bytes)) = crate::clipboard::read_image_as_png() {
-                        let content = std::mem::take(&mut state.compose_buf);
-                        let reply_to = state.reply_target.take().map(|m| m.id);
-                        let _ = cmd_tx.send(UiCommand::SendAttachmentBytes {
-                            channel_id,
-                            content,
-                            filename,
-                            bytes,
-                            content_type: "image/png".to_string(),
-                            reply_to,
-                        });
+                        let source = crate::app_state::AttachmentSource::Bytes { bytes: std::sync::Arc::new(bytes), content_type: "image/png".to_string() };
+                        state.queue_attachment(&channel_id, filename, source);
                     }
                 }
             }
@@ -3379,10 +3527,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 if let Some(channel_id) = state.selected_channel.clone() {
                     let content = std::mem::take(&mut state.compose_buf);
                     let reply_to = state.reply_target.take().map(|m| m.id);
-                    if let Some(path) = state.pending_attachment.take() {
-                        let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-                        let (upload_id, progress) = state.start_upload(filename);
-                        let _ = cmd_tx.send(UiCommand::SendAttachment { channel_id, content, path, reply_to, upload_id, progress });
+                    let files = state.take_attachments(&channel_id);
+                    if !files.is_empty() {
+                        let label = match files.as_slice() {
+                            [only] => only.filename.clone(),
+                            many => format!("{} files", many.len()),
+                        };
+                        let (upload_id, progress) = state.start_upload(label);
+                        let _ = cmd_tx.send(UiCommand::SendAttachments { channel_id, content, files, reply_to, upload_id, progress });
                     } else if !content.trim().is_empty() {
                         let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to });
                     }
@@ -5165,7 +5317,6 @@ fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureC
     }
 }
 
-#[cfg(any(test, feature = "screenshare"))]
 fn cover_uv(source: [f32; 2], target: [f32; 2]) -> ([f32; 2], [f32; 2]) {
     let source_aspect = source[0].max(1.0) / source[1].max(1.0);
     let target_aspect = target[0].max(1.0) / target[1].max(1.0);
@@ -7803,5 +7954,36 @@ mod cover_uv_tests {
     #[test]
     fn matching_aspects_use_the_whole_image() {
         assert_eq!(cover_uv([1280.0, 720.0], [640.0, 360.0]), ([0.0, 0.0], [1.0, 1.0]));
+    }
+}
+
+#[cfg(test)]
+mod mosaic_tests {
+    use super::mosaic_rows;
+
+    #[test]
+    fn rows_follow_discords_layouts() {
+        let layouts: Vec<Vec<usize>> = (2..=10).map(mosaic_rows).collect();
+        assert_eq!(
+            layouts,
+            [
+                vec![2],
+                vec![1, 2],
+                vec![2, 2],
+                vec![2, 3],
+                vec![3, 3],
+                vec![1, 3, 3],
+                vec![2, 3, 3],
+                vec![3, 3, 3],
+                vec![1, 3, 3, 3],
+            ]
+        );
+    }
+
+    #[test]
+    fn every_image_gets_exactly_one_cell() {
+        for count in 0..=10 {
+            assert_eq!(mosaic_rows(count).iter().sum::<usize>(), count);
+        }
     }
 }

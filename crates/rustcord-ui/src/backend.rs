@@ -117,23 +117,16 @@ pub enum UiCommand {
     RevokeInvite { code: String },
     UpdateGuildSettings { guild_key: String, patch: serde_json::Value },
     SearchGifs { query: String },
-    SendAttachment {
+    SendAttachments {
         channel_id: String,
         content: String,
-        path: std::path::PathBuf,
+        files: Vec<crate::app_state::PendingAttachment>,
         reply_to: Option<String>,
         upload_id: u64,
         progress: std::sync::Arc<rustcord_client::rest::UploadProgress>,
     },
     CancelUpload { upload_id: u64 },
-    SendAttachmentBytes {
-        channel_id: String,
-        content: String,
-        filename: String,
-        bytes: Vec<u8>,
-        content_type: String,
-        reply_to: Option<String>,
-    },
+    PreviewAttachment { key: String, source: crate::app_state::AttachmentSource },
     DownloadImage { url: String },
     ShowNotification { title: String, body: String, avatar_url: String },
     #[cfg(feature = "video")]
@@ -448,36 +441,24 @@ pub fn spawn(
                         });
                     }
                 }
-                UiCommand::SendAttachment { channel_id, content, path, reply_to, upload_id, progress } => {
+                UiCommand::SendAttachments { channel_id, content, files, reply_to, upload_id, progress } => {
                     if let Some(client) = rest.clone() {
                         let event_tx = event_tx.clone();
                         let task = tokio::spawn(async move {
-                            let filename = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "file".into());
-                            let content_type = mime_guess_from_path(&path);
-                            match tokio::fs::read(&path).await {
-                                Ok(bytes) => {
-                                    progress.total.store(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                            match read_attachments(files).await {
+                                Ok(files) => {
+                                    let total = files.iter().map(|f| f.bytes.len() as u64).sum();
+                                    progress.total.store(total, std::sync::atomic::Ordering::Relaxed);
                                     if let Err(e) = client
-                                        .send_message_with_attachment_progress(
-                                            &channel_id,
-                                            &content,
-                                            &filename,
-                                            bytes,
-                                            content_type,
-                                            reply_to.as_deref(),
-                                            Some(progress),
-                                        )
+                                        .send_message_with_files(&channel_id, &content, files, reply_to.as_deref(), Some(progress))
                                         .await
                                     {
                                         tracing::warn!("attachment send failed: {e}");
-                                        let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachment: {e}")));
+                                        let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachments: {e}")));
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to read file: {e}")));
+                                    let _ = event_tx.send(BackendEvent::Error(e));
                                 }
                             }
                             UPLOADS.lock().unwrap().remove(&upload_id);
@@ -486,27 +467,25 @@ pub fn spawn(
                         UPLOADS.lock().unwrap().insert(upload_id, task.abort_handle());
                     }
                 }
+                UiCommand::PreviewAttachment { key, source } => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let bytes = match source {
+                            crate::app_state::AttachmentSource::Path(path) => tokio::fs::read(&path).await.ok().map(std::sync::Arc::new),
+                            crate::app_state::AttachmentSource::Bytes { bytes, .. } => Some(bytes),
+                        };
+                        let image = match bytes {
+                            Some(bytes) => tokio::task::spawn_blocking(move || crate::images::decode(&bytes))
+                                .await
+                                .unwrap_or(crate::images::Decoded::Failed),
+                            None => crate::images::Decoded::Failed,
+                        };
+                        let _ = event_tx.send(BackendEvent::ImageDownloaded { url: key, image });
+                    });
+                }
                 UiCommand::CancelUpload { upload_id } => {
                     if let Some(task) = UPLOADS.lock().unwrap().remove(&upload_id) {
                         task.abort();
-                    }
-                }
-                UiCommand::SendAttachmentBytes { channel_id, content, filename, bytes, content_type, reply_to } => {
-                    if let Some(client) = &rest {
-                        if let Err(e) = client
-                            .send_message_with_attachment_reply(
-                                &channel_id,
-                                &content,
-                                &filename,
-                                bytes,
-                                &content_type,
-                                reply_to.as_deref(),
-                            )
-                            .await
-                        {
-                            tracing::warn!("pasted attachment send failed: {e}");
-                            let _ = event_tx.send(BackendEvent::Error(format!("failed to send attachment: {e}")));
-                        }
                     }
                 }
                 UiCommand::DownloadImage { url } => {
@@ -1317,6 +1296,23 @@ fn try_spawn_voice_gateway(
             tracing::warn!("voice gateway task exited: {e}");
         }
     });
+}
+
+async fn read_attachments(files: Vec<crate::app_state::PendingAttachment>) -> Result<Vec<rustcord_client::rest::UploadFile>, String> {
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        let (bytes, content_type) = match file.source {
+            crate::app_state::AttachmentSource::Path(path) => {
+                let bytes = tokio::fs::read(&path).await.map_err(|e| format!("failed to read {}: {e}", file.filename))?;
+                (bytes, mime_guess_from_path(&path).to_string())
+            }
+            crate::app_state::AttachmentSource::Bytes { bytes, content_type } => {
+                (std::sync::Arc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone()), content_type)
+            }
+        };
+        out.push(rustcord_client::rest::UploadFile { filename: file.filename, bytes, content_type });
+    }
+    Ok(out)
 }
 
 async fn load_guild_emojis(client: &RestClient, guild_id: String, event_tx: &mpsc::UnboundedSender<BackendEvent>) {

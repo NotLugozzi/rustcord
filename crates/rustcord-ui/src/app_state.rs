@@ -438,7 +438,9 @@ pub struct AppState {
     pub reached_start: std::collections::HashSet<String>,
     pub incoming_calls: Vec<String>,
     pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub pending_attachment: Option<std::path::PathBuf>,
+    pub pending_attachments: HashMap<String, Vec<PendingAttachment>>,
+    pub next_attachment_id: u64,
+    pub attachment_previews_requested: std::collections::HashSet<u64>,
     pub revealed_spoilers: std::collections::HashSet<usize>,
     pub typing_users: HashMap<String, HashMap<String, std::time::Instant>>,
     pub last_typing_sent: Option<std::time::Instant>,
@@ -550,6 +552,37 @@ pub enum PinsState {
     Loading,
     Ready(Vec<Message>),
     Failed,
+}
+
+pub const MAX_ATTACHMENTS: usize = 10;
+
+#[derive(Clone)]
+pub enum AttachmentSource {
+    Path(std::path::PathBuf),
+    Bytes { bytes: std::sync::Arc<Vec<u8>>, content_type: String },
+}
+
+#[derive(Clone)]
+pub struct PendingAttachment {
+    pub id: u64,
+    pub filename: String,
+    pub source: AttachmentSource,
+}
+
+impl PendingAttachment {
+    pub fn is_image(&self) -> bool {
+        match &self.source {
+            AttachmentSource::Bytes { content_type, .. } => content_type.starts_with("image/"),
+            AttachmentSource::Path(_) => {
+                let ext = self.filename.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+                matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+            }
+        }
+    }
+
+    pub fn preview_key(&self) -> String {
+        format!("local-attachment:{}", self.id)
+    }
 }
 
 pub struct PendingUpload {
@@ -1402,6 +1435,40 @@ impl AppState {
             Some(name) => format!("Message #{name}"),
             None => "Message".to_string(),
         }
+    }
+
+    pub fn queue_attachment(&mut self, channel_id: &str, filename: String, source: AttachmentSource) -> bool {
+        let queue = self.pending_attachments.entry(channel_id.to_string()).or_default();
+        if queue.len() >= MAX_ATTACHMENTS {
+            self.status_message = Some(format!("You can attach up to {MAX_ATTACHMENTS} files to one message."));
+            return false;
+        }
+        self.next_attachment_id += 1;
+        queue.push(PendingAttachment { id: self.next_attachment_id, filename, source });
+        true
+    }
+
+    pub fn queue_attachment_path(&mut self, channel_id: &str, path: std::path::PathBuf) -> bool {
+        let filename = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+        self.queue_attachment(channel_id, filename, AttachmentSource::Path(path))
+    }
+
+    pub fn remove_attachment(&mut self, channel_id: &str, id: u64) {
+        if let Some(queue) = self.pending_attachments.get_mut(channel_id) {
+            queue.retain(|a| a.id != id);
+            if queue.is_empty() {
+                self.pending_attachments.remove(channel_id);
+            }
+        }
+        self.attachment_previews_requested.remove(&id);
+    }
+
+    pub fn take_attachments(&mut self, channel_id: &str) -> Vec<PendingAttachment> {
+        let taken = self.pending_attachments.remove(channel_id).unwrap_or_default();
+        for attachment in &taken {
+            self.attachment_previews_requested.remove(&attachment.id);
+        }
+        taken
     }
 
     pub fn start_upload(&mut self, filename: String) -> (u64, std::sync::Arc<rustcord_client::rest::UploadProgress>) {
@@ -2294,6 +2361,48 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["blob", "\u{1F600}"]);
+    }
+
+    fn bytes_source() -> AttachmentSource {
+        AttachmentSource::Bytes { bytes: std::sync::Arc::new(vec![1, 2, 3]), content_type: "image/png".into() }
+    }
+
+    #[test]
+    fn attachments_queue_per_channel_and_stop_at_the_discord_limit() {
+        let mut state = AppState::default();
+        for _ in 0..MAX_ATTACHMENTS {
+            assert!(state.queue_attachment("a", "image.png".into(), bytes_source()));
+        }
+        assert!(!state.queue_attachment("a", "one-too-many.png".into(), bytes_source()));
+        assert!(state.status_message.is_some());
+        assert!(state.queue_attachment_path("b", "/tmp/notes.txt".into()));
+        assert_eq!(state.pending_attachments["a"].len(), MAX_ATTACHMENTS);
+        assert_eq!(state.pending_attachments["b"][0].filename, "notes.txt");
+        assert_eq!(state.take_attachments("a").len(), MAX_ATTACHMENTS);
+        assert!(!state.pending_attachments.contains_key("a"));
+    }
+
+    #[test]
+    fn removing_the_last_attachment_drops_the_channel_entry() {
+        let mut state = AppState::default();
+        state.queue_attachment("a", "x.png".into(), bytes_source());
+        state.queue_attachment("a", "y.png".into(), bytes_source());
+        let first = state.pending_attachments["a"][0].id;
+        state.remove_attachment("a", first);
+        assert_eq!(state.pending_attachments["a"].iter().map(|a| a.filename.as_str()).collect::<Vec<_>>(), ["y.png"]);
+        let second = state.pending_attachments["a"][0].id;
+        state.remove_attachment("a", second);
+        assert!(state.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn image_detection_uses_the_content_type_or_the_extension() {
+        let mut state = AppState::default();
+        state.queue_attachment("a", "clip.bin".into(), bytes_source());
+        state.queue_attachment_path("a", "/tmp/Photo.JPG".into());
+        state.queue_attachment_path("a", "/tmp/report.pdf".into());
+        let flags: Vec<bool> = state.pending_attachments["a"].iter().map(PendingAttachment::is_image).collect();
+        assert_eq!(flags, [true, true, false]);
     }
 
     #[test]

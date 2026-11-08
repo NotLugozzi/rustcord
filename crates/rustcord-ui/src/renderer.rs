@@ -365,8 +365,8 @@ impl ApplicationHandler for App {
                 self.needs_redraw = true;
             }
             WindowEvent::DroppedFile(path) => {
-                if self.state.selected_channel.is_some() {
-                    self.state.pending_attachment = Some(path.clone());
+                if let Some(channel_id) = self.state.selected_channel.clone() {
+                    self.state.queue_attachment_path(&channel_id, path.clone());
                     self.state.focus_compose = true;
                 }
                 self.needs_redraw = true;

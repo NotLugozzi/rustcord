@@ -4,6 +4,11 @@ pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
+pub const CREATE_INSTANT_INVITE: u64 = 1 << 0;
+pub const MANAGE_CHANNELS: u64 = 1 << 4;
+pub const MANAGE_GUILD: u64 = 1 << 5;
+pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const MODERATE_MEMBERS: u64 = 1 << 40;
 
 pub fn compute_base_permissions(member_role_ids: &[Snowflake], everyone_role_id: &str, roles: &[Role]) -> u64 {
     let mut permissions: u64 = 0;

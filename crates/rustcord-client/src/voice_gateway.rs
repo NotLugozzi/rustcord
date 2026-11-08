@@ -28,6 +28,8 @@ pub struct VoiceMediaState {
     pub system_audio_pid: Arc<std::sync::atomic::AtomicU32>,
     pub screen_share_max_height: Arc<std::sync::atomic::AtomicU32>,
     pub screen_share_fps: Arc<std::sync::atomic::AtomicU32>,
+    pub camera_enabled: Arc<AtomicBool>,
+    pub camera_device: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -106,6 +108,7 @@ pub enum VoiceGatewayEvent {
     Ready,
     MediaConnected,
     ScreenShareStopped,
+    CameraStopped { error: Option<String> },
     #[cfg(feature = "screenshare")]
     VideoFrame { user_id: String, width: u32, height: u32, rgba: Vec<u8> },
     Speaking { ssrc: u32, user_id: Option<String>, speaking: bool },
@@ -196,9 +199,11 @@ impl VoiceGateway {
                 "user_id": self.user_id,
                 "session_id": self.session_id,
                 "token": self.token,
-                "video": self.stream_media,
+                "video": self.stream_media || cfg!(feature = "screenshare"),
                 "streams": if self.publish_stream {
                     json!([{ "type": "screen", "rid": "100", "quality": 100 }])
+                } else if !self.stream_media && cfg!(feature = "screenshare") {
+                    json!([{ "type": "video", "rid": "100", "quality": 100 }])
                 } else {
                     json!([])
                 },
@@ -296,6 +301,11 @@ impl VoiceGateway {
         let _ = &system_audio_tx;
         let (video_frame_tx, mut video_frame_rx) = mpsc::channel(2);
         let mut screen_share_check = tokio::time::interval(Duration::from_millis(250));
+        let mut camera_check = tokio::time::interval(Duration::from_millis(250));
+        let mut camera_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+        let (camera_preview_tx, mut camera_preview_rx) = mpsc::channel::<(u32, u32, Vec<u8>)>(2);
+        #[cfg(not(feature = "screenshare"))]
+        let _ = (&camera_preview_tx, &mut camera_task);
         let (video_packet_tx, video_packet_rx) = mpsc::channel(4);
         let (decoded_video_tx, mut decoded_video_rx) = mpsc::channel(2);
         tokio::task::spawn_blocking(move || decode_screen_packets(video_packet_rx, decoded_video_tx));
@@ -515,6 +525,52 @@ impl VoiceGateway {
                         _ => {}
                     }
                 }
+                _ = camera_check.tick(), if media_connected && !self.stream_media => {
+                    let requested = self.media_state.camera_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                    if camera_task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+                        let error = match camera_task.take().expect("finished camera task").await {
+                            Ok(Ok(())) => None,
+                            Ok(Err(error)) => Some(error),
+                            Err(error) => Some(format!("camera worker failed: {error}")),
+                        };
+                        if let Some(error) = &error {
+                            tracing::warn!("camera stopped: {error}");
+                        }
+                        self.media_state.camera_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.send(VoiceGatewayEvent::CameraStopped { error });
+                        continue;
+                    }
+                    #[cfg(feature = "screenshare")]
+                    if !requested && video_announced && camera_task.is_none() {
+                        let inactive = rtc.as_ref().map(|active| {
+                            camera_state_frame(active.audio_ssrc(), active.video_ssrc(), active.video_rtx_ssrc(), false)
+                        }).unwrap_or_default();
+                        if let Err(error) = write.send(WsMessage::Text(inactive)).await {
+                            break Err(error.into());
+                        }
+                        video_announced = false;
+                    }
+                    #[cfg(feature = "screenshare")]
+                    if requested && camera_task.is_none() {
+                        let frames = video_frame_tx.clone();
+                        let preview = camera_preview_tx.clone();
+                        let enabled = self.media_state.camera_enabled.clone();
+                        let device = self.media_state.camera_device.lock().unwrap().clone();
+                        let codec = negotiated_video_codec;
+                        camera_task = Some(tokio::task::spawn_blocking(move || capture_and_encode_camera(frames, preview, enabled, device, codec)));
+                    }
+                    #[cfg(not(feature = "screenshare"))]
+                    if requested {
+                        self.media_state.camera_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.send(VoiceGatewayEvent::CameraStopped { error: Some("this build has no video support".into()) });
+                    }
+                }
+                Some((width, height, rgba)) = camera_preview_rx.recv() => {
+                    #[cfg(feature = "screenshare")]
+                    let _ = tx.send(VoiceGatewayEvent::VideoFrame { user_id: self.user_id.clone(), width, height, rgba });
+                    #[cfg(not(feature = "screenshare"))]
+                    let _ = (width, height, rgba);
+                }
                 Some(samples) = system_audio_rx.recv(), if self.stream_media && self.publish_stream && media_connected => {
                     system_audio_pending.extend(samples);
                     let mut send_error = None;
@@ -561,7 +617,11 @@ impl VoiceGateway {
                             continue;
                         }
                         if !video_announced {
-                            let active = video_state_frame(active_rtc.audio_ssrc(), active_rtc.video_ssrc(), active_rtc.video_rtx_ssrc(), true);
+                            let active = if self.stream_media {
+                                video_state_frame(active_rtc.audio_ssrc(), active_rtc.video_ssrc(), active_rtc.video_rtx_ssrc(), true)
+                            } else {
+                                camera_state_frame(active_rtc.audio_ssrc(), active_rtc.video_ssrc(), active_rtc.video_rtx_ssrc(), true)
+                            };
                             if let Err(error) = write.send(WsMessage::Text(active)).await {
                                 break Err(error.into());
                             }
@@ -725,7 +785,7 @@ impl VoiceGateway {
                                                 tracing::warn!("voice: gateway selected a screen-share codec different from the advertised encoder");
                                             }
                                         } else {
-                                            tracing::debug!("voice: negotiated remote video codec {codec}");
+                                            tracing::info!("voice: call video codec is {codec}");
                                         }
                                     }
                                     target_dave_version = data["dave_protocol_version"].as_u64().unwrap_or(0) as u32;
@@ -1043,8 +1103,10 @@ impl VoiceGateway {
                             let audio_ssrc = rtc.as_ref().map(|r| r.audio_ssrc()).unwrap_or_default();
                             #[cfg(feature = "screenshare")]
                             let client_connect = rtc.as_ref().map(|r| {
-                                if self.publish_stream || (!self.stream_media && ready_video_ssrcs.is_some()) {
+                                if self.publish_stream {
                                     video_state_frame(audio_ssrc, r.video_ssrc(), r.video_rtx_ssrc(), false)
+                                } else if !self.stream_media && ready_video_ssrcs.is_some() {
+                                    camera_state_frame(audio_ssrc, r.video_ssrc(), r.video_rtx_ssrc(), false)
                                 } else {
                                     json!({ "op": 12, "d": { "audio_ssrc": audio_ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] } }).to_string()
                                 }
@@ -1305,6 +1367,9 @@ impl VoiceGateway {
         drop(mic);
         drop(speaker);
         self.media_state.screen_sharing.store(false, std::sync::atomic::Ordering::Relaxed);
+        if !self.stream_media {
+            self.media_state.camera_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(task) = screen_share_task.take() {
             task.abort();
         }
@@ -1338,6 +1403,61 @@ async fn capture_and_encode_screen(
         let _ = (max_height, framerate);
         Err("screen sharing was not enabled in this build".into())
     }
+}
+
+#[cfg(feature = "screenshare")]
+const CAMERA_PREVIEW_WIDTH: u32 = 480;
+#[cfg(feature = "screenshare")]
+const CAMERA_PREVIEW_EVERY: u64 = 2;
+
+#[cfg(feature = "screenshare")]
+fn capture_and_encode_camera(
+    frames: mpsc::Sender<EncodedVideoFrame>,
+    preview: mpsc::Sender<(u32, u32, Vec<u8>)>,
+    enabled: Arc<AtomicBool>,
+    device: Option<String>,
+    codec: crate::screen_decode::VideoCodec,
+) -> Result<(), String> {
+    let settings = crate::camera_capture::CameraSettings::default();
+    let mut capture = crate::camera_capture::CameraCapture::open(device.as_deref(), settings).map_err(|error| error.to_string())?;
+    let probed = crate::screen_encode::probe_encoder();
+    let choice = crate::screen_encode::encoder_for(codec, &probed)
+        .ok_or_else(|| format!("the call uses {codec:?} and no {codec:?} encoder is available"))?;
+    let mut captured = 0u64;
+    let mut failure = None;
+    let next_frame = || match capture.next_frame() {
+        Ok(Some(frame)) => {
+            captured += 1;
+            if captured % CAMERA_PREVIEW_EVERY == 1 {
+                let _ = preview.try_send(preview_rgba(&frame, CAMERA_PREVIEW_WIDTH));
+            }
+            Some(frame)
+        }
+        Ok(None) => None,
+        Err(error) => {
+            failure = Some(error.to_string());
+            None
+        }
+    };
+    encode_video_frames(next_frame, frames, enabled, settings.height, settings.frame_rate, choice, "camera")?;
+    failure.map_or(Ok(()), Err)
+}
+
+#[cfg(feature = "screenshare")]
+fn preview_rgba(frame: &crate::screen_capture::CapturedFrame, max_width: u32) -> (u32, u32, Vec<u8>) {
+    let step = frame.width.div_ceil(max_width.max(1)).max(1);
+    let (width, height) = ((frame.width / step).max(1), (frame.height / step).max(1));
+    let (red, blue) = (frame.layout.red_offset(), frame.layout.blue_offset());
+    let stride = frame.stride();
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        let row = (y * step) as usize * stride;
+        for x in 0..width {
+            let px = &frame.pixels[row + (x * step) as usize * 4..][..4];
+            rgba.extend_from_slice(&[px[red], px[1], px[blue], 255]);
+        }
+    }
+    (width, height, rgba)
 }
 
 #[cfg(feature = "screenshare")]
@@ -1429,6 +1549,19 @@ fn encode_screen_frames(
     framerate: u32,
     encoder_choice: crate::screen_encode::EncoderChoice,
 ) -> Result<(), String> {
+    encode_video_frames(|| capture.blocking_next_frame(), frames, sharing, max_height, framerate, encoder_choice, "screen share")
+}
+
+#[cfg(feature = "screenshare")]
+fn encode_video_frames(
+    mut next_frame: impl FnMut() -> Option<crate::screen_capture::CapturedFrame>,
+    frames: mpsc::Sender<EncodedVideoFrame>,
+    sharing: Arc<AtomicBool>,
+    max_height: u32,
+    framerate: u32,
+    encoder_choice: crate::screen_encode::EncoderChoice,
+    source: &'static str,
+) -> Result<(), String> {
     use crate::screen_encode::{EncodeTimingSample, EncoderSettings, ScreenEncoder};
 
     let mut encoder: Option<ScreenEncoder> = None;
@@ -1436,7 +1569,7 @@ fn encode_screen_frames(
     let mut timing = EncodeTimingSample::default();
     let mut queue_drops = 0u64;
     while sharing.load(std::sync::atomic::Ordering::Relaxed) {
-        let Some(frame) = capture.blocking_next_frame() else { break };
+        let Some(frame) = next_frame() else { break };
         if encoder.as_ref().is_none_or(|current| !current.matches_source(frame.width, frame.height, frame.layout)) {
             let bitrate_bps = match (max_height >= 1080, framerate >= 60) {
                 (true, true) => 4_000_000,
@@ -1462,7 +1595,8 @@ fn encode_screen_frames(
                 backend = encoder_choice.backend_name(),
                 codec = ?encoder_choice.codec,
                 conversion = new_encoder.conversion_name(),
-                "screen share encoder configured"
+                source,
+                "video encoder configured"
             );
             encoder = Some(new_encoder);
         }
@@ -1489,7 +1623,8 @@ fn encode_screen_frames(
                 queue_drops,
                 backend = encoder_choice.backend_name(),
                 codec = ?encoder_choice.codec,
-                "screen share encoder stage timing"
+                source,
+                "video encoder stage timing"
             );
             timing_started = Instant::now();
             timing = EncodeTimingSample::default();
@@ -1506,7 +1641,7 @@ fn encode_screen_frames(
                 codec: encoder_choice.codec,
             }).is_err() {
                 queue_drops += 1;
-                tracing::trace!("screen share: dropping encoded frame because the RTP queue is full");
+                tracing::trace!(source, "dropping encoded frame because the RTP queue is full");
             }
         }
     }
@@ -1717,6 +1852,31 @@ fn video_state_frame(audio_ssrc: u32, video_ssrc: u32, rtx_ssrc: u32, active: bo
 }
 
 #[cfg(feature = "screenshare")]
+fn camera_state_frame(audio_ssrc: u32, video_ssrc: u32, rtx_ssrc: u32, active: bool) -> String {
+    let settings = crate::camera_capture::CameraSettings::default();
+    json!({
+        "op": 12,
+        "d": {
+            "audio_ssrc": audio_ssrc,
+            "video_ssrc": if active { video_ssrc } else { 0 },
+            "rtx_ssrc": if active { rtx_ssrc } else { 0 },
+            "streams": [{
+                "type": "video",
+                "rid": "100",
+                "ssrc": video_ssrc,
+                "active": active,
+                "quality": 100,
+                "rtx_ssrc": rtx_ssrc,
+                "max_bitrate": 2500000,
+                "max_framerate": settings.frame_rate,
+                "max_resolution": { "type": "fixed", "width": settings.width, "height": settings.height }
+            }]
+        }
+    })
+    .to_string()
+}
+
+#[cfg(feature = "screenshare")]
 fn media_sink_wants(video_ssrc: u32) -> String {
     json!({
         "op": 15,
@@ -1726,4 +1886,41 @@ fn media_sink_wants(video_ssrc: u32) -> String {
             "pixelCounts": { video_ssrc.to_string(): 0 }
         }
     }).to_string()
+}
+
+#[cfg(all(test, feature = "screenshare"))]
+mod camera_tests {
+    use super::*;
+
+    #[test]
+    fn camera_state_announces_a_fixed_720p_video_stream_only_while_active() {
+        let on: Value = serde_json::from_str(&camera_state_frame(1, 2, 3, true)).unwrap();
+        assert_eq!(on["op"], 12);
+        assert_eq!((on["d"]["video_ssrc"].as_u64(), on["d"]["rtx_ssrc"].as_u64()), (Some(2), Some(3)));
+        let stream = &on["d"]["streams"][0];
+        assert_eq!(stream["type"], "video");
+        assert_eq!(stream["max_resolution"], json!({ "type": "fixed", "width": 1280, "height": 720 }));
+        let off: Value = serde_json::from_str(&camera_state_frame(1, 2, 3, false)).unwrap();
+        assert_eq!((off["d"]["video_ssrc"].as_u64(), off["d"]["streams"][0]["active"].as_bool()), (Some(0), Some(false)));
+        assert_eq!(off["d"]["streams"][0]["ssrc"], 2);
+    }
+
+    #[test]
+    fn the_preview_is_downscaled_and_swizzled_to_rgba() {
+        let mut pixels = Vec::new();
+        for _ in 0..4 * 2 {
+            pixels.extend_from_slice(&[10, 20, 30, 0]);
+        }
+        let frame = crate::screen_capture::CapturedFrame {
+            width: 4,
+            height: 2,
+            layout: crate::screen_capture::PixelLayout::Bgrx,
+            pixels,
+            captured_at: Instant::now(),
+        };
+        let (width, height, rgba) = preview_rgba(&frame, 2);
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba, [30, 20, 10, 255, 30, 20, 10, 255]);
+        assert_eq!(preview_rgba(&frame, 480).0, 4);
+    }
 }

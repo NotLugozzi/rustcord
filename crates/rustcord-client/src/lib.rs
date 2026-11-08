@@ -1,4 +1,6 @@
 pub mod captcha;
+#[cfg(feature = "screenshare")]
+pub mod camera_capture;
 pub mod cdn;
 pub mod dave;
 pub mod dave_frame_crypto;

@@ -129,6 +129,17 @@ impl ScreenEncoder {
     }
 }
 
+pub fn software_vp8() -> EncoderChoice {
+    EncoderChoice { codec: VideoCodec::Vp8, backend: EncoderBackend::SoftwareVp8 }
+}
+
+pub fn encoder_for(codec: VideoCodec, probed: &EncoderChoice) -> Option<EncoderChoice> {
+    if probed.codec == codec {
+        return Some(probed.clone());
+    }
+    (codec == VideoCodec::Vp8).then(software_vp8)
+}
+
 pub fn probe_encoder() -> EncoderChoice {
     if let Ok(entries) = std::fs::read_dir("/dev/dri") {
         let mut devices = entries
