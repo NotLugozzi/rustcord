@@ -443,6 +443,7 @@ pub struct AppState {
     pub poll_card_heights: HashMap<String, f32>,
     pub poll_draft: Option<PollDraft>,
     pub devtools_requested: bool,
+    pub font_fetches: HashMap<crate::theme::FontSpec, Option<String>>,
     pub next_attachment_id: u64,
     pub attachment_previews_requested: std::collections::HashSet<u64>,
     pub revealed_spoilers: std::collections::HashSet<usize>,
@@ -1824,6 +1825,12 @@ impl AppState {
             .collect();
         voice.sort_by_key(|c| c.position.unwrap_or(i32::MAX));
         voice
+    }
+
+    pub fn connected_voice_server_name(&self) -> Option<String> {
+        let (guild_id, _) = self.connected_voice_channel.as_ref()?;
+        let guild_id = guild_id.as_deref()?;
+        self.guilds.iter().find(|g| g.id == guild_id).map(|g| g.name.clone())
     }
 
     pub fn connected_voice_channel_name(&self) -> Option<String> {

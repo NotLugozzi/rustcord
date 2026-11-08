@@ -83,14 +83,22 @@ Themes are plain TOML files under `~/.config/rustcord/themes/` (platform
 equivalent paths apply on Windows/macOS), each defining a small color
 palette. The built-in themes are installed there on first launch, including
 in packaged builds. Alongside Discord Dark, Nord, and Solarized Light, the
-picker includes Aurora, Sunset, and Cosmic gradients. Custom themes may add
-an optional two-color horizontal gradient. `background` is the main app
-surface when no gradient is set; a gradient replaces it across the main panes.
+picker includes Aurora, Sunset, Cosmic and Cyberpunk gradients. Custom themes
+may add an optional global gradient. `background` is the main app surface when
+no gradient is set; a gradient replaces it across the main panes.
 `panel` colors inputs, popups, and raised surfaces. `text` and `text_muted` set
 primary and secondary text, `accent` colors actions and selected items,
 `accent_hover` colors their hover and pressed states, and `border` colors
 separators. The appearance editor lets you adjust the gradient independently
 from the solid colors.
+
+The gradient takes `use_global_gradient`, `global_gradient_start` and
+`global_gradient_end`, plus two optional keys. `global_gradient_angle` uses
+CSS degrees (0 = to top, 90 = to right, the default, 180 = to bottom).
+`global_gradient_ratio` either takes two stops, like CSS
+`linear-gradient(… 10%, … 65%)`, where the start colour is solid before the
+first and the end colour after the second, or a single number for where the
+two colours mix 50/50. The older `gradient = [[start], [end]]` key still loads.
 
 ```toml
 name = "my-theme"
@@ -101,8 +109,35 @@ text_muted    = [0.60, 0.62, 0.66, 1.0]
 accent        = [0.35, 0.40, 0.95, 1.0]
 accent_hover  = [0.45, 0.50, 1.0,  1.0]
 border        = [0.08, 0.09, 0.10, 1.0]
-gradient      = [[0.10, 0.75, 0.67, 1.0], [0.31, 0.27, 0.78, 1.0]]
+use_global_gradient   = true
+global_gradient_start = [0.10, 0.75, 0.67, 1.0]
+global_gradient_end   = [0.31, 0.27, 0.78, 1.0]
+global_gradient_angle = 135.0
+global_gradient_ratio = [0.1, 0.65]
 ```
+
+A theme can also bring its own fonts with an optional `[fonts]` table. Each
+style (`regular`, `bold`, `italic`, `bold_italic`, `mono`) takes one source:
+`google` (a Google Fonts family, with an optional `weight` and `italic`),
+`url` (a direct link to a `.ttf` or `.otf` file) or `path` (a font file,
+relative to the themes directory). `size` sets the base text size in points
+(default 16). Downloaded fonts are cached, so a theme works offline after its
+first use, and switching themes swaps fonts without a restart. Styles the
+theme leaves out keep the built-in Inter; a missing italic falls back to the
+theme's regular face. Glyphs the font lacks fall back to Inter and DejaVu
+Sans. WOFF/WOFF2 files are not supported.
+
+```toml
+[fonts]
+size = 17.0
+regular = { google = "Rajdhani", weight = 500 }
+bold = { google = "Rajdhani", weight = 700 }
+mono = { path = "fonts/MyMono.ttf" }
+```
+
+The bundled `cyberpunk` theme uses this, with a palette after Patryk
+Bielanin's [Cyberpunk 2077 theme](https://github.com/PatrykBielanin/discord-cyberpunk2077-theme)
+for BetterDiscord.
 
 Add your own TOML theme to that directory to make it appear in the theme
 switcher. The selected theme applies immediately; `discord-dark.toml` is the

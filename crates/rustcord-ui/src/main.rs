@@ -4,6 +4,7 @@ mod backend;
 mod clipboard;
 mod devtools;
 mod emoji;
+mod fonts;
 mod icons;
 mod images;
 mod invites;
@@ -409,6 +410,16 @@ pub fn drain_backend_events(
                     state.status_message = Some(format!("Camera stopped: {error}"));
                 }
             }
+            BackendEvent::FontFetched { spec, error } => match error {
+                Some(error) => {
+                    tracing::warn!("theme font failed to load: {error}");
+                    state.status_message = Some(format!("Theme font unavailable, using the default: {error}"));
+                    state.font_fetches.insert(spec, Some(error));
+                }
+                None => {
+                    state.font_fetches.remove(&spec);
+                }
+            },
             BackendEvent::CamerasLoaded(cameras) => {
                 state.cameras = cameras;
                 state.cameras_loaded = true;

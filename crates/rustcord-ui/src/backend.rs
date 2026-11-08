@@ -174,6 +174,7 @@ pub enum UiCommand {
     LoadScreenAudioSources,
     SetCamera { enabled: bool, guild_id: Option<String>, channel_id: String, self_mute: bool, self_deaf: bool },
     SetCameraDevice { device: Option<String> },
+    FetchFont { spec: crate::theme::FontSpec },
     LoadCameras,
     WatchStream { stream_key: String },
     StopWatchingStream { stream_key: String },
@@ -250,6 +251,7 @@ pub enum BackendEvent {
     ScreenShareStopped,
     CameraStopped { error: Option<String> },
     CamerasLoaded(Vec<(String, String)>),
+    FontFetched { spec: crate::theme::FontSpec, error: Option<String> },
     #[cfg(feature = "screenshare")]
     ScreenAudioSourcesLoaded { sources: Vec<(u32, String, bool)>, error: Option<String> },
     VoiceSpeaking { user_id: String, speaking: bool },
@@ -1064,6 +1066,14 @@ pub fn spawn(
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
                         *media_state.camera_device.lock().unwrap() = device;
                     }
+                }
+                UiCommand::FetchFont { spec } => {
+                    let events = event_tx.clone();
+                    tokio::spawn(async move {
+                        let client = HTTP.get_or_init(reqwest::Client::new);
+                        let error = crate::fonts::fetch(client, &spec).await.err();
+                        let _ = events.send(BackendEvent::FontFetched { spec, error });
+                    });
                 }
                 UiCommand::LoadCameras => {
                     let events = event_tx.clone();

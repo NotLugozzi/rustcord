@@ -15,6 +15,7 @@ headphone-off.svg    deafened (controls, voice member badge)
 headphones.svg       deafen toggle
 image.svg            channel icon change rows
 info.svg             connection info
+signal.svg           voice connection quality (voice panel)
 maximize.svg         video fullscreen
 message-circle.svg   About page logo
 mic-off.svg          muted (controls, voice member badge)

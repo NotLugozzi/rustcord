@@ -92,17 +92,10 @@ impl ImguiState {
     }
 }
 
-fn build_imgui(mut context: imgui::Context, window: &Window, device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> ImguiState {
-    let hidpi_factor = window.scale_factor();
-    context.set_clipboard_backend(ArboardClipboard { clipboard: arboard::Clipboard::new().ok() });
-    let mut platform = WinitPlatform::new(&mut context);
-    platform.attach_window(context.io_mut(), window, HiDpiMode::Default);
-    context.set_ini_filename(None);
-
-    let font_size = (16.0 * hidpi_factor) as f32;
+fn add_fonts(context: &mut imgui::Context, hidpi_factor: f64, custom: &crate::fonts::CustomFonts) -> crate::ui::Fonts {
+    let font_size = (custom.size * hidpi_factor as f32).round();
     let mono_size = (14.0 * hidpi_factor) as f32;
-    context.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-    let make_config = |size_pixels: f32| {
+    let config = |size_pixels: f32| {
         Some(FontConfig {
             oversample_h: 2,
             oversample_v: 2,
@@ -112,60 +105,33 @@ fn build_imgui(mut context: imgui::Context, window: &Window, device: &wgpu::Devi
             ..Default::default()
         })
     };
-    let fallback = |size_pixels: f32| FontSource::TtfData {
-        data: include_bytes!("../assets/fonts/DejaVuSans.ttf"),
-        size_pixels,
-        config: Some(FontConfig {
-            oversample_h: 2,
-            oversample_v: 2,
-            pixel_snap_h: true,
-            size_pixels,
-            glyph_ranges: imgui::FontGlyphRanges::from_slice(TEXT_GLYPH_RANGES),
-            ..Default::default()
-        }),
+    let source = |data: &'static [u8], size_pixels: f32| FontSource::TtfData { data, size_pixels, config: config(size_pixels) };
+    let mut add = |custom: Option<&Vec<u8>>, builtin: &'static [u8], size_pixels: f32| {
+        let mut sources = Vec::with_capacity(3);
+        if let Some(data) = custom {
+            sources.push(FontSource::TtfData { data, size_pixels, config: config(size_pixels) });
+        }
+        sources.push(source(builtin, size_pixels));
+        sources.push(source(include_bytes!("../assets/fonts/DejaVuSans.ttf"), size_pixels));
+        context.fonts().add_font(&sources)
     };
-    let regular = context.fonts().add_font(&[
-        FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Regular.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        },
-        fallback(font_size),
-    ]);
-    let bold = context.fonts().add_font(&[
-        FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Bold.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        },
-        fallback(font_size),
-    ]);
-    let italic = context.fonts().add_font(&[
-        FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-Italic.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        },
-        fallback(font_size),
-    ]);
-    let bold_italic = context.fonts().add_font(&[
-        FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"),
-            size_pixels: font_size,
-            config: make_config(font_size),
-        },
-        fallback(font_size),
-    ]);
-    let mono = context.fonts().add_font(&[
-        FontSource::TtfData {
-            data: include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
-            size_pixels: mono_size,
-            config: make_config(mono_size),
-        },
-        fallback(mono_size),
-    ]);
+    let regular = add(custom.regular.as_ref(), include_bytes!("../assets/fonts/Inter-Regular.ttf"), font_size);
+    let bold = add(custom.bold.as_ref(), include_bytes!("../assets/fonts/Inter-Bold.ttf"), font_size);
+    let italic = add(custom.italic.as_ref(), include_bytes!("../assets/fonts/Inter-Italic.ttf"), font_size);
+    let bold_italic = add(custom.bold_italic.as_ref(), include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"), font_size);
+    let mono = add(custom.mono.as_ref(), include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"), mono_size);
+    crate::ui::Fonts { regular, bold, italic, bold_italic, mono }
+}
 
-    let fonts = crate::ui::Fonts { regular, bold, italic, bold_italic, mono };
+fn build_imgui(mut context: imgui::Context, window: &Window, device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> ImguiState {
+    let hidpi_factor = window.scale_factor();
+    context.set_clipboard_backend(ArboardClipboard { clipboard: arboard::Clipboard::new().ok() });
+    let mut platform = WinitPlatform::new(&mut context);
+    platform.attach_window(context.io_mut(), window, HiDpiMode::Default);
+    context.set_ini_filename(None);
+
+    context.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
+    let fonts = add_fonts(&mut context, hidpi_factor, &crate::fonts::CustomFonts { size: crate::fonts::DEFAULT_SIZE, ..Default::default() });
     let renderer = Renderer::new(&mut context, device, queue, RendererConfig { texture_format: format, ..Default::default() });
     ImguiState { context: Some(context), parked: None, platform, renderer, last_frame: Instant::now(), last_cursor: None, fonts }
 }
@@ -174,6 +140,7 @@ const FRAME_HISTORY: usize = 300;
 
 struct AppWindow {
     last_redraw: Instant,
+    loaded_fonts: Option<crate::theme::ThemeFonts>,
     instance: wgpu::Instance,
     adapter_info: wgpu::AdapterInfo,
     frames: std::collections::VecDeque<(Instant, crate::devtools::FrameSample)>,
@@ -230,6 +197,7 @@ impl AppWindow {
 
         Self {
             last_redraw: Instant::now(),
+            loaded_fonts: None,
             instance,
             adapter_info: adapter.get_info(),
             frames: std::collections::VecDeque::new(),
@@ -282,6 +250,7 @@ impl AppWindow {
         self.textures.tick();
 
         self.last_redraw = Instant::now();
+        self.sync_theme_fonts(state, cmd_tx);
         let textures = &mut self.textures;
         let sample = render_frame(&mut self.imgui, &self.window, &self.surface, &self.surface_desc, &self.device, &self.queue, Some(&state.theme.clone()), |frame_ui, fonts| {
             ui::draw(frame_ui, state, cmd_tx, textures, &fonts);
@@ -292,6 +261,31 @@ impl AppWindow {
                 self.frames.pop_front();
             }
             self.frames.push_back((Instant::now(), sample));
+        }
+    }
+
+    fn sync_theme_fonts(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+        if state.theme.fonts == self.loaded_fonts {
+            return;
+        }
+        let failed = |spec: &crate::theme::FontSpec| matches!(state.font_fetches.get(spec), Some(Some(_)));
+        match crate::fonts::resolve(state.theme.fonts.as_ref(), &failed) {
+            crate::fonts::Resolution::Ready(custom) => {
+                let context = self.imgui.context.as_mut().expect(ACTIVE_CONTEXT);
+                context.fonts().clear();
+                self.imgui.fonts = add_fonts(context, self.window.scale_factor(), &custom);
+                self.imgui.renderer.reload_font_texture(context, &self.device, &self.queue);
+                self.loaded_fonts = state.theme.fonts.clone();
+                tracing::info!(custom = custom.regular.is_some(), size = custom.size, "theme fonts loaded");
+            }
+            crate::fonts::Resolution::Waiting(missing) => {
+                for spec in missing {
+                    if !state.font_fetches.contains_key(&spec) {
+                        state.font_fetches.insert(spec.clone(), None);
+                        let _ = cmd_tx.send(UiCommand::FetchFont { spec });
+                    }
+                }
+            }
         }
     }
 

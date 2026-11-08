@@ -588,7 +588,9 @@ const RAIL_WIDTH: f32 = 72.0;
 const RAIL_ICON_SIZE: [f32; 2] = [48.0, 48.0];
 const RAIL_PADDING_TOP: f32 = 12.0;
 const USER_BAR_HEIGHT: f32 = 44.0;
-const VOICE_STATUS_BAR_HEIGHT: f32 = 92.0;
+const VOICE_PANEL_ROW: f32 = 38.0;
+const VOICE_PANEL_BUTTON: f32 = 32.0;
+const VOICE_STATUS_BAR_HEIGHT: f32 = if cfg!(feature = "screenshare") { VOICE_PANEL_ROW + 8.0 + VOICE_PANEL_BUTTON + 6.0 } else { VOICE_PANEL_ROW + 6.0 };
 const HEADER_HEIGHT: f32 = 48.0;
 const SIDEBAR_MIN_WIDTH: f32 = 160.0;
 const SIDEBAR_MAX_WIDTH: f32 = 480.0;
@@ -2871,16 +2873,8 @@ fn draw_attachment(
 }
 
 pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, fonts: &Fonts) {
-    if let Some([left, right]) = state.theme.gradient {
-        let [display_w, display_h] = ui.io().display_size;
-        ui.get_background_draw_list().add_rect_filled_multicolor(
-            [0.0, 0.0],
-            [display_w, display_h],
-            left,
-            right,
-            right,
-            left,
-        );
+    if let Some(gradient) = state.theme.global_gradient() {
+        gradient.draw(&ui.get_background_draw_list(), [0.0, 0.0], ui.io().display_size);
     }
     if ui.io().key_ctrl && ui.io().key_shift && ui.is_key_pressed(imgui::Key::I) {
         state.devtools_requested = true;
@@ -2914,8 +2908,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     let server_call_fullscreen = false;
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
     let sidebar_width = state.sidebar_width;
-    let surface_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.panel };
-    let servers_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.servers_bg() };
+    let surface_bg = if state.theme.use_global_gradient { [0.0; 4] } else { state.theme.panel };
+    let servers_bg = if state.theme.use_global_gradient { [0.0; 4] } else { state.theme.servers_bg() };
 
     let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, servers_bg);
     ui.window("servers")
@@ -3196,18 +3190,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if state.connected_voice_channel.is_some() {
                 ui.separator();
                 ui.child_window("voice_status_bar").size([0.0, VOICE_STATUS_BAR_HEIGHT]).build(|| {
-                    if server_call_fullscreen {
-                        let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| "Voice channel".into());
-                        ui.text_colored([0.3, 0.8, 0.45, 1.0], "Voice connected");
-                        ui.text_disabled(channel_name);
-                        #[cfg(feature = "screenshare")]
-                        if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
-                            draw_sidebar_call_controls(ui, state, textures, cmd_tx, guild_id, &channel_id);
-                        }
-                    } else {
-                        let can_open_call = state.connected_voice_channel.as_ref().is_some_and(|(guild_id, _)| guild_id.is_some());
-                        draw_voice_status_bar(ui, state, textures, cmd_tx, state.server_call_minimized && can_open_call);
-                    }
+                    let can_open_call = state.connected_voice_channel.as_ref().is_some_and(|(guild_id, _)| guild_id.is_some());
+                    draw_voice_panel(ui, state, textures, cmd_tx, !server_call_fullscreen && state.server_call_minimized && can_open_call);
                 });
             }
             ui.separator();
@@ -3257,7 +3241,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         0.0
     };
 
-    let chat_bg = if state.theme.gradient.is_some() { [0.0; 4] } else { state.theme.background };
+    let chat_bg = if state.theme.use_global_gradient { [0.0; 4] } else { state.theme.background };
     let _chat_bg = ui.push_style_color(imgui::StyleColor::WindowBg, chat_bg);
     ui.window("chat")
         .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
@@ -3873,30 +3857,124 @@ fn format_bitrate(bps: u32) -> String {
     }
 }
 
-fn draw_voice_status_bar(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, open_call_view: bool) {
-    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
-    let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
-
-    ui.text(format!("[voice] {channel_name}"));
-    if open_call_view {
-        ui.same_line();
-        if ui.small_button("Open call") {
-            state.server_call_minimized = false;
-        }
+fn signal_quality(rtt_ms: Option<f32>) -> [f32; 4] {
+    match rtt_ms {
+        None => [0.55, 0.55, 0.60, 1.0],
+        Some(ms) if ms <= 120.0 => [0.26, 0.83, 0.44, 1.0],
+        Some(ms) if ms <= 250.0 => [0.96, 0.74, 0.30, 1.0],
+        Some(_) => [0.94, 0.33, 0.36, 1.0],
     }
-    let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-    ui.set_window_font_scale(0.85);
+}
+
+#[cfg(feature = "screenshare")]
+fn voice_panel_button(ui: &Ui, textures: &TextureCache, id: &str, icon: crate::icons::Icon, tooltip: &str, active: bool, size: [f32; 2]) -> bool {
+    let clicked = ui.invisible_button(id, size);
+    let hovered = ui.is_item_hovered();
+    let (p_min, p_max) = (ui.item_rect_min(), ui.item_rect_max());
+    let base = ui.style_color(imgui::StyleColor::Button);
+    let fill = match (active, hovered) {
+        (true, _) => [0.18, 0.58, 0.34, 1.0],
+        (false, true) => ui.style_color(imgui::StyleColor::ButtonHovered),
+        (false, false) => base,
+    };
+    ui.get_window_draw_list().add_rect(p_min, p_max, fill).filled(true).rounding(8.0).build();
+    let glyph = (size[1] * 0.55).round();
+    draw_icon_at(
+        ui,
+        textures,
+        icon,
+        [p_min[0] + (size[0] - glyph) / 2.0, p_min[1] + (size[1] - glyph) / 2.0],
+        glyph,
+        ui.style_color(imgui::StyleColor::Text),
+    );
+    if hovered {
+        ui.tooltip_text(tooltip);
+    }
+    clicked
+}
+
+fn draw_voice_panel(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, open_call_view: bool) {
+    const GREEN: [f32; 4] = [0.26, 0.83, 0.44, 1.0];
+    const RED: [f32; 4] = [0.94, 0.33, 0.36, 1.0];
+    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
+    #[cfg(not(feature = "screenshare"))]
+    let _ = &channel_id;
+    let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
+    let location = match state.connected_voice_server_name() {
+        Some(server) => format!("{channel_name} / {server}"),
+        None => channel_name,
+    };
     let stats = &state.voice_stats;
-    let rtt = stats.rtc_rtt_ms.map(|ms| ms as u32).or(stats.ws_rtt_ms).map(|ms| format!(" | {ms} ms")).unwrap_or_default();
-    ui.text(format!(
-        "up {} / down {}{rtt}",
+    let rtt = stats.rtc_rtt_ms.or(stats.ws_rtt_ms.map(|ms| ms as f32));
+    let signal_tip = format!(
+        "{}\nup {} · down {}\nClick for connection info",
+        rtt.map_or_else(|| "Connecting…".to_string(), |ms| format!("{ms:.0} ms ping")),
         format_bitrate(stats.bitrate_up_bps),
         format_bitrate(stats.bitrate_down_bps),
-    ));
-    ui.set_window_font_scale(1.0);
-    token.pop();
+    );
+    let width = ui.content_region_avail()[0];
+    let top = ui.cursor_pos();
+    let icon = 30.0;
+    ui.set_cursor_pos([top[0], top[1] + (VOICE_PANEL_ROW - icon) / 2.0]);
+    if icon_button_sized(ui, textures, "vc_signal", crate::icons::Icon::Signal, &signal_tip, Some(signal_quality(rtt)), icon) {
+        state.show_voice_info = !state.show_voice_info;
+    }
 
-    draw_voice_controls(ui, state, textures, cmd_tx, guild_id, &channel_id, true);
+    let right_buttons = icon * 2.0 + 4.0;
+    let text_x = top[0] + icon + 8.0;
+    let text_width = (width - icon - 8.0 - right_buttons - 8.0).max(40.0);
+    let line = ui.text_line_height();
+    let text_top = top[1] + (VOICE_PANEL_ROW - line * 2.0 - 2.0) / 2.0;
+    ui.set_cursor_pos([text_x, text_top]);
+    let title_clicked = ui.invisible_button("##vc_title", [text_width, line * 2.0 + 2.0]);
+    let title_hovered = ui.is_item_hovered();
+    let title_min = ui.item_rect_min();
+    {
+        let dl = ui.get_window_draw_list();
+        let title = if title_hovered && open_call_view { "Open call" } else { "Voice Connected" };
+        dl.add_text(title_min, GREEN, title);
+        let shown = truncate_to_width(ui, &location, text_width).unwrap_or_else(|| location.clone());
+        dl.add_text([title_min[0], title_min[1] + line + 2.0], ui.style_color(imgui::StyleColor::TextDisabled), shown);
+    }
+    if title_hovered && !location.is_empty() {
+        ui.tooltip_text(&location);
+    }
+    if title_clicked && open_call_view {
+        state.server_call_minimized = false;
+    }
+
+    ui.set_cursor_pos([top[0] + width - right_buttons, top[1] + (VOICE_PANEL_ROW - icon) / 2.0]);
+    let denoise = state.denoise;
+    let denoise_tip = if denoise { "Noise suppression: on" } else { "Noise suppression: off" };
+    if icon_button_sized(ui, textures, "vc_rnn", crate::icons::Icon::AudioWaveform, denoise_tip, denoise.then_some(GREEN), icon) {
+        state.denoise = !state.denoise;
+        persist_settings(state);
+        let _ = cmd_tx.send(UiCommand::SetMicProcessing { gain: state.mic_gain, denoise: state.denoise });
+    }
+    ui.same_line_with_spacing(0.0, 4.0);
+    if icon_button_sized(ui, textures, "vc_disconnect", crate::icons::Icon::PhoneOff, "Disconnect", Some(RED), icon) {
+        let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: guild_id.clone() });
+    }
+
+    #[cfg(feature = "screenshare")]
+    {
+        let gap = 8.0;
+        let button = [(width - gap) / 2.0, VOICE_PANEL_BUTTON];
+        ui.set_cursor_pos([top[0], top[1] + VOICE_PANEL_ROW + 8.0]);
+        if voice_panel_button(ui, textures, "vc_camera", crate::icons::Icon::Video, camera_tooltip(state.camera_on), state.camera_on, button) {
+            toggle_camera(state, cmd_tx);
+        }
+        ui.same_line_with_spacing(0.0, gap);
+        let sharing = state.screen_sharing;
+        if voice_panel_button(ui, textures, "vc_screenshare", SCREENSHARE_ICON, if sharing { "Stop screen sharing" } else { "Share your screen" }, sharing, button) {
+            if sharing {
+                state.screen_sharing = false;
+                let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.clone() });
+            } else {
+                state.show_screen_share_setup = true;
+            }
+        }
+    }
 }
 
 fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
@@ -5544,49 +5622,6 @@ fn draw_server_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCa
         state.show_voice_info = !state.show_voice_info;
     }
     if draw_server_call_button(ui, textures, "server_call_hangup", "Leave voice channel", ServerCallIcon::Hangup, None, next_x(), y, SIZE) {
-        let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
-    }
-}
-
-#[cfg(feature = "screenshare")]
-fn draw_sidebar_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str) {
-    const SIZE: f32 = 34.0;
-    const GAP: f32 = 5.0;
-    const COUNT: f32 = 6.0;
-    let width = ui.window_size()[0];
-    let x = ((width - (COUNT * SIZE + (COUNT - 1.0) * GAP)) * 0.5).max(0.0);
-    let y = ui.cursor_pos()[1] + 1.0;
-    let mut index = 0.0f32;
-    let mut next_x = || {
-        let pos = x + index * (SIZE + GAP);
-        index += 1.0;
-        pos
-    };
-    let muted = state.self_muted;
-    if draw_server_call_button(ui, textures, "server_call_sidebar_mute", if muted { "Unmute microphone" } else { "Mute microphone" }, ServerCallIcon::Microphone, muted.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
-        toggle_voice(state, cmd_tx, VoiceToggle::Mute);
-    }
-    let deafened = state.self_deafened;
-    if draw_server_call_button(ui, textures, "server_call_sidebar_deafen", if deafened { "Undeafen" } else { "Deafen" }, ServerCallIcon::Headphones, deafened.then_some([0.75, 0.17, 0.20, 1.0]), next_x(), y, SIZE) {
-        toggle_voice(state, cmd_tx, VoiceToggle::Deafen);
-    }
-    let camera = state.camera_on;
-    if draw_server_call_button(ui, textures, "server_call_sidebar_camera", camera_tooltip(camera), ServerCallIcon::Camera, camera.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
-        toggle_camera(state, cmd_tx);
-    }
-    let sharing = state.screen_sharing;
-    if draw_server_call_button(ui, textures, "server_call_sidebar_share", if sharing { "Stop screen sharing" } else { "Share your screen" }, ServerCallIcon::Screen, sharing.then_some([0.18, 0.58, 0.34, 1.0]), next_x(), y, SIZE) {
-        if sharing {
-            state.screen_sharing = false;
-            let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
-        } else {
-            state.show_screen_share_setup = true;
-        }
-    }
-    if draw_server_call_button(ui, textures, "server_call_sidebar_info", "Connection info", ServerCallIcon::Info, state.show_voice_info.then_some([0.25, 0.35, 0.72, 1.0]), next_x(), y, SIZE) {
-        state.show_voice_info = !state.show_voice_info;
-    }
-    if draw_server_call_button(ui, textures, "server_call_sidebar_hangup", "Leave voice channel", ServerCallIcon::Hangup, None, next_x(), y, SIZE) {
         let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id });
     }
 }
@@ -7518,6 +7553,57 @@ fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache) {
     ui.text_disabled("Logs, API requests and gateway/voice socket frames. Tokens and passwords are redacted.");
 }
 
+fn draw_gradient_editor(ui: &Ui, theme: &mut crate::theme::Theme) {
+    use crate::theme::GradientRatio;
+    if ui.checkbox("Use global gradient", &mut theme.use_global_gradient) && theme.use_global_gradient {
+        theme.global_gradient_start.get_or_insert(theme.background);
+        theme.global_gradient_end.get_or_insert(theme.panel);
+    }
+    if !theme.use_global_gradient {
+        return;
+    }
+    let mut start = theme.global_gradient_start.unwrap_or(theme.background);
+    if ui.color_edit4("Gradient start", &mut start) {
+        theme.global_gradient_start = Some(start);
+    }
+    let mut end = theme.global_gradient_end.unwrap_or(theme.panel);
+    if ui.color_edit4("Gradient end", &mut end) {
+        theme.global_gradient_end = Some(end);
+    }
+    let mut angle = theme.global_gradient_angle.unwrap_or(crate::theme::DEFAULT_GRADIENT_ANGLE);
+    if ui.slider_config("Angle", 0.0, 360.0).display_format("%.0f°").build(&mut angle) {
+        theme.global_gradient_angle = Some(angle);
+    }
+    ui.same_line();
+    ui.text_disabled("0° = to top, 90° = to right, 180° = to bottom");
+    let mut stops = match theme.global_gradient_ratio {
+        Some(GradientRatio::Stops(stops)) => stops,
+        Some(GradientRatio::Midpoint(m)) => [m, m],
+        None => [0.0, 1.0],
+    };
+    let mut midpoint = matches!(theme.global_gradient_ratio, Some(GradientRatio::Midpoint(_)));
+    if ui.checkbox("Single midpoint", &mut midpoint) {
+        theme.global_gradient_ratio = Some(if midpoint { GradientRatio::Midpoint(0.5) } else { GradientRatio::Stops([0.0, 1.0]) });
+    }
+    match theme.global_gradient_ratio {
+        Some(GradientRatio::Midpoint(mut m)) => {
+            if ui.slider_config("Midpoint", 0.01, 0.99).display_format("%.2f").build(&mut m) {
+                theme.global_gradient_ratio = Some(GradientRatio::Midpoint(m));
+            }
+            ui.text_disabled("Where the two colours are mixed 50/50 along the gradient.");
+        }
+        _ => {
+            let changed_start = ui.slider_config("Blend starts", 0.0, 1.0).display_format("%.2f").build(&mut stops[0]);
+            let changed_end = ui.slider_config("Blend ends", 0.0, 1.0).display_format("%.2f").build(&mut stops[1]);
+            if changed_start || changed_end {
+                stops[1] = stops[1].max(stops[0]);
+                theme.global_gradient_ratio = Some(GradientRatio::Stops(stops));
+            }
+            ui.text_disabled("The start colour is solid before the first stop, the end colour after the second.");
+        }
+    }
+}
+
 fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
     let clock_options = [(None, "System default"), (Some(false), "12-hour"), (Some(true), "24-hour")];
     let mut clock_idx = clock_options.iter().position(|(value, _)| *value == state.clock_24h).unwrap_or(0);
@@ -7543,16 +7629,9 @@ fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
 
         let swatch_size = [28.0, 20.0];
         let swatch_pos = ui.cursor_screen_pos();
-        match theme.gradient {
-            Some([left, right]) => {
-                ui.get_window_draw_list().add_rect_filled_multicolor(
-                    swatch_pos,
-                    [swatch_pos[0] + swatch_size[0], swatch_pos[1] + swatch_size[1]],
-                    left,
-                    right,
-                    right,
-                    left,
-                );
+        match theme.global_gradient() {
+            Some(gradient) => {
+                gradient.draw(&ui.get_window_draw_list(), swatch_pos, [swatch_pos[0] + swatch_size[0], swatch_pos[1] + swatch_size[1]]);
             }
             None => {
                 ui.get_window_draw_list()
@@ -7589,17 +7668,7 @@ fn draw_settings_appearance(ui: &Ui, state: &mut AppState) {
     ui.separator();
     ui.text("Global gradient");
     ui.text_disabled("When enabled, this gradient fills the app background across all panes.");
-    let mut gradient_enabled = state.theme.gradient.is_some();
-    if ui.checkbox("Use global gradient", &mut gradient_enabled) {
-        state.theme.gradient = gradient_enabled.then_some([state.theme.background, state.theme.panel]);
-    }
-    if let Some([mut left, mut right]) = state.theme.gradient {
-        let left_changed = ui.color_edit4("Gradient start", &mut left);
-        let right_changed = ui.color_edit4("Gradient end", &mut right);
-        if left_changed || right_changed {
-            state.theme.gradient = Some([left, right]);
-        }
-    }
+    draw_gradient_editor(ui, &mut state.theme);
     if ui.button("Save theme as TOML") {
         let name = state.theme_name_input.trim();
         let slug: String = name
@@ -8214,6 +8283,20 @@ mod line_break_tests {
     #[test]
     fn leading_whitespace_is_not_a_break_point() {
         assert_eq!(line_break(" abc def", 4.0, false, chars), Some(4));
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::signal_quality;
+
+    #[test]
+    fn ping_maps_to_green_yellow_red() {
+        let green = signal_quality(Some(40.0));
+        assert_eq!(signal_quality(Some(120.0)), green);
+        assert_ne!(signal_quality(Some(200.0)), green);
+        assert_ne!(signal_quality(Some(400.0)), signal_quality(Some(200.0)));
+        assert_ne!(signal_quality(None), green);
     }
 }
 
