@@ -8,7 +8,7 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 const HTTP_CAPACITY: usize = 500;
 const SOCKET_CAPACITY: usize = 3000;
 const REDACTED: &str = "[redacted]";
-const SECRET_KEYS: &[&str] = &["token", "password", "new_password", "ticket", "code", "captcha_key", "captcha_rqtoken", "authorization"];
+const SECRET_KEYS: &[&str] = &["token", "password", "new_password", "ticket", "mfa_ticket", "code", "captcha_key", "captcha_token", "captcha_rqtoken", "captcha_rqdata", "session_id", "sessionid", "session", "access_token", "refresh_token", "authorization", "cookie", "set-cookie", "client_secret", "api_key", "secret", "fingerprint", "cf_clearance"];
 
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -132,6 +132,7 @@ pub fn redact_value(value: &mut Value) {
             }
         }
         Value::Array(items) => items.iter_mut().for_each(redact_value),
+        Value::String(text) => *text = redact_unstructured(text),
         _ => {}
     }
 }
@@ -142,8 +143,33 @@ pub fn redact_text(text: &str) -> String {
             redact_value(&mut value);
             value.to_string()
         }
-        Err(_) => text.to_string(),
+        Err(_) => redact_unstructured(text),
     }
+}
+
+fn redact_unstructured(text: &str) -> String {
+    let mut out = text.to_string();
+    for key in SECRET_KEYS {
+        let mut from = 0;
+        while let Some(relative) = out[from..].to_ascii_lowercase().find(&key.to_ascii_lowercase()) {
+            let start = from + relative;
+            let after_key = start + key.len();
+            let Some(sep) = out[after_key..].find(|c: char| c == ':' || c == '=' || c == ' ') else { from = after_key; continue };
+            let mut value_start = after_key + sep + 1;
+            while value_start < out.len() && matches!(out.as_bytes()[value_start], b' ' | b'\t' | b'\"' | b'\'') { value_start += 1; }
+            let prefix = &out[after_key..value_start];
+            if !prefix.contains(':') && !prefix.contains('=') { from = value_start; continue; }
+            let value_end = if key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("cookie") || key.eq_ignore_ascii_case("set-cookie") {
+                out[value_start..].find(['\r', '\n']).map_or(out.len(), |n| value_start + n)
+            } else {
+                out[value_start..].find(|c: char| c.is_whitespace() || c == '&' || c == ',' || c == ';' || c == '"' || c == '\'').map_or(out.len(), |n| value_start + n)
+            };
+            if value_end == value_start { from = value_start; continue; }
+            out.replace_range(value_start..value_end, REDACTED);
+            from = value_start + REDACTED.len();
+        }
+    }
+    out
 }
 
 pub fn truncate(text: String, limit: usize) -> String {
@@ -176,7 +202,7 @@ pub fn begin_http(method: &str, path: &str, request_body: Option<&[u8]>) -> u64 
             id,
             at: SystemTime::now(),
             method: method.to_string(),
-            path: path.to_string(),
+            path: redact_text(path),
             request_body,
             status: None,
             duration: None,
@@ -191,7 +217,7 @@ pub fn begin_http(method: &str, path: &str, request_body: Option<&[u8]>) -> u64 
 pub fn finish_http(id: u64, status: Option<u16>, duration: Duration, response: Result<&[u8], String>) {
     let (size, body, error) = match response {
         Ok(bytes) => (Some(bytes.len()), Some(body_text(bytes)), None),
-        Err(error) => (None, None, Some(error)),
+        Err(error) => (None, None, Some(redact_text(&error))),
     };
     with_store(|store| {
         if let Some(record) = store.http.iter_mut().rev().find(|r| r.id == id) {
@@ -222,7 +248,7 @@ pub fn describe_frame(text: &str) -> (Option<u64>, Option<String>, String) {
             redact_value(&mut value);
             (op, event, truncate(value.to_string(), BODY_LIMIT))
         }
-        Err(_) => (None, None, truncate(text.to_string(), BODY_LIMIT)),
+        Err(_) => (None, None, truncate(redact_text(text), BODY_LIMIT)),
     }
 }
 
@@ -278,7 +304,7 @@ pub fn record_ws_message(socket: SocketKind, direction: Direction, message: &tok
                 event: Some("CLOSE".into()),
                 size: 0,
                 binary: false,
-                payload: reason,
+                payload: redact_text(&reason),
             });
         }
         _ => {}
@@ -350,6 +376,30 @@ mod tests {
         assert_eq!(redact_text("plain"), "plain");
         let cut = truncate("ééé".to_string(), 3);
         assert!(cut.starts_with('é') && cut.contains("more bytes"), "{cut}");
+    }
+
+    #[test]
+    fn secrets_are_redacted_in_headers_queries_and_malformed_json() {
+        for (input, secret) in [
+            ("Authorization: Bearer abc123", "abc123"),
+            ("/path?access_token=abc123&safe=yes", "abc123"),
+            ("session_id: sid-123 captcha_rqdata=challenge-123", "sid-123"),
+            (r#"{"refresh_token":"refresh-123""#, "refresh-123"),
+        ] {
+            assert!(!redact_text(input).contains(secret), "secret survived redaction");
+        }
+        assert!(redact_text("/path?safe=yes").contains("safe=yes"));
+        let nested = redact_text(r#"{"error":"Authorization: Bearer nested-secret"}"#);
+        assert!(!nested.contains("nested-secret"));
+    }
+
+    #[test]
+    fn malformed_socket_frames_and_http_paths_are_redacted_before_storage() {
+        let (_, _, malformed) = describe_frame(r#"{"session_id":"hidden-session""#);
+        assert!(!malformed.contains("hidden-session"));
+        let id = begin_http("GET", "/resource?access_token=hidden-token", None);
+        let record = http_detail(id).expect("recorded");
+        assert!(!record.path.contains("hidden-token"));
     }
 
     #[test]

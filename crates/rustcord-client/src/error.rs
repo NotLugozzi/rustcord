@@ -1,6 +1,6 @@
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("http error: {0}")]
+    #[error("http request failed")]
     Http(#[from] reqwest::Error),
     #[error("websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),

@@ -6,6 +6,7 @@ pub mod dave;
 pub mod dave_frame_crypto;
 pub mod devtools;
 pub mod error;
+pub mod identity;
 pub mod models;
 pub mod permissions;
 pub mod rest;

@@ -51,7 +51,7 @@ fn solve_blocking(challenge: &CaptchaChallenge) -> Result<String, ClientError> {
         )));
     }
 
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::sync_channel::<String>(1);
     let prior_backend = std::env::var_os("GDK_BACKEND");
     std::env::set_var("GDK_BACKEND", "x11");
     let mut event_loop = EventLoop::new();
@@ -90,8 +90,12 @@ function onSolved(token) {{
 
     let _webview = WebViewBuilder::new()
         .with_html(html)
+        .with_navigation_handler(is_allowed_captcha_url)
         .with_ipc_handler(move |req| {
-            let _ = tx.send(req.body().clone());
+            let body = req.body();
+            if is_allowed_captcha_url(req.uri().to_string()) && valid_response_token(body) {
+                let _ = tx.try_send(body.clone());
+            }
         })
         .build(&window)
         .map_err(|e| ClientError::CaptchaFailed(e.to_string()))?;
@@ -117,6 +121,17 @@ function onSolved(token) {{
     solved.ok_or_else(|| ClientError::CaptchaFailed("window closed before captcha solved".into()))
 }
 
+fn valid_response_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 8192 && token.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+fn is_allowed_captcha_url(url: String) -> bool {
+    if url == "about:blank" { return true; }
+    let Some(authority) = url.strip_prefix("https://").and_then(|rest| rest.split(['/', '?', '#']).next()) else { return false; };
+    let Some(host) = authority.rsplit('@').next().and_then(|host| host.split(':').next()) else { return false; };
+    host.eq_ignore_ascii_case("hcaptcha.com") || host.to_ascii_lowercase().ends_with(".hcaptcha.com")
+}
+
 fn escape_attr(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
@@ -130,4 +145,28 @@ fn escape_attr(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captcha_ipc_payload_is_bounded_and_token_shaped() {
+        assert!(valid_response_token("synthetic.token_123-abc"));
+        assert!(!valid_response_token(""));
+        assert!(!valid_response_token(&"x".repeat(8193)));
+        assert!(!valid_response_token("token with spaces"));
+        assert!(!valid_response_token("<script>"));
+    }
+
+    #[test]
+    fn captcha_navigation_is_limited_to_hcaptcha_and_inline_document() {
+        assert!(is_allowed_captcha_url("about:blank".into()));
+        assert!(is_allowed_captcha_url("https://newassets.hcaptcha.com/captcha".into()));
+        assert!(!is_allowed_captcha_url("http://hcaptcha.com/".into()));
+        assert!(!is_allowed_captcha_url("https://hcaptcha.com.evil.example/".into()));
+        assert!(!is_allowed_captcha_url("https://hcaptcha.com@evil.example/".into()));
+        assert!(!is_allowed_captcha_url("https://example.org/".into()));
+    }
 }
