@@ -6,11 +6,62 @@ const TEXTURE_BUDGET_BYTES: usize = 192 * 1024 * 1024;
 const IN_USE_WINDOW: Duration = Duration::from_secs(2);
 const MAX_ANIMATED_DIM: u32 = 640;
 const MAX_ANIMATED_BYTES: usize = 48 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 8192;
+const MAX_IMAGE_PIXELS: u64 = 24_000_000;
+const MAX_GIF_FRAMES: usize = 120;
 
 pub enum Decoded {
     Still(image::RgbaImage),
     Animated(Vec<(Duration, image::RgbaImage)>),
     Failed,
+}
+
+#[cfg(test)]
+mod decode_security_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_image_data_fails_without_panicking() {
+        assert!(matches!(decode(b"not an image"), Decoded::Failed));
+        assert!(matches!(decode(&[0x89, b'P', b'N', b'G', 0, 1, 2]), Decoded::Failed));
+    }
+
+    #[test]
+    fn excessive_image_dimensions_are_rejected_before_pixel_allocation() {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&9000u32.to_be_bytes());
+        png.extend_from_slice(&1u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let crc = png_crc(&png[12..29]);
+        png.extend_from_slice(&crc.to_be_bytes());
+        png.extend_from_slice(&0u32.to_be_bytes());
+        png.extend_from_slice(b"IEND");
+        png.extend_from_slice(&png_crc(b"IEND").to_be_bytes());
+        assert!(matches!(decode(&png), Decoded::Failed));
+    }
+
+    fn png_crc(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 { crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb88320 } else { crc >> 1 }; }
+        }
+        !crc
+    }
+
+    #[test]
+    fn gif_frame_count_is_bounded() {
+        let rgba = image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]));
+        let frames = (0..MAX_GIF_FRAMES + 5).map(|_| image::Frame::new(rgba.clone()));
+        let mut bytes = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut bytes).encode_frames(frames).unwrap();
+        match decode(&bytes) {
+            Decoded::Animated(frames) => assert_eq!(frames.len(), MAX_GIF_FRAMES),
+            _ => panic!("expected bounded animated image"),
+        }
+    }
 }
 
 pub fn decode(bytes: &[u8]) -> Decoded {
@@ -21,7 +72,14 @@ pub fn decode(bytes: &[u8]) -> Decoded {
             _ => Decoded::Failed,
         };
     }
-    match image::load_from_memory(bytes) {
+    let Ok(format) = image::guess_format(bytes) else { return Decoded::Failed };
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some((MAX_IMAGE_PIXELS * 4) as u64);
+    reader.limits(limits);
+    match reader.decode() {
         Ok(img) => Decoded::Still(img.to_rgba8()),
         Err(e) => {
             tracing::warn!("failed to decode image: {e}");
@@ -830,17 +888,22 @@ impl TextureCache {
 }
 
 fn decode_gif_frames(bytes: &[u8]) -> image::ImageResult<Vec<(Duration, image::RgbaImage)>> {
-    use image::{codecs::gif::GifDecoder, AnimationDecoder};
+    use image::{codecs::gif::GifDecoder, AnimationDecoder, ImageDecoder};
     let decoder = GifDecoder::new(std::io::Cursor::new(bytes))?;
-    let frames = decoder.into_frames().collect_frames()?;
-    Ok(frames
-        .into_iter()
-        .map(|f| {
-            let delay = Duration::from(f.delay());
-            let delay = if delay.is_zero() { Duration::from_millis(100) } else { delay };
-            (delay, f.into_buffer())
-        })
-        .collect())
+    let (width, height) = decoder.dimensions();
+    let pixels = u64::from(width) * u64::from(height);
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION || pixels > MAX_IMAGE_PIXELS || pixels.saturating_mul(4) > MAX_ANIMATED_BYTES as u64 {
+        return Err(image::ImageError::Limits(image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError)));
+    }
+    let mut result = Vec::new();
+    for f in decoder.into_frames() {
+        if result.len() == MAX_GIF_FRAMES || result.len().saturating_mul(width as usize).saturating_mul(height as usize).saturating_mul(4) >= MAX_ANIMATED_BYTES { break; }
+        let f = f?;
+        let delay = Duration::from(f.delay());
+        let delay = if delay.is_zero() { Duration::from_millis(100) } else { delay };
+        result.push((delay, f.into_buffer()));
+    }
+    Ok(result)
 }
 
 #[cfg(feature = "video")]

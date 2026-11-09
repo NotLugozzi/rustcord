@@ -1,4 +1,4 @@
-use crate::backend::{BackendEvent, HTTP};
+use crate::backend::BackendEvent;
 use crate::presence;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -9,15 +9,38 @@ use tokio::sync::mpsc::UnboundedSender;
 
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 static APP_INFO: Mutex<Option<HashMap<String, AppInfo>>> = Mutex::new(None);
+const MAX_IPC_MESSAGE_BYTES: usize = 64 * 1024;
+const MAX_IPC_CLIENTS: usize = 32;
+
+fn valid_message_len(len: usize) -> bool { len <= MAX_IPC_MESSAGE_BYTES }
+
+#[cfg(unix)]
+fn set_socket_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(unix)]
+fn private_runtime_dir(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(dir) else { return false };
+    let uid = unsafe { libc::geteuid() };
+    meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0
+}
 
 #[cfg(unix)]
 pub async fn serve(event_tx: UnboundedSender<BackendEvent>) {
     use tokio::net::{UnixListener, UnixStream};
-    let dir = ["XDG_RUNTIME_DIR", "TMPDIR"]
-        .iter()
-        .find_map(std::env::var_os)
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| "/tmp".into());
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else {
+        tracing::warn!("RPC disabled: XDG_RUNTIME_DIR is unavailable");
+        return;
+    };
+    let uid = unsafe { libc::geteuid() };
+    if !private_runtime_dir(&dir) {
+        tracing::warn!("RPC disabled: runtime directory ownership or permissions are unsafe");
+        return;
+    }
     let mut bound = None;
     for n in 0..10 {
         let path = dir.join(format!("discord-ipc-{n}"));
@@ -25,9 +48,15 @@ pub async fn serve(event_tx: UnboundedSender<BackendEvent>) {
             if UnixStream::connect(&path).await.is_ok() {
                 continue;
             }
-            let _ = std::fs::remove_file(&path);
+            let Ok(meta) = std::fs::symlink_metadata(&path) else { continue };
+            if meta.file_type().is_socket() && meta.uid() == uid && std::fs::remove_file(&path).is_err() { continue; }
         }
         if let Ok(l) = UnixListener::bind(&path) {
+            if set_socket_permissions(&path).is_err() {
+                drop(l);
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
             if n > 0 {
                 tracing::warn!("discord-ipc-0 is taken; listening on {path:?}, apps will likely talk to the other client instead");
             } else {
@@ -41,9 +70,12 @@ pub async fn serve(event_tx: UnboundedSender<BackendEvent>) {
         tracing::warn!("no free discord-ipc socket; RPC disabled");
         return;
     };
+    let clients = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IPC_CLIENTS));
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
-        tokio::spawn(handle(stream, event_tx.clone()));
+        let Ok(permit) = clients.clone().try_acquire_owned() else { drop(stream); continue };
+        let events = event_tx.clone();
+        tokio::spawn(async move { let _permit = permit; handle(stream, events).await; });
     }
 }
 
@@ -61,7 +93,7 @@ async fn handle(mut stream: tokio::net::UnixStream, event_tx: UnboundedSender<Ba
         }
         let op = u32::from_le_bytes(head[..4].try_into().unwrap());
         let len = u32::from_le_bytes(head[4..].try_into().unwrap()) as usize;
-        if len > 64 * 1024 {
+        if !valid_message_len(len) {
             break;
         }
         let mut buf = vec![0u8; len];
@@ -94,6 +126,50 @@ async fn handle(mut stream: tokio::net::UnixStream, event_tx: UnboundedSender<Ba
     }
     presence::remove_app(conn_id);
     presence::publish(&event_tx);
+}
+
+#[cfg(all(test, unix))]
+mod security_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_runtime_directory_requires_owned_private_directory() {
+        let path = std::env::temp_dir().join(format!("rustcord-ipc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(private_runtime_dir(&path));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!private_runtime_dir(&path));
+        std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn ipc_message_limit_rejects_oversized_frames() {
+        assert!(valid_message_len(MAX_IPC_MESSAGE_BYTES));
+        assert!(!valid_message_len(MAX_IPC_MESSAGE_BYTES + 1));
+    }
+
+    #[tokio::test]
+    async fn socket_mode_helper_and_client_limit_are_restrictive() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("rustcord-ipc-socket-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("socket-permissions-probe");
+        std::fs::write(&socket, []).unwrap();
+        set_socket_permissions(&socket).unwrap();
+        assert_eq!(std::fs::symlink_metadata(&socket).unwrap().mode() & 0o777, 0o600);
+        let clients = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IPC_CLIENTS));
+        let mut permits = Vec::new();
+        for _ in 0..MAX_IPC_CLIENTS { permits.push(clients.clone().acquire_owned().await.unwrap()); }
+        assert!(clients.clone().try_acquire_owned().is_err());
+        drop(permits);
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }
 
 #[cfg(unix)]
@@ -160,7 +236,7 @@ async fn app_info(app_id: &str) -> AppInfo {
     if let Some(info) = APP_INFO.lock().unwrap().get_or_insert_with(HashMap::new).get(app_id) {
         return info.clone();
     }
-    let client = HTTP.get_or_init(reqwest::Client::new);
+    let client = crate::backend::http_client();
     let get = |url: String| async move { client.get(url).send().await.ok()?.json::<Value>().await.ok() };
     let (rpc, assets) = tokio::join!(
         get(format!("https://discord.com/api/v10/applications/{app_id}/rpc")),

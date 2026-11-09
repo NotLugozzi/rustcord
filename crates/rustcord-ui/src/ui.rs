@@ -7887,6 +7887,26 @@ fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache) {
     }
     row("Video playback", if cfg!(feature = "video") { "enabled" } else { "not built in" }, false);
 
+    let identity = rustcord_client::identity::ClientIdentity::current();
+    let runtime = identity.runtime();
+    ui.dummy([0.0, 10.0]);
+    ui.separator();
+    ui.dummy([0.0, 6.0]);
+    ui.text("Client identity");
+    ui.dummy([0.0, 4.0]);
+    row("User agent", identity.user_agent(), true);
+    row("OS", &format!("{} ({})", runtime.os, runtime.arch), false);
+    row("OS version", runtime.os_version.as_deref().unwrap_or("not detected"), false);
+    row("Locale", runtime.locale.as_deref().unwrap_or("not detected"), false);
+    let properties = identity.super_properties_json();
+    let y = ui.cursor_pos()[1];
+    ui.text_disabled("Properties");
+    ui.set_cursor_pos([LABEL_COLUMN, y]);
+    ui.text_wrapped(&properties);
+    if ui.small_button("Copy##copy_properties") {
+        crate::clipboard::write_text(&properties);
+    }
+
     ui.dummy([0.0, 10.0]);
     ui.separator();
     ui.dummy([0.0, 6.0]);

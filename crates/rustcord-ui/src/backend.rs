@@ -26,18 +26,56 @@ fn cache_file(url: &str) -> Option<std::path::PathBuf> {
 }
 
 const MAX_DISK_CACHED_BYTES: usize = 1024 * 1024;
+const MAX_IMAGE_DOWNLOAD_BYTES: usize = 24 * 1024 * 1024;
+const MAX_VOICE_CLIP_BYTES: usize = 24 * 1024 * 1024;
+const MAX_ATTACHMENT_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_ATTACHMENT_DOWNLOAD_TIME: std::time::Duration = std::time::Duration::from_secs(180);
+static MEDIA_DOWNLOADS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(6)));
+static IMAGE_DECODERS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    HTTP.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().expect("valid HTTP client configuration"))
+}
+
+fn safe_reqwest_error(error: reqwest::Error) -> String { error.without_url().to_string() }
+
+fn response_fits_limit(content_length: Option<u64>, limit: usize) -> bool {
+    content_length.is_none_or(|size| size <= limit as u64)
+}
+
+fn chunk_fits_limit(current: usize, chunk: usize, limit: usize) -> bool {
+    current.checked_add(chunk).is_some_and(|size| size <= limit)
+}
 
 async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
+    let _permit = MEDIA_DOWNLOADS.acquire().await.ok()?;
     let path = cache_file(url);
-    if let Some(bytes) = path.as_ref().and_then(|p| std::fs::read(p).ok()) {
-        return Some(bytes);
+    if let Some(cached_path) = &path {
+        if std::fs::metadata(cached_path).is_ok_and(|meta| meta.len() <= MAX_IMAGE_DOWNLOAD_BYTES as u64) {
+            if let Ok(bytes) = std::fs::read(cached_path) { return Some(bytes); }
+        }
     }
-    let client = HTTP.get_or_init(reqwest::Client::new);
+    let client = http_client();
     let resp = client.get(url).send().await.and_then(|r| r.error_for_status());
     let bytes = match resp {
-        Ok(r) => r.bytes().await.map_err(|e| tracing::warn!("failed to read image bytes for {url}: {e}")).ok()?.to_vec(),
+        Ok(mut r) => {
+            if !response_fits_limit(r.content_length(), MAX_IMAGE_DOWNLOAD_BYTES) {
+                tracing::warn!("image response exceeded configured size limit");
+                return None;
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = r.chunk().await.ok()? {
+                if !chunk_fits_limit(bytes.len(), chunk.len(), MAX_IMAGE_DOWNLOAD_BYTES) {
+                    tracing::warn!("image response exceeded configured size limit");
+                    return None;
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            bytes
+        },
         Err(e) => {
-            tracing::warn!("failed to download image {url}: {e}");
+            tracing::warn!("failed to download image: {}", e.without_url());
             return None;
         }
     };
@@ -50,10 +88,21 @@ async fn fetch_image_bytes(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+async fn decode_image_bytes(bytes: Vec<u8>) -> crate::images::Decoded {
+    let Ok(_permit) = IMAGE_DECODERS.acquire().await else { return crate::images::Decoded::Failed };
+    tokio::task::spawn_blocking(move || crate::images::decode(&bytes)).await.unwrap_or(crate::images::Decoded::Failed)
+}
+
 async fn load_voice_clip(url: &str) -> Result<std::sync::Arc<Vec<i16>>, String> {
-    let client = HTTP.get_or_init(reqwest::Client::new);
-    let resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let _permit = MEDIA_DOWNLOADS.acquire().await.map_err(|_| "download service unavailable".to_string())?;
+    let client = http_client();
+    let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(safe_reqwest_error)?;
+    if resp.content_length().is_some_and(|size| size > MAX_VOICE_CLIP_BYTES as u64) { return Err("voice clip exceeds size limit".into()); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(safe_reqwest_error)? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_VOICE_CLIP_BYTES { return Err("voice clip exceeds size limit".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
     let samples = tokio::task::spawn_blocking(move || rustcord_client::voice_message::decode_ogg(&bytes))
         .await
         .map_err(|e| e.to_string())??;
@@ -72,32 +121,191 @@ async fn send_voice_message(client: &RestClient, channel_id: &str, samples: Vec<
 
 async fn save_attachment(url: &str, filename: &str) -> Result<std::path::PathBuf, String> {
     use tokio::io::AsyncWriteExt;
+    let _permit = MEDIA_DOWNLOADS.acquire().await.map_err(|_| "download service unavailable".to_string())?;
     let dir = directories::UserDirs::new()
         .and_then(|d| d.download_dir().map(|p| p.to_path_buf()))
         .ok_or("no Downloads folder")?;
     let name = std::path::Path::new(filename).file_name().and_then(|n| n.to_str()).filter(|n| !n.is_empty()).unwrap_or("attachment");
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (name.to_string(), String::new()),
-    };
-    let mut path = dir.join(name);
-    for n in 1.. {
-        if !path.exists() {
-            break;
+    let client = http_client();
+    let mut resp = client.get(url).timeout(MAX_ATTACHMENT_DOWNLOAD_TIME).send().await.and_then(|r| r.error_for_status()).map_err(safe_reqwest_error)?;
+    if resp.content_length().is_some_and(|size| size > MAX_ATTACHMENT_DOWNLOAD_BYTES) { return Err("attachment exceeds size limit".into()); }
+    let (path, mut file) = create_attachment_file(&dir, name).await?;
+    let mut written = 0u64;
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&path).await;
+                return Err(safe_reqwest_error(error));
+            }
+        };
+        written = written.saturating_add(chunk.len() as u64);
+        if written > MAX_ATTACHMENT_DOWNLOAD_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err("attachment exceeds size limit".into());
         }
-        path = dir.join(format!("{stem} ({n}){ext}"));
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(error.to_string());
+        }
     }
-    let client = HTTP.get_or_init(reqwest::Client::new);
-    let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
-    let mut file = tokio::fs::File::create(&path).await.map_err(|e| e.to_string())?;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
-        file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+    if let Err(error) = file.flush().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error.to_string());
     }
-    file.flush().await.map_err(|e| e.to_string())?;
     Ok(path)
 }
 
+async fn create_attachment_file(dir: &std::path::Path, name: &str) -> Result<(std::path::PathBuf, tokio::fs::File), String> {
+    use tokio::fs::OpenOptions;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem.to_string(), format!(".{extension}")),
+        _ => (name.to_string(), String::new()),
+    };
+    for suffix in 0..1000 {
+        let candidate_name = if suffix == 0 { name.to_string() } else { format!("{stem} ({suffix}){ext}") };
+        let path = dir.join(candidate_name);
+        match OpenOptions::new().write(true).create_new(true).open(&path).await {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err("could not choose a unique attachment filename".into())
+}
+
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
+static ACTIVE_GATEWAY: std::sync::Mutex<Option<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>> = std::sync::Mutex::new(None);
+static CREDENTIAL_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serialized_credential_op<T, F>(op: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let _guard = CREDENTIAL_OPS.lock().await;
+    tokio::task::spawn_blocking(op).await
+}
+
+async fn stop_gateway() {
+    *GATEWAY_TX.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    let active = ACTIVE_GATEWAY.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some((cancel, mut task)) = active {
+        let _ = cancel.send(true);
+        if tokio::time::timeout(std::time::Duration::from_secs(3), &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_serialization_tests {
+    use super::*;
+    static GATEWAY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn streamed_download_limits_cover_absent_and_inaccurate_length_headers() {
+        assert!(response_fits_limit(None, 10));
+        assert!(response_fits_limit(Some(8), 10));
+        assert!(!response_fits_limit(Some(11), 10));
+        assert!(chunk_fits_limit(0, 6, 10));
+        assert!(chunk_fits_limit(6, 4, 10));
+        assert!(!chunk_fits_limit(6, 5, 10));
+    }
+
+    #[tokio::test]
+    async fn image_download_and_decode_concurrency_are_bounded() {
+        let mut downloads = Vec::new();
+        for _ in 0..6 { downloads.push(MEDIA_DOWNLOADS.acquire().await.unwrap()); }
+        assert!(MEDIA_DOWNLOADS.try_acquire().is_err());
+        drop(downloads);
+        let mut decoders = Vec::new();
+        for _ in 0..2 { decoders.push(IMAGE_DECODERS.acquire().await.unwrap()); }
+        assert!(IMAGE_DECODERS.try_acquire().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attachment_creation_does_not_follow_existing_symlinks() {
+        use tokio::io::AsyncWriteExt;
+        let dir = std::env::temp_dir().join(format!("rustcord-attachment-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let protected = dir.join("protected.txt");
+        std::fs::write(&protected, b"keep").unwrap();
+        std::os::unix::fs::symlink(&protected, dir.join("file.txt")).unwrap();
+        let (path, mut output) = create_attachment_file(&dir, "file.txt").await.unwrap();
+        assert_eq!(path.file_name().unwrap(), "file (1).txt");
+        output.write_all(b"attachment").await.unwrap();
+        drop(output);
+        assert_eq!(std::fs::read(&protected).unwrap(), b"keep");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_completed_clear_cannot_be_followed_by_a_queued_save() {
+        let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let save_ops = operations.clone();
+        let save_started = started.clone();
+        let save = tokio::spawn(async move {
+            serialized_credential_op(move || {
+                save_ops.lock().unwrap().push("save");
+                save_started.store(true, std::sync::atomic::Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }).await.unwrap();
+        });
+        while !started.load(std::sync::atomic::Ordering::Acquire) { tokio::task::yield_now().await; }
+        let clear_ops = operations.clone();
+        let clear = tokio::spawn(async move {
+            serialized_credential_op(move || clear_ops.lock().unwrap().push("clear")).await.unwrap();
+        });
+        save.await.unwrap();
+        clear.await.unwrap();
+        assert_eq!(*operations.lock().unwrap(), ["save", "clear"]);
+    }
+
+    async fn register_fake_gateway() -> (std::sync::Arc<std::sync::atomic::AtomicBool>, mpsc::UnboundedSender<String>) {
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_stopped = stopped.clone();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let (commands, mut command_rx) = mpsc::unbounded_channel::<String>();
+        let task = tokio::spawn(async move {
+            tokio::select! { _ = cancelled.changed() => {}, _ = command_rx.recv() => {} }
+            task_stopped.store(true, std::sync::atomic::Ordering::Release);
+        });
+        *GATEWAY_TX.lock().unwrap() = Some(commands.clone());
+        *ACTIVE_GATEWAY.lock().unwrap() = Some((cancel, task));
+        (stopped, commands)
+    }
+
+    #[tokio::test]
+    async fn logout_cancels_gateway_clears_sender_and_rejects_old_commands() {
+        let _test_guard = GATEWAY_TEST_LOCK.lock().await;
+        let (stopped, obsolete) = register_fake_gateway().await;
+        stop_gateway().await;
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(GATEWAY_TX.lock().unwrap().is_none());
+        assert!(obsolete.send("stale".into()).is_err());
+    }
+
+    #[tokio::test]
+    async fn registering_a_new_session_stops_the_previous_gateway_first() {
+        let _test_guard = GATEWAY_TEST_LOCK.lock().await;
+        let (first_stopped, _) = register_fake_gateway().await;
+        stop_gateway().await;
+        let (second_stopped, _) = register_fake_gateway().await;
+        assert!(first_stopped.load(std::sync::atomic::Ordering::Acquire));
+        stop_gateway().await;
+        assert!(second_stopped.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
 static UPLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -529,7 +737,7 @@ pub fn spawn(
                     tokio::spawn(async move {
                         let result = load_voice_clip(&url).await;
                         if let Err(e) = &result {
-                            tracing::warn!("voice message {url} failed to load: {e}");
+                            tracing::warn!("voice message failed to load: {e}");
                         }
                         let _ = event_tx.send(BackendEvent::VoiceClipLoaded { url, result });
                     });
@@ -598,9 +806,7 @@ pub fn spawn(
                     let event_tx = event_tx.clone();
                     tokio::spawn(async move {
                         let image = match fetch_image_bytes(&url).await {
-                            Some(bytes) => tokio::task::spawn_blocking(move || crate::images::decode(&bytes))
-                                .await
-                                .unwrap_or(crate::images::Decoded::Failed),
+                            Some(bytes) => decode_image_bytes(bytes).await,
                             None => crate::images::Decoded::Failed,
                         };
                         let _ = event_tx.send(BackendEvent::ImageDownloaded { url, image });
@@ -611,10 +817,14 @@ pub fn spawn(
                         let image_path = match fetch_image_bytes(&avatar_url).await {
                             Some(bytes) => {
                                 let path = cache_file(&avatar_url).map(|path| path.with_extension("notification.png"));
+                                let decoded = decode_image_bytes(bytes).await;
                                 tokio::task::spawn_blocking(move || {
                                     let path = path?;
                                     std::fs::create_dir_all(path.parent()?).ok()?;
-                                    let image = image::load_from_memory(&bytes).ok()?;
+                                    let image = match decoded {
+                                        crate::images::Decoded::Still(image) => image,
+                                        _ => return None,
+                                    };
                                     image.save_with_format(&path, image::ImageFormat::Png).ok()?;
                                     Some(path)
                                 })
@@ -641,12 +851,16 @@ pub fn spawn(
                     let event_tx = event_tx.clone();
                     tokio::spawn(async move {
                         let decoded = match poster_source(&url).await {
-                            Some(path) => tokio::task::spawn_blocking(move || match crate::video::first_frame(&path) {
-                                Some(image) => crate::images::Decoded::Still(image),
-                                None => crate::images::Decoded::Failed,
-                            })
-                            .await
-                            .unwrap_or(crate::images::Decoded::Failed),
+                            Some(path) => match VIDEO_WORKER_LIMIT.clone().acquire_owned().await {
+                                Ok(permit) => tokio::task::spawn_blocking(move || {
+                                    let _permit = permit;
+                                    match crate::video::first_frame(&path) {
+                                        Some(image) => crate::images::Decoded::Still(image),
+                                        None => crate::images::Decoded::Failed,
+                                    }
+                                }).await.unwrap_or(crate::images::Decoded::Failed),
+                                Err(_) => crate::images::Decoded::Failed,
+                            },
                             None => crate::images::Decoded::Failed,
                         };
                         let _ = event_tx.send(BackendEvent::ImageDownloaded { url: crate::images::poster_key(&url), image: decoded });
@@ -1141,7 +1355,7 @@ pub fn spawn(
                 UiCommand::FetchFont { spec } => {
                     let events = event_tx.clone();
                     tokio::spawn(async move {
-                        let client = HTTP.get_or_init(reqwest::Client::new);
+                        let client = http_client();
                         let error = crate::fonts::fetch(client, &spec).await.err();
                         let _ = events.send(BackendEvent::FontFetched { spec, error });
                     });
@@ -1208,7 +1422,12 @@ pub fn spawn(
                     });
                 }
                 UiCommand::Logout => {
-                    tokio::task::spawn_blocking(session_store::clear_token);
+                    stop_gateway().await;
+                    match serialized_credential_op(session_store::clear_token).await {
+                        Ok(Ok(())) => {},
+                        Ok(Err(_)) => tracing::warn!("failed to delete saved credentials"),
+                        Err(_) => tracing::warn!("credential deletion task failed"),
+                    }
                     rest = None;
                     login_session = None;
                 }
@@ -1540,6 +1759,7 @@ async fn start_session(
     rest: &mut Option<RestClient>,
     event_tx: &mpsc::UnboundedSender<BackendEvent>,
 ) {
+    stop_gateway().await;
     let client = match RestClient::new(&token) {
         Ok(c) => c,
         Err(e) => {
@@ -1557,7 +1777,11 @@ async fn start_session(
     }
 
     let token_to_save = token.clone();
-    tokio::task::spawn_blocking(move || session_store::save_token(&token_to_save));
+    match serialized_credential_op(move || session_store::save_token(&token_to_save)).await {
+        Ok(Ok(())) => {},
+        Ok(Err(_)) => tracing::warn!("failed to save credentials"),
+        Err(_) => tracing::warn!("credential save task failed"),
+    }
     *rest = Some(client.clone());
     let _ = event_tx.send(BackendEvent::LoggedIn);
 
@@ -1663,11 +1887,13 @@ async fn start_session(
             let _ = forward_tx.send(BackendEvent::Gateway(ev));
         }
     });
-    tokio::spawn(async move {
-        if let Err(e) = gateway.run(gw_tx, out_rx).await {
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        if let Err(e) = gateway.run_with_cancel(gw_tx, out_rx, cancel_rx).await {
             tracing::warn!("gateway task exited: {e}");
         }
     });
+    *ACTIVE_GATEWAY.lock().unwrap_or_else(|p| p.into_inner()) = Some((cancel_tx, task));
 
     if let Ok(dms) = client.dm_channels().await {
         let _ = event_tx.send(BackendEvent::DmChannelsLoaded(dms));
@@ -1679,16 +1905,23 @@ async fn start_session(
 }
 
 #[cfg(feature = "video")]
-struct ParkedDecoder(crate::video::VideoDecoder, u64);
+enum VideoWorkerCommand {
+    Next { source: crate::video::SourceState, failed: bool, reply: std::sync::mpsc::SyncSender<Option<crate::images::VideoBatch>> },
+    Seek { target: f64, reply: std::sync::mpsc::SyncSender<Option<crate::images::VideoBatch>> },
+    Close,
+}
 
 #[cfg(feature = "video")]
-unsafe impl Send for ParkedDecoder {}
+static VIDEO_WORKERS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::mpsc::SyncSender<VideoWorkerCommand>>>> = std::sync::Mutex::new(None);
 
 #[cfg(feature = "video")]
-static OPEN_VIDEOS: std::sync::Mutex<Option<std::collections::HashMap<String, ParkedDecoder>>> = std::sync::Mutex::new(None);
+static VIDEO_WORKER_LIMIT: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(4)));
 
 #[cfg(feature = "video")]
 const MAX_VIDEO_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(feature = "video")]
+const MAX_VIDEO_DOWNLOAD_TIME: std::time::Duration = std::time::Duration::from_secs(180);
 
 #[cfg(feature = "video")]
 const PLAYABLE_HEAD_BYTES: u64 = 512 * 1024;
@@ -1746,8 +1979,9 @@ async fn start_video_download(url: &str) -> Result<(std::path::PathBuf, Download
         let _ = std::fs::create_dir_all(dir);
     }
 
-    let client = HTTP.get_or_init(reqwest::Client::new);
-    let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).map_err(|e| e.to_string())?;
+    let permit = MEDIA_DOWNLOADS.clone().acquire_owned().await.map_err(|_| "download service unavailable".to_string())?;
+    let client = http_client();
+    let mut resp = client.get(url).timeout(MAX_VIDEO_DOWNLOAD_TIME).send().await.and_then(|r| r.error_for_status()).map_err(safe_reqwest_error)?;
     if resp.content_length().is_some_and(|len| len > MAX_VIDEO_BYTES) {
         return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
     }
@@ -1772,12 +2006,12 @@ async fn start_video_download(url: &str) -> Result<(std::path::PathBuf, Download
     }
     file.flush().await.map_err(|e| e.to_string())?;
 
-    let rest_url = url.to_string();
     let rest_partial = partial.clone();
     let rest_final = final_path.clone();
     tokio::spawn(async move {
+        let _permit = permit;
         let result = async {
-            while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+            while let Some(chunk) = resp.chunk().await.map_err(safe_reqwest_error)? {
                 written += chunk.len() as u64;
                 if written > MAX_VIDEO_BYTES {
                     return Err(format!("video larger than {MAX_VIDEO_BYTES} bytes"));
@@ -1794,7 +2028,7 @@ async fn start_video_download(url: &str) -> Result<(std::path::PathBuf, Download
         match result {
             Ok(()) => state.complete.store(true, Ordering::Relaxed),
             Err(e) => {
-                tracing::warn!("video download failed for {rest_url}: {e}");
+                tracing::warn!("video download failed: {e}");
                 state.failed.store(true, Ordering::Relaxed);
                 state.complete.store(true, Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(&rest_partial).await;
@@ -1806,45 +2040,9 @@ async fn start_video_download(url: &str) -> Result<(std::path::PathBuf, Download
 }
 
 #[cfg(feature = "video")]
-fn wait_for_complete_download(
-    url: &str,
-    partial: &std::path::Path,
-    handle: &DownloadHandle,
-) -> Option<crate::images::VideoBatch> {
-    while handle.source_state() == crate::video::SourceState::Growing {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if handle.failed() {
-        forget_download(url);
-        return None;
-    }
-    let final_path = partial.with_extension("");
-    let path = if final_path.exists() { final_path } else { partial.to_path_buf() };
-    let mut decoder = match crate::video::VideoDecoder::open(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!("failed to open video {url} after download: {e}");
-            forget_download(url);
-            return None;
-        }
-    };
-    let batch = decoder.next_batch(crate::video::BATCH_FRAMES, crate::video::SourceState::Complete);
-    let meta = crate::images::VideoMeta {
-        duration_secs: decoder.duration_secs,
-        has_audio: decoder.has_audio(),
-        width: decoder.width,
-        height: decoder.height,
-    };
-    if !batch.finished {
-        let mut guard = OPEN_VIDEOS.lock().unwrap();
-        guard.get_or_insert_with(Default::default).insert(url.to_string(), ParkedDecoder(decoder, 0));
-    }
-    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: Some(meta), seek_generation: 0 })
-}
-
-#[cfg(feature = "video")]
 async fn poster_source(url: &str) -> Option<std::path::PathBuf> {
     use tokio::io::AsyncWriteExt;
+    let _permit = MEDIA_DOWNLOADS.acquire().await.ok()?;
     let final_path = cache_file(url)?.with_extension("video");
     if final_path.exists() {
         return Some(final_path);
@@ -1857,7 +2055,7 @@ async fn poster_source(url: &str) -> Option<std::path::PathBuf> {
         let _ = std::fs::create_dir_all(dir);
     }
 
-    let client = HTTP.get_or_init(reqwest::Client::new);
+    let client = http_client();
     let mut resp = client.get(url).send().await.and_then(|r| r.error_for_status()).ok()?;
     let partial = poster_path.with_extension("poster.part");
     let mut file = tokio::fs::File::create(&partial).await.ok()?;
@@ -1865,8 +2063,10 @@ async fn poster_source(url: &str) -> Option<std::path::PathBuf> {
     while written < PLAYABLE_HEAD_BYTES {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
-                written += chunk.len() as u64;
-                file.write_all(&chunk).await.ok()?;
+                let take = (PLAYABLE_HEAD_BYTES - written).min(chunk.len() as u64) as usize;
+                file.write_all(&chunk[..take]).await.ok()?;
+                written += take as u64;
+                if take < chunk.len() { break; }
             }
             Ok(None) => break,
             Err(_) => break,
@@ -1892,71 +2092,131 @@ fn forget_download(url: &str) {
 
 #[cfg(feature = "video")]
 fn open_video(url: &str, path: &std::path::Path, handle: &DownloadHandle) -> Option<crate::images::VideoBatch> {
-    let mut decoder = match crate::video::VideoDecoder::open(path) {
-        Ok(d) => d,
-        Err(e) => {
-            if handle.source_state() == crate::video::SourceState::Growing {
-                tracing::debug!("video {url} not yet playable ({e}); waiting for the full download");
-                return wait_for_complete_download(url, path, handle);
+    if let Some(previous) = VIDEO_WORKERS.lock().unwrap().as_mut().and_then(|workers| workers.remove(url)) {
+        let _ = previous.send(VideoWorkerCommand::Close);
+    }
+    let permit = VIDEO_WORKER_LIMIT.clone().blocking_acquire_owned().ok()?;
+    let url = url.to_string();
+    let path = path.to_path_buf();
+    let handle = handle.clone();
+    let (command_tx, command_rx) = std::sync::mpsc::sync_channel(8);
+    let (initial_tx, initial_rx) = std::sync::mpsc::sync_channel(1);
+    let worker_url = url.clone();
+    std::thread::Builder::new().name("rustcord-video-decoder".into()).spawn(move || {
+        let url = worker_url;
+        let _permit = permit;
+        let mut path = path;
+        let mut decoder = match crate::video::VideoDecoder::open(&path) {
+            Ok(d) => d,
+            Err(initial_error) if handle.source_state() == crate::video::SourceState::Growing => {
+                tracing::debug!("video not playable yet ({initial_error}); waiting for download");
+                while handle.source_state() == crate::video::SourceState::Growing {
+                    if matches!(command_rx.recv_timeout(std::time::Duration::from_millis(100)), Ok(VideoWorkerCommand::Close)) {
+                        let _ = initial_tx.send(None);
+                        return;
+                    }
+                }
+                if handle.failed() {
+                    forget_download(&url);
+                    let _ = initial_tx.send(None);
+                    return;
+                }
+                let final_path = path.with_extension("");
+                if final_path.exists() { path = final_path; }
+                match crate::video::VideoDecoder::open(&path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        forget_download(&url);
+                        let _ = initial_tx.send(None);
+                        return;
+                    }
+                }
             }
-            tracing::warn!("failed to open video {url}: {e}");
-            forget_download(url);
+            Err(_) => {
+                forget_download(&url);
+                let _ = initial_tx.send(None);
+                return;
+            }
+        };
+        let batch = decoder.next_batch(crate::video::BATCH_FRAMES, handle.source_state());
+        let meta = crate::images::VideoMeta {
+            duration_secs: decoder.duration_secs,
+            has_audio: decoder.has_audio(),
+            width: decoder.width,
+            height: decoder.height,
+        };
+        let keep = !batch.finished;
+        if initial_tx.send(Some((crate::images::VideoBatch { url: url.clone(), batch, meta: Some(meta), seek_generation: 0 }, keep))).is_err() || !keep {
+            return;
+        }
+        let mut seek_generation = 0;
+        while let Ok(command) = command_rx.recv() {
+            match command {
+                VideoWorkerCommand::Next { source, failed, reply } => {
+                    let mut batch = decoder.next_batch(crate::video::BATCH_FRAMES, source);
+                    if batch.awaiting_data && failed {
+                        batch.awaiting_data = false;
+                        batch.finished = true;
+                    }
+                    let reply_batch = crate::images::VideoBatch { url: url.clone(), batch, meta: None, seek_generation };
+                    let finished = reply_batch.batch.finished;
+                    let _ = reply.send(Some(reply_batch));
+                    if finished { break; }
+                }
+                VideoWorkerCommand::Seek { target, reply } => {
+                    if let Err(e) = decoder.seek(target) { tracing::warn!("video seek failed: {e}"); }
+                    seek_generation += 1;
+                    let batch = decoder.next_batch(crate::video::BATCH_FRAMES, crate::video::SourceState::Complete);
+                    let _ = reply.send(Some(crate::images::VideoBatch { url: url.clone(), batch, meta: None, seek_generation }));
+                }
+                VideoWorkerCommand::Close => break,
+            }
+        }
+    }).ok()?;
+    VIDEO_WORKERS.lock().unwrap().get_or_insert_with(Default::default).insert(url.clone(), command_tx);
+    let result = match initial_rx.recv() {
+        Ok(result) => result,
+        Err(_) => {
+            VIDEO_WORKERS.lock().unwrap().as_mut()?.remove(&url);
             return None;
         }
     };
-    let batch = decoder.next_batch(crate::video::BATCH_FRAMES, handle.source_state());
-    let meta = crate::images::VideoMeta {
-        duration_secs: decoder.duration_secs,
-        has_audio: decoder.has_audio(),
-        width: decoder.width,
-        height: decoder.height,
+    let Some((batch, keep)) = result else {
+        VIDEO_WORKERS.lock().unwrap().as_mut()?.remove(&url);
+        return None;
     };
-    if !batch.finished {
-        let mut guard = OPEN_VIDEOS.lock().unwrap();
-        guard.get_or_insert_with(Default::default).insert(url.to_string(), ParkedDecoder(decoder, 0));
+    if !keep {
+        VIDEO_WORKERS.lock().unwrap().as_mut()?.remove(&url);
     }
-    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: Some(meta), seek_generation: 0 })
+    Some(batch)
 }
 
 #[cfg(feature = "video")]
 fn next_video_batch(url: &str) -> Option<crate::images::VideoBatch> {
     let handle = download_handle(url);
     let source = handle.as_ref().map(|h| h.source_state()).unwrap_or(crate::video::SourceState::Complete);
-    let mut parked = OPEN_VIDEOS.lock().unwrap().as_mut()?.remove(url)?;
-    let mut batch = parked.0.next_batch(crate::video::BATCH_FRAMES, source);
-    if batch.awaiting_data && handle.as_ref().is_some_and(|h| h.failed()) {
-        tracing::warn!("video download for {url} failed; ending playback at {} bytes", handle.map(|h| h.written()).unwrap_or(0));
-        batch.awaiting_data = false;
-        batch.finished = true;
-    }
-    let generation = parked.1;
-    if !batch.finished {
-        let mut guard = OPEN_VIDEOS.lock().unwrap();
-        guard.get_or_insert_with(Default::default).insert(url.to_string(), parked);
-    }
-    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: None, seek_generation: generation })
+    let workers = VIDEO_WORKERS.lock().unwrap();
+    let worker = workers.as_ref()?.get(url)?.clone();
+    drop(workers);
+    let (reply, response) = std::sync::mpsc::sync_channel(1);
+    worker.send(VideoWorkerCommand::Next { source, failed: handle.is_some_and(|h| h.failed()), reply }).ok()?;
+    let batch = response.recv().ok()??;
+    if batch.batch.finished { VIDEO_WORKERS.lock().unwrap().as_mut()?.remove(url); }
+    Some(batch)
 }
 
 #[cfg(feature = "video")]
 fn seek_video(url: &str, target_secs: f64) -> Option<crate::images::VideoBatch> {
-    let mut parked = OPEN_VIDEOS.lock().unwrap().as_mut()?.remove(url)?;
-    if let Err(e) = parked.0.seek(target_secs) {
-        tracing::warn!("seek failed for {url}: {e}");
-    }
-    parked.1 += 1;
-    let batch = parked.0.next_batch(crate::video::BATCH_FRAMES, crate::video::SourceState::Complete);
-    let generation = parked.1;
-    if !batch.finished {
-        let mut guard = OPEN_VIDEOS.lock().unwrap();
-        guard.get_or_insert_with(Default::default).insert(url.to_string(), parked);
-    }
-    Some(crate::images::VideoBatch { url: url.to_string(), batch, meta: None, seek_generation: generation })
+    let worker = VIDEO_WORKERS.lock().unwrap().as_ref()?.get(url)?.clone();
+    let (reply, response) = std::sync::mpsc::sync_channel(1);
+    worker.send(VideoWorkerCommand::Seek { target: target_secs, reply }).ok()?;
+    response.recv().ok()?
 }
 
 #[cfg(feature = "video")]
 fn close_video(url: &str) {
-    if let Some(decoders) = OPEN_VIDEOS.lock().unwrap().as_mut() {
-        decoders.remove(url);
+    if let Some(worker) = VIDEO_WORKERS.lock().unwrap().as_mut().and_then(|workers| workers.remove(url)) {
+        let _ = worker.send(VideoWorkerCommand::Close);
     }
     forget_download(url);
 }

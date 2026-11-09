@@ -64,7 +64,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
             at: SystemTime::now(),
             level: *event.metadata().level(),
             target: event.metadata().target().to_string(),
-            message,
+            message: rustcord_client::devtools::redact_text(&message),
         };
         let mut logs = LOGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if logs.len() >= LOG_CAPACITY {
@@ -875,7 +875,7 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
     ui.child_window("runtime").build(|| {
         if ui.collapsing_header("Usage by thread", imgui::TreeNodeFlags::DEFAULT_OPEN) {
             ui.text(format!(
-                "Process CPU {:.1}% (100% = one core) · RSS {}",
+                "Process CPU {:.1}% · RSS {}",
                 usage.process_cpu,
                 usage.rss.map_or_else(|| "–".into(), |r| human_size(r as usize))
             ));
@@ -908,7 +908,7 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
             if usage.engines.is_empty() && usage.gpu_memory.is_empty() {
                 ui.text_disabled("Per-process GPU usage isn't exposed by this driver (needs DRM fdinfo: amdgpu, i915, xe, nouveau).");
             } else {
-                ui.text_colored(MUTED, format!("This process on {} (DRM fdinfo)", usage.gpu_driver.as_deref().unwrap_or("GPU")));
+                ui.text_colored(MUTED, format!("This process on {}", usage.gpu_driver.as_deref().unwrap_or("GPU")));
                 kv_table(ui, "gpu_usage", || {
                     for (engine, busy) in &usage.engines {
                         kv(ui, &format!("{engine} engine"), format!("{busy:.1}% busy"));
@@ -919,7 +919,7 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
                 });
             }
         }
-        if ui.collapsing_header("Memory by item (estimates)", imgui::TreeNodeFlags::DEFAULT_OPEN) {
+        if ui.collapsing_header("Memory by item", imgui::TreeNodeFlags::DEFAULT_OPEN) {
             let t = &runtime.textures;
             let capture_bytes: usize = view.logs.iter().map(|e| e.message.len() + e.target.len() + 48).sum();
             kv_table(ui, "memory_items", || {
@@ -942,7 +942,7 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
                 crate::memory::trim();
             }
         }
-        if ui.collapsing_header("Rendering (main window)", imgui::TreeNodeFlags::DEFAULT_OPEN) {
+        if ui.collapsing_header("Main Window Rendering", imgui::TreeNodeFlags::DEFAULT_OPEN) {
             let now = std::time::Instant::now();
             let recent: Vec<&FrameSample> = runtime
                 .frames
@@ -954,10 +954,10 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
             let average = |pick: fn(&FrameSample) -> f32| if last.is_empty() { 0.0 } else { last.iter().map(|f| pick(f)).sum::<f32>() / last.len() as f32 };
             let worst = last.iter().map(|f| f.total_ms()).fold(0.0f32, f32::max);
             kv_table(ui, "render_stats", || {
-                kv(ui, "Redraws (last second)", format!("{} (redraws only happen on input, animation or new data)", recent.len()));
-                kv(ui, "Acquire surface", format!("{:.2} ms avg", average(|f| f.acquire_ms)));
+                kv(ui, "Redraws (1s)", format!("{}", recent.len()));
+                kv(ui, "Surface", format!("{:.2} ms avg", average(|f| f.acquire_ms)));
                 kv(ui, "UI build (imgui)", format!("{:.2} ms avg", average(|f| f.build_ms)));
-                kv(ui, "Encode + submit (wgpu)", format!("{:.2} ms avg", average(|f| f.submit_ms)));
+                kv(ui, "wgpu Encode/Submit chain", format!("{:.2} ms avg", average(|f| f.submit_ms)));
                 kv(ui, "Present", format!("{:.2} ms avg", average(|f| f.present_ms)));
                 kv(ui, "Frame total", format!("{:.2} ms avg · {worst:.2} ms worst of last {}", average(FrameSample::total_ms), last.len()));
                 if let Some((_, f)) = runtime.frames.last() {
@@ -968,7 +968,7 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
             let dev_last: Vec<f32> = runtime.devtools_frames.iter().rev().take(60).map(|(_, f)| f.total_ms()).collect();
             let dev_avg = if dev_last.is_empty() { 0.0 } else { dev_last.iter().sum::<f32>() / dev_last.len() as f32 };
             kv_table(ui, "devtools_render", || {
-                kv(ui, "Devtools window", format!("{dev_recent} redraws/s · {dev_avg:.2} ms avg (same thread as the main window)"));
+                kv(ui, "Devtools window", format!("{dev_recent} redraws/s · {dev_avg:.2} ms avg"));
                 kv(ui, "UI thread busy rendering", format!("~{:.0}% of the last second", (recent.iter().map(|f| f.total_ms()).sum::<f32>() + runtime.devtools_frames.iter().filter(|(at, _)| now.duration_since(*at) < std::time::Duration::from_secs(1)).map(|(_, f)| f.total_ms()).sum::<f32>()) / 10.0));
             });
             let totals: Vec<f32> = runtime.frames.iter().map(|(_, f)| f.total_ms()).collect();
@@ -1016,6 +1016,19 @@ fn draw_runtime(ui: &Ui, view: &mut DevtoolsView, runtime: &RuntimeSnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_tracing_fields_are_redacted_before_storage() {
+        use tracing_subscriber::prelude::*;
+        let before = LOG_SEQ.load(Ordering::Relaxed);
+        let subscriber = tracing_subscriber::Registry::default().with(LogCapture);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(access_token = "buffer-secret", "synthetic diagnostic");
+        });
+        let captured = logs_since(before);
+        assert!(!captured.iter().any(|entry| entry.message.contains("buffer-secret")));
+        assert!(captured.iter().any(|entry| entry.message.contains("[redacted]")));
+    }
 
     fn frame(socket: SocketKind, direction: Direction, op: Option<u64>, event: Option<&str>, size: usize) -> SocketSummary {
         SocketSummary { id: 1, at: SystemTime::UNIX_EPOCH, socket, direction, op, event: event.map(str::to_string), size, binary: false }

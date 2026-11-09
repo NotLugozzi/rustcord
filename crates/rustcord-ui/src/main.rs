@@ -104,9 +104,13 @@ fn main() {
         }
     }
 
-    if let Some(token) = session_store::load_token() {
-        state.login_status = Some("Resuming saved session...".into());
-        let _ = cmd_tx.send(UiCommand::LoginWithToken { token });
+    match session_store::load_token() {
+        Ok(Some(token)) => {
+            state.login_status = Some("Resuming saved session...".into());
+            let _ = cmd_tx.send(UiCommand::LoginWithToken { token });
+        }
+        Ok(None) => {}
+        Err(_) => tracing::warn!("failed to read saved credentials"),
     }
 
     renderer::run(state, cmd_tx, event_rx);

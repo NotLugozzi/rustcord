@@ -1,10 +1,10 @@
 use crate::error::ClientError;
+use crate::identity::ClientIdentity;
 use crate::models::{Channel, ChannelType, Emoji, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Sticker, StickerPack, User};
 use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
 const API_BASE: &str = "https://discord.com/api/v10";
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -36,11 +36,8 @@ pub struct LoginSession {
 
 impl LoginSession {
     pub fn new() -> Result<Self, ClientError> {
-        let mut headers = header::HeaderMap::new();
-        headers.insert(header::USER_AGENT, header::HeaderValue::from_static(USER_AGENT));
-        headers.insert("X-Super-Properties", header::HeaderValue::from_static(SUPER_PROPERTIES_B64));
         let http = Client::builder()
-            .default_headers(headers)
+            .default_headers(login_headers())
             .timeout(std::time::Duration::from_secs(15))
             .cookie_store(true)
             .build()?;
@@ -92,7 +89,7 @@ impl LoginSession {
                     }
                 }
             }
-            return Err(ClientError::Api { status: status.as_u16(), message: text });
+            return Err(ClientError::Api { status: status.as_u16(), message: "request rejected by server".into() });
         }
         Ok(serde_json::from_str(&text)?)
     }
@@ -113,8 +110,7 @@ impl LoginSession {
             .json(&Body { code, ticket })).await?;
         let status = resp.status();
         if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
+            return Err(ClientError::Api { status: status.as_u16(), message: "request rejected by server".into() });
         }
         Ok(resp.json::<Resp>().await?.token)
     }
@@ -229,14 +225,8 @@ pub struct RestClient {
 impl RestClient {
     pub fn new(token: impl Into<String>) -> Result<Self, ClientError> {
         let token = token.into().trim().to_string();
-        let mut headers = header::HeaderMap::new();
-        let auth = header::HeaderValue::from_str(&token).map_err(|_| ClientError::MalformedToken)?;
-        headers.insert(header::AUTHORIZATION, auth);
-        headers.insert(header::USER_AGENT, header::HeaderValue::from_static(USER_AGENT));
-        headers.insert("X-Super-Properties", header::HeaderValue::from_static(SUPER_PROPERTIES_B64));
-
         let http = Client::builder()
-            .default_headers(headers)
+            .default_headers(rest_headers(&token)?)
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
         Ok(Self { http, token })
@@ -424,8 +414,7 @@ impl RestClient {
         let resp = dispatch(self.http.post(format!("{API_BASE}/channels/{channel_id}/messages")).multipart(form)).await?;
         let status = resp.status();
         if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
+            return Err(ClientError::Api { status: status.as_u16(), message: "request rejected by server".into() });
         }
         Ok(resp.json::<Message>().await?)
     }
@@ -676,8 +665,7 @@ impl RestClient {
             .multipart(form)).await?;
         let status = resp.status();
         if !status.is_success() {
-            let message = resp.text().await.unwrap_or_default();
-            return Err(ClientError::Api { status: status.as_u16(), message });
+            return Err(ClientError::Api { status: status.as_u16(), message: "request rejected by server".into() });
         }
         Ok(resp.json::<Message>().await?)
     }
@@ -840,11 +828,37 @@ fn retry_after(resp: &Response) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(secs))
 }
 
-const SUPER_PROPERTIES_B64: &str = "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6ImVuLVVTIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyOS4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTI5LjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjMwMDAwMCwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=";
+fn login_headers() -> header::HeaderMap {
+    ClientIdentity::current().http_headers()
+}
+
+fn rest_headers(token: &str) -> Result<header::HeaderMap, ClientError> {
+    let mut headers = ClientIdentity::current().http_headers();
+    let auth = header::HeaderValue::from_str(token).map_err(|_| ClientError::MalformedToken)?;
+    headers.insert(header::AUTHORIZATION, auth);
+    Ok(headers)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_and_rest_send_the_same_client_identity() {
+        let login = login_headers();
+        let rest = rest_headers("token").unwrap();
+        for name in [header::USER_AGENT.as_str(), "x-super-properties"] {
+            assert!(login.get(name).is_some(), "{name} missing");
+            assert_eq!(login.get(name), rest.get(name), "{name}");
+        }
+        assert_eq!(rest.get(header::AUTHORIZATION).unwrap(), "token");
+        assert!(login.get(header::AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn a_token_with_control_characters_is_rejected_without_panicking() {
+        assert!(matches!(rest_headers("bad\ntoken"), Err(ClientError::MalformedToken)));
+    }
 
     #[test]
     fn a_forward_references_the_source_with_type_one() {

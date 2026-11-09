@@ -2,6 +2,8 @@ use ffmpeg_next as ffmpeg;
 use std::time::Duration;
 
 const MAX_VIDEO_DIM: u32 = 640;
+const MAX_SOURCE_VIDEO_DIM: u32 = 16_384;
+const MAX_SOURCE_VIDEO_PIXELS: u64 = 64_000_000;
 
 pub const BATCH_FRAMES: usize = 48;
 
@@ -92,6 +94,9 @@ impl VideoDecoder {
         let stream_duration = stream.duration();
         let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
         let decoder = ctx.decoder().video()?;
+        if !source_dimensions_allowed(decoder.width(), decoder.height()) {
+            return Err(ffmpeg::Error::InvalidData);
+        }
 
         let duration_secs = if stream_duration > 0 {
             stream_duration as f64 * time_base
@@ -328,6 +333,10 @@ fn scaled_dimensions(w: u32, h: u32) -> (u32, u32) {
     (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1))
 }
 
+fn source_dimensions_allowed(w: u32, h: u32) -> bool {
+    w > 0 && h > 0 && w <= MAX_SOURCE_VIDEO_DIM && h <= MAX_SOURCE_VIDEO_DIM && u64::from(w) * u64::from(h) <= MAX_SOURCE_VIDEO_PIXELS
+}
+
 fn copy_to_image(frame: &ffmpeg::frame::Video, width: u32, height: u32) -> Option<image::RgbaImage> {
     let stride = frame.stride(0);
     let data = frame.data(0);
@@ -362,6 +371,14 @@ mod tests {
         let (w, h) = scaled_dimensions(1080, 1920);
         assert_eq!(h, 640);
         assert_eq!(w, 360);
+    }
+
+    #[test]
+    fn source_video_dimensions_are_bounded_before_frame_decode() {
+        assert!(source_dimensions_allowed(7680, 4320));
+        assert!(!source_dimensions_allowed(16_385, 100));
+        assert!(!source_dimensions_allowed(16_000, 5000));
+        assert!(!source_dimensions_allowed(0, 480));
     }
 
     #[test]

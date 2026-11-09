@@ -1,4 +1,5 @@
 use crate::error::ClientError;
+use crate::identity::{ClientIdentity, GatewayProperties};
 use crate::models::{Channel, Emoji, Guild, GuildSettings, Sticker, GuildMember, MergedPresences, Message, Presence, ReactionEmoji, Relationship, Role, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -74,18 +75,12 @@ struct Payload {
 #[derive(Serialize)]
 struct Identify<'a> {
     token: &'a str,
-    properties: IdentifyProperties,
+    properties: GatewayProperties<'a>,
     capabilities: u64,
 }
 
 const CAPABILITY_PRIORITIZED_READY_PAYLOAD: u64 = 1 << 5;
 
-#[derive(Serialize)]
-struct IdentifyProperties {
-    os: &'static str,
-    browser: &'static str,
-    device: &'static str,
-}
 
 #[derive(Serialize)]
 struct Resume<'a> {
@@ -136,6 +131,37 @@ pub struct Gateway {
     token: String,
 }
 
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_gateway_stops_before_connecting_or_reconnecting() {
+        let gateway = Gateway::new("synthetic-token");
+        let (events, _event_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        let task = tokio::spawn(async move { gateway.run_with_cancel(events, out_rx, cancel_rx).await });
+        tokio::time::timeout(Duration::from_secs(1), task).await.expect("cancel must stop task").unwrap().unwrap();
+        assert!(out_tx.send("obsolete command".into()).is_err());
+        drop(cancel_tx);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_reconnect_backoff() {
+        let gateway = Gateway::new("synthetic-token");
+        let (events, mut event_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { gateway.run_with_url(events, out_rx, cancel_rx, "not a websocket URL").await });
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await.unwrap(), Some(GatewayEvent::Connecting)));
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await.unwrap(), Some(GatewayEvent::Disconnected { .. })));
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_millis(500), task).await.expect("backoff must be cancellable").unwrap().unwrap();
+        assert!(out_tx.send("obsolete command".into()).is_err());
+    }
+}
+
 impl Gateway {
     pub fn new(token: impl Into<String>) -> Self {
         Self { token: token.into() }
@@ -144,21 +170,49 @@ impl Gateway {
     pub async fn run(
         &self,
         tx: mpsc::UnboundedSender<GatewayEvent>,
+        outgoing: mpsc::UnboundedReceiver<String>,
+    ) -> Result<(), ClientError> {
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        self.run_with_cancel(tx, outgoing, cancel_rx).await
+    }
+
+    pub async fn run_with_cancel(
+        &self,
+        tx: mpsc::UnboundedSender<GatewayEvent>,
+        outgoing: mpsc::UnboundedReceiver<String>,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), ClientError> {
+        self.run_with_url(tx, outgoing, cancel, GATEWAY_URL).await
+    }
+
+    async fn run_with_url(
+        &self,
+        tx: mpsc::UnboundedSender<GatewayEvent>,
         mut outgoing: mpsc::UnboundedReceiver<String>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+        fallback_url: &str,
     ) -> Result<(), ClientError> {
         let mut session = Session::default();
         let mut backoff = Duration::from_secs(1);
 
         loop {
             let _ = tx.send(GatewayEvent::Connecting);
-            match self.connect_and_run(&tx, &mut outgoing, &mut session).await {
+            if *cancel.borrow() { return Ok(()); }
+            let result = tokio::select! {
+                _ = cancel.changed() => return Ok(()),
+                result = self.connect_and_run(&tx, &mut outgoing, &mut session, fallback_url) => result,
+            };
+            match result {
                 Ok(()) => {
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
                     tracing::warn!("gateway connection ended: {e}");
                     let _ = tx.send(GatewayEvent::Disconnected { reason: e.to_string() });
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = cancel.changed() => return Ok(()),
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
                     backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
@@ -170,8 +224,9 @@ impl Gateway {
         tx: &mpsc::UnboundedSender<GatewayEvent>,
         outgoing: &mut mpsc::UnboundedReceiver<String>,
         session: &mut Session,
+        fallback_url: &str,
     ) -> Result<(), ClientError> {
-        let url = session.resume_gateway_url.as_deref().unwrap_or(GATEWAY_URL);
+        let url = session.resume_gateway_url.as_deref().unwrap_or(fallback_url);
         let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
         let (write, read) = ws_stream.split();
         let mut write = write.with(|message: WsMessage| {
@@ -203,11 +258,7 @@ impl Gateway {
             _ => {
                 let identify = Identify {
                     token: &self.token,
-                    properties: IdentifyProperties {
-                        os: "Windows",
-                        browser: "Discord Client",
-                        device: "Discord Client",
-                    },
+                    properties: ClientIdentity::current().gateway_properties(),
                     capabilities: CAPABILITY_PRIORITIZED_READY_PAYLOAD,
                 };
                 let identify_payload = json!({ "op": 2, "d": identify });
@@ -718,6 +769,17 @@ fn deduplicate_presences(presences: &mut Vec<Presence>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identify_carries_runtime_properties_and_only_the_prioritized_ready_capability() {
+        let identify = Identify { token: "t", properties: ClientIdentity::current().gateway_properties(), capabilities: CAPABILITY_PRIORITIZED_READY_PAYLOAD };
+        let d = serde_json::to_value(&identify).unwrap();
+        assert_eq!(d["capabilities"], 32);
+        assert_eq!(d["properties"]["browser"], "Rustcord");
+        assert_eq!(d["properties"]["device"], "Rustcord");
+        assert_eq!(d["properties"]["os"], ClientIdentity::current().runtime().os.as_str());
+        assert_eq!(d["properties"].as_object().unwrap().len(), 3);
+    }
 
     fn user_json(id: &str) -> Value {
         json!({ "id": id, "username": "ada", "discriminator": "0", "avatar": null })

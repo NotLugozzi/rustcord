@@ -3,19 +3,24 @@ use keyring::Entry;
 const SERVICE: &str = "rustcord";
 const USERNAME: &str = "session-token";
 
-pub fn load_token() -> Option<String> {
-    let entry = Entry::new(SERVICE, USERNAME).ok()?;
-    entry.get_password().ok()
-}
-
-pub fn save_token(token: &str) {
-    let Ok(entry) = Entry::new(SERVICE, USERNAME) else { return };
-    if let Err(e) = entry.set_password(token) {
-        tracing::warn!("failed to save token to keychain: {e}");
+pub fn load_token() -> Result<Option<String>, keyring::Error> {
+    let entry = Entry::new(SERVICE, USERNAME)?;
+    match entry.get_password() {
+        Ok(token) => Ok(Some(token)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
-pub fn clear_token() {
-    let Ok(entry) = Entry::new(SERVICE, USERNAME) else { return };
-    let _ = entry.delete_credential();
+pub fn save_token(token: &str) -> Result<(), keyring::Error> {
+    let entry = Entry::new(SERVICE, USERNAME)?;
+    entry.set_password(token)
+}
+
+pub fn clear_token() -> Result<(), keyring::Error> {
+    let entry = Entry::new(SERVICE, USERNAME)?;
+    match entry.delete_credential() {
+        Err(keyring::Error::NoEntry) => Ok(()),
+        result => result,
+    }
 }
