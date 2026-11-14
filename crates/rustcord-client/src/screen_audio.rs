@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-/// Available app audio output sources as `(pid, display name, currently playing)`.
 #[cfg(target_os = "linux")]
 pub fn list_sources() -> Result<Vec<(u32, String, bool)>, String> {
     flexaudio_os_linux::list_processes()
@@ -11,14 +10,16 @@ pub fn list_sources() -> Result<Vec<(u32, String, bool)>, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Process-specific capture currently requires PipeWire's per-process stream support.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub fn list_sources() -> Result<Vec<(u32, String, bool)>, String> {
+    crate::screen_capture::list_apps()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn list_sources() -> Result<Vec<(u32, String, bool)>, String> {
     Err("per-app audio capture is currently available on Linux with PipeWire".into())
 }
 
-/// Captures 48 kHz mono PCM until screen sharing stops. PID zero captures system
-/// output excluding RustCord; a nonzero PID captures only that application's output.
 pub fn capture_system_audio(sender: mpsc::Sender<Vec<i16>>, sharing: Arc<AtomicBool>, source_pid: u32) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
@@ -60,7 +61,11 @@ pub fn capture_system_audio(sender: mpsc::Sender<Vec<i16>>, sharing: Arc<AtomicB
         backend.stop();
         Ok(())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        crate::screen_capture::capture_audio(sender, sharing, source_pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (sender, sharing, source_pid);
         Err("per-app audio capture is currently available on Linux with PipeWire".into())

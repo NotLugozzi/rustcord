@@ -53,7 +53,7 @@ chrono = "0.4"
 resvg = { version = "0.45", default-features = false }
 arboard = { version = "3", features = ["wayland-data-control"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

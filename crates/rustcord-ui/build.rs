@@ -7,6 +7,17 @@ fn main() {
     emit("RUSTCORD_COMMIT", git(&["rev-parse", "--short", "HEAD"]));
     emit("RUSTCORD_TAG", git(&["describe", "--tags", "--exact-match", "HEAD"]));
     emit("RUSTCORD_COMMIT_DATE", git(&["log", "-1", "--format=%cs"]));
+
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,/usr/lib/swift");
+        let swiftc = Command::new("xcrun").args(["--find", "swiftc"]).output().ok();
+        let dir = swiftc
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .and_then(|path| std::path::Path::new(path.trim()).parent()?.parent().map(|usr| usr.join("lib/swift/macosx")));
+        if let Some(dir) = dir.filter(|dir| dir.exists()) {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
 }
 
 fn git(args: &[&str]) -> Option<String> {

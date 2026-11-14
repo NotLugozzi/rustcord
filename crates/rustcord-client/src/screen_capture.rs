@@ -1,6 +1,17 @@
 #[cfg(not(target_os = "linux"))]
 use crate::error::ClientError;
 
+static TARGET_APP_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_target_app(pid: Option<u32>) {
+    TARGET_APP_PID.store(pid.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn target_app() -> u32 {
+    TARGET_APP_PID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub const MAX_CAPTURE_WIDTH: u32 = 8192;
 pub const MAX_CAPTURE_HEIGHT: u32 = 8192;
 
@@ -54,6 +65,8 @@ pub use windows::ScreenCapture;
 mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::ScreenCapture;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{capture_audio, list_apps};
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 pub struct ScreenCapture;

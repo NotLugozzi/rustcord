@@ -6030,7 +6030,9 @@ fn draw_call_participant_tiles(
         let avatar_url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
         let avatar = textures.get_still(&avatar_url).map(|(id, _)| id);
         if avatar.is_none() { textures.request(&avatar_url, cmd_tx); }
-        let camera = textures.live_video(&crate::app_state::camera_video_key(&user.id));
+        let camera = textures.live_video(&crate::app_state::camera_video_key(&user.id))
+            .or_else(|| state.current_user.as_ref().filter(|me| me.id == user.id)
+                .and_then(|_| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id))));
         let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
         let display_name = truncate_to_width(ui, &name, tile_w - if large { 32.0 } else { 82.0 }).unwrap_or(name);
         let speaking_color = [0.26, 0.83, 0.44, 1.0];
@@ -6145,6 +6147,25 @@ fn draw_screen_share_setup_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unboun
             }
             if let Some(_popup) = ui.modal_popup_config("Start screen share").always_auto_resize(true).begin_popup() {
                 ui.text("Choose stream quality and audio before sharing.");
+                #[cfg(target_os = "macos")]
+                {
+                    let selected_app = state.selected_screen_app_pid
+                        .and_then(|pid| state.screen_audio_sources.iter().find(|(source_pid, _, _)| *source_pid == pid))
+                        .map(|(_, name, _)| name.as_str())
+                        .unwrap_or("Entire display");
+                    ui.set_next_item_width(260.0);
+                    if let Some(_combo) = ui.begin_combo("Share", selected_app) {
+                        if ui.selectable_config("Entire display").selected(state.selected_screen_app_pid.is_none()).build() {
+                            state.selected_screen_app_pid = None;
+                        }
+                        for (pid, name, _) in &state.screen_audio_sources {
+                            let label = format!("{name}##app{pid}");
+                            if ui.selectable_config(&label).selected(state.selected_screen_app_pid == Some(*pid)).build() {
+                                state.selected_screen_app_pid = Some(*pid);
+                            }
+                        }
+                    }
+                }
                 ui.checkbox("Share audio", &mut state.share_system_audio);
                 if state.share_system_audio {
                     let selected_audio = state.selected_screen_audio_pid
@@ -6189,6 +6210,8 @@ fn draw_screen_share_setup_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unboun
                 }
                 ui.spacing();
                 if ui.button("Start sharing") {
+                    #[cfg(all(feature = "screenshare", target_os = "macos"))]
+                    rustcord_client::screen_capture::set_target_app(state.selected_screen_app_pid);
                     if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
                         state.screen_sharing = true;
                         let _ = cmd_tx.send(UiCommand::SetScreenSharing {
@@ -6349,13 +6372,22 @@ fn draw_server_call_fullscreen(ui: &Ui, state: &mut AppState, textures: &mut Tex
     let stage_width = if state.server_call_focus_stream { width - 32.0 } else { width * 0.92 };
     let stage_width = stage_width.clamp(1.0, (width - 48.0).max(1.0));
     let stage_height = (stage_bottom - stage_top).max(100.0);
-    let frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    let remote_frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    let local_preview = state.current_user.as_ref()
+        .filter(|user| owner_id.as_deref() == Some(user.id.as_str()) && state.screen_sharing)
+        .and_then(|user| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)));
+    let showing_local_preview = remote_frame.is_none() && local_preview.is_some();
+    let frame = remote_frame.or(local_preview);
     if let Some((texture_id, source)) = frame {
         let scale = (stage_width / source[0].max(1.0)).min(stage_height / source[1].max(1.0));
         let size = [source[0] * scale, source[1] * scale];
         let pos = [(width - size[0]) * 0.5, stage_top + (stage_height - size[1]) * 0.5];
         ui.set_cursor_pos(pos);
         imgui::Image::new(texture_id, size).build(ui);
+        if showing_local_preview {
+            ui.set_cursor_pos([20.0, stage_top + 8.0]);
+            ui.text_colored([0.7, 0.8, 0.85, 1.0], "Preparing your local preview");
+        }
     } else if state.watching_stream.is_some() {
         let text = "Connecting to the stream…";
         let text_size = ui.calc_text_size(text);
@@ -6395,7 +6427,12 @@ fn draw_watched_stream_panel(ui: &Ui, state: &mut AppState, textures: &mut Textu
         .map(|user| user.global_name.clone().unwrap_or_else(|| user.username.clone()))
         .or(owner_id.clone())
         .unwrap_or_else(|| "screen share".into());
-    let frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    let remote_frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
+    let local_preview = state.current_user.as_ref()
+        .filter(|user| owner_id.as_deref() == Some(user.id.as_str()) && state.screen_sharing)
+        .and_then(|user| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)));
+    let showing_local_preview = remote_frame.is_none() && local_preview.is_some();
+    let frame = remote_frame.or(local_preview);
     let image_size = frame.map(|(_, source)| {
         let max_width = (ui.window_size()[0] - 24.0).clamp(1.0, 900.0);
         let max_height = 400.0;
@@ -6404,7 +6441,7 @@ fn draw_watched_stream_panel(ui: &Ui, state: &mut AppState, textures: &mut Textu
     });
     let panel_height = image_size.map_or(74.0, |size| size[1] + 44.0);
     ui.child_window("watched_stream_panel").size([0.0, panel_height]).build(|| {
-        ui.text(format!("Live: {owner_name}"));
+        ui.text(if showing_local_preview { format!("Local preview: {owner_name}") } else { format!("Live: {owner_name}") });
         ui.same_line();
         if ui.small_button("Stop watching##live_stream_panel") {
             let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
@@ -6442,7 +6479,10 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
     #[cfg(feature = "screenshare")]
     let live_videos: Vec<_> = members
         .iter()
-        .map(|(user, _)| textures.live_video(&user.id).or_else(|| textures.live_video(&crate::app_state::camera_video_key(&user.id))))
+        .map(|(user, _)| textures.live_video(&user.id)
+            .or_else(|| textures.live_video(&crate::app_state::camera_video_key(&user.id)))
+            .or_else(|| state.current_user.as_ref().filter(|me| me.id == user.id)
+                .and_then(|_| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)))))
         .collect();
     ui.child_window("dm_call_panel").size([0.0, CALL_PANEL_HEIGHT]).build(|| {
         let width = ui.window_size()[0];

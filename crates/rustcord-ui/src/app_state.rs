@@ -217,6 +217,11 @@ pub fn camera_video_key(user_id: &str) -> String {
     format!("camera:{user_id}")
 }
 
+#[cfg(feature = "screenshare")]
+pub fn screen_preview_video_key(user_id: &str) -> String {
+    format!("screen_preview:{user_id}")
+}
+
 pub const FREQUENT_SECTION: &str = "frequent";
 const FREQUENT_STICKERS_SHOWN: usize = 12;
 const FREQUENT_EMOJIS_SHOWN: usize = 24;
@@ -503,6 +508,7 @@ pub struct AppState {
     pub screen_audio_sources_loaded: bool,
     pub screen_audio_sources_error: Option<String>,
     pub selected_screen_audio_pid: Option<u32>,
+    pub selected_screen_app_pid: Option<u32>,
     pub screen_share_max_height: u32,
     pub screen_share_fps: u32,
     pub show_screen_share_setup: bool,

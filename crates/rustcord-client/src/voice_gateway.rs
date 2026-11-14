@@ -310,6 +310,7 @@ impl VoiceGateway {
         #[cfg(not(feature = "screenshare"))]
         let _ = &system_audio_tx;
         let (video_frame_tx, mut video_frame_rx) = mpsc::channel(2);
+        let (_screen_preview_tx, mut screen_preview_rx) = mpsc::channel::<(u32, u32, Vec<u8>)>(2);
         let mut screen_share_check = tokio::time::interval(Duration::from_millis(250));
         let mut camera_check = tokio::time::interval(Duration::from_millis(250));
         let mut camera_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
@@ -498,6 +499,8 @@ impl VoiceGateway {
                     match (screen_share_task.is_some(), requested) {
                         (false, true) => {
                             let frames = video_frame_tx.clone();
+                            #[cfg(feature = "screenshare")]
+                            let preview = _screen_preview_tx.clone();
                             let sharing = self.media_state.screen_sharing.clone();
                             #[cfg(feature = "screenshare")]
                             let encoder_choice = encoder_choice.clone().unwrap_or_else(|| crate::screen_encode::probe_encoder());
@@ -506,7 +509,7 @@ impl VoiceGateway {
                             #[cfg(feature = "screenshare")]
                             {
                                 screen_share_task = Some(tokio::spawn(async move {
-                                    if let Err(error) = capture_and_encode_screen(frames, sharing, max_height, framerate, encoder_choice).await {
+                                    if let Err(error) = capture_and_encode_screen(frames, preview, sharing, max_height, framerate, encoder_choice).await {
                                         tracing::warn!("screen share stopped: {error}");
                                     }
                                 }));
@@ -582,6 +585,17 @@ impl VoiceGateway {
                 Some((width, height, rgba)) = camera_preview_rx.recv() => {
                     #[cfg(feature = "screenshare")]
                     let _ = tx.send(VoiceGatewayEvent::VideoFrame { user_id: self.user_id.clone(), width, height, rgba });
+                    #[cfg(not(feature = "screenshare"))]
+                    let _ = (width, height, rgba);
+                }
+                Some((width, height, rgba)) = screen_preview_rx.recv() => {
+                    #[cfg(feature = "screenshare")]
+                    let _ = tx.send(VoiceGatewayEvent::VideoFrame {
+                        user_id: format!("screen_preview:{}", self.user_id),
+                        width,
+                        height,
+                        rgba,
+                    });
                     #[cfg(not(feature = "screenshare"))]
                     let _ = (width, height, rgba);
                 }
@@ -1397,6 +1411,8 @@ impl VoiceGateway {
 
 async fn capture_and_encode_screen(
     frames: mpsc::Sender<EncodedVideoFrame>,
+    #[cfg(feature = "screenshare")]
+    preview: mpsc::Sender<(u32, u32, Vec<u8>)>,
     sharing: Arc<AtomicBool>,
     max_height: u32,
     framerate: u32,
@@ -1407,7 +1423,7 @@ async fn capture_and_encode_screen(
         let capture = crate::screen_capture::ScreenCapture::start(framerate)
             .await
             .map_err(|error| error.to_string())?;
-        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, sharing, max_height, framerate, encoder_choice))
+        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, preview, sharing, max_height, framerate, encoder_choice))
             .await
             .map_err(|error| format!("screen encoder worker failed: {error}"))?
     }
@@ -1559,12 +1575,22 @@ fn decode_screen_packets(
 fn encode_screen_frames(
     mut capture: crate::screen_capture::ScreenCapture,
     frames: mpsc::Sender<EncodedVideoFrame>,
+    preview: mpsc::Sender<(u32, u32, Vec<u8>)>,
     sharing: Arc<AtomicBool>,
     max_height: u32,
     framerate: u32,
     encoder_choice: crate::screen_encode::EncoderChoice,
 ) -> Result<(), String> {
-    encode_video_frames(|| capture.blocking_next_frame(), frames, sharing, max_height, framerate, encoder_choice, "screen share")
+    let mut captured = 0u64;
+    let next_frame = || {
+        let frame = capture.blocking_next_frame()?;
+        captured += 1;
+        if captured % CAMERA_PREVIEW_EVERY == 1 {
+            let _ = preview.try_send(preview_rgba(&frame, CAMERA_PREVIEW_WIDTH));
+        }
+        Some(frame)
+    };
+    encode_video_frames(next_frame, frames, sharing, max_height, framerate, encoder_choice, "screen share")
 }
 
 #[cfg(feature = "screenshare")]
