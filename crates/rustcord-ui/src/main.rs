@@ -520,13 +520,26 @@ pub fn drain_backend_events(
                 });
             }
             BackendEvent::GuildInvitesLoaded { guild_id, result } => {
-                if let Some(manager) = state.invite_manager.as_mut().filter(|m| m.guild_id == guild_id) {
-                    manager.invites = Some(result);
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    settings.invites = Some(result);
                 }
             }
             BackendEvent::InviteRevoked { code } => {
-                if let Some(Some(Ok(invites))) = state.invite_manager.as_mut().map(|m| m.invites.as_mut()) {
+                if let Some(Some(Ok(invites))) = state.server_settings.as_mut().map(|s| s.invites.as_mut()) {
                     invites.retain(|i| i.code != code);
+                }
+            }
+            BackendEvent::GuildEdited(guild) => {
+                state.update_guild(&guild.id, Some(guild.name), guild.icon);
+            }
+            BackendEvent::GuildBansLoaded { guild_id, result } => {
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    settings.bans = Some(result);
+                }
+            }
+            BackendEvent::MemberUnbanned { guild_id, user_id } => {
+                if let Some(Some(Ok(bans))) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id).map(|s| s.bans.as_mut()) {
+                    bans.retain(|b| b.user.id != user_id);
                 }
             }
             BackendEvent::MemberRemoved { guild_id, user_id } => {

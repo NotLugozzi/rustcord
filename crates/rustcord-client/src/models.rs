@@ -193,6 +193,13 @@ pub struct Guild {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Ban {
+    pub user: User,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Invite {
     pub code: String,
     #[serde(default)]

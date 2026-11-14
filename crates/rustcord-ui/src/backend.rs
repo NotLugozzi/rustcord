@@ -210,6 +210,16 @@ mod credential_serialization_tests {
     static GATEWAY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
+    fn guild_icons_are_cropped_to_a_512_square_png() {
+        let path = std::env::temp_dir().join(format!("rustcord-icon-test-{}.png", std::process::id()));
+        image::RgbImage::new(1000, 600).save(&path).unwrap();
+        let png = encode_guild_icon(&path);
+        let _ = std::fs::remove_file(&path);
+        let icon = image::load_from_memory_with_format(&png.unwrap(), image::ImageFormat::Png).unwrap();
+        assert_eq!((icon.width(), icon.height()), (512, 512));
+    }
+
+    #[test]
     fn streamed_download_limits_cover_absent_and_inaccurate_length_headers() {
         assert!(response_fits_limit(None, 10));
         assert!(response_fits_limit(Some(8), 10));
@@ -343,6 +353,11 @@ pub enum UiCommand {
     CreateInvite { channel_id: String },
     LoadGuildInvites { guild_id: String },
     RevokeInvite { code: String },
+    RenameGuild { guild_id: String, name: String },
+    SetGuildIcon { guild_id: String, path: Option<std::path::PathBuf> },
+    DeleteGuild { guild_id: String },
+    LoadGuildBans { guild_id: String },
+    UnbanMember { guild_id: String, user_id: String },
     UpdateGuildSettings { guild_key: String, patch: serde_json::Value },
     SearchGifs { query: String },
     SendAttachments {
@@ -454,6 +469,9 @@ pub enum BackendEvent {
     InviteCreated { code: String },
     GuildInvitesLoaded { guild_id: String, result: Result<Vec<rustcord_client::models::Invite>, String> },
     InviteRevoked { code: String },
+    GuildEdited(rustcord_client::models::Guild),
+    GuildBansLoaded { guild_id: String, result: Result<Vec<rustcord_client::models::Ban>, String> },
+    MemberUnbanned { guild_id: String, user_id: String },
     GuildSettingsUpdated(rustcord_client::models::GuildSettings),
     GifsLoaded { query: String, result: Result<Vec<rustcord_client::models::Gif>, String> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
@@ -1166,6 +1184,72 @@ pub fn spawn(
                         });
                     }
                 }
+                UiCommand::RenameGuild { guild_id, name } => {
+                    if let Some(client) = &rest {
+                        match client.edit_guild(&guild_id, &serde_json::json!({ "name": name })).await {
+                            Ok(guild) => {
+                                let _ = event_tx.send(BackendEvent::GuildEdited(guild));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to rename server: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::SetGuildIcon { guild_id, path } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let icon = match path {
+                                Some(path) => match tokio::task::spawn_blocking(move || encode_guild_icon(&path)).await {
+                                    Ok(Ok(png)) => serde_json::Value::String(rustcord_client::rest::png_data_uri(&png)),
+                                    Ok(Err(e)) => {
+                                        let _ = event_tx.send(BackendEvent::Error(format!("failed to read server icon: {e}")));
+                                        return;
+                                    }
+                                    Err(_) => return,
+                                },
+                                None => serde_json::Value::Null,
+                            };
+                            match client.edit_guild(&guild_id, &serde_json::json!({ "icon": icon })).await {
+                                Ok(guild) => {
+                                    let _ = event_tx.send(BackendEvent::GuildEdited(guild));
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to update server icon: {e}")));
+                                }
+                            }
+                        });
+                    }
+                }
+                UiCommand::DeleteGuild { guild_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.delete_guild(&guild_id).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to delete server: {e}")));
+                        }
+                    }
+                }
+                UiCommand::LoadGuildBans { guild_id } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.guild_bans(&guild_id).await.map_err(|e| e.to_string());
+                            let _ = event_tx.send(BackendEvent::GuildBansLoaded { guild_id, result });
+                        });
+                    }
+                }
+                UiCommand::UnbanMember { guild_id, user_id } => {
+                    if let Some(client) = &rest {
+                        match client.unban_member(&guild_id, &user_id).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::MemberUnbanned { guild_id, user_id });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to unban member: {e}")));
+                            }
+                        }
+                    }
+                }
                 UiCommand::RevokeInvite { code } => {
                     if let Some(client) = &rest {
                         match client.delete_invite(&code).await {
@@ -1646,6 +1730,13 @@ async fn read_attachments(files: Vec<crate::app_state::PendingAttachment>) -> Re
         out.push(rustcord_client::rest::UploadFile { filename: file.filename, bytes, content_type });
     }
     Ok(out)
+}
+
+fn encode_guild_icon(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let icon = image::open(path).map_err(|e| e.to_string())?.resize_to_fill(512, 512, image::imageops::FilterType::Lanczos3);
+    let mut png = std::io::Cursor::new(Vec::new());
+    icon.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok(png.into_inner())
 }
 
 async fn load_guild_emojis(client: &RestClient, guild_id: String, event_tx: &mpsc::UnboundedSender<BackendEvent>) {

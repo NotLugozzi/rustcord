@@ -264,9 +264,49 @@ impl ChannelEditor {
     }
 }
 
-pub struct InviteManager {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ServerSettingsCategory {
+    Profile,
+    Members,
+    Invites,
+    Bans,
+    Delete,
+}
+
+impl ServerSettingsCategory {
+    pub const ALL: [ServerSettingsCategory; 5] = [
+        ServerSettingsCategory::Profile,
+        ServerSettingsCategory::Members,
+        ServerSettingsCategory::Invites,
+        ServerSettingsCategory::Bans,
+        ServerSettingsCategory::Delete,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerSettingsCategory::Profile => "Server Profile",
+            ServerSettingsCategory::Members => "Members",
+            ServerSettingsCategory::Invites => "Invites",
+            ServerSettingsCategory::Bans => "Bans",
+            ServerSettingsCategory::Delete => "Delete Server",
+        }
+    }
+}
+
+pub struct ServerSettings {
     pub guild_id: String,
+    pub category: ServerSettingsCategory,
+    pub name: String,
+    pub member_filter: String,
+    pub delete_confirm: String,
     pub invites: Option<Result<Vec<rustcord_client::models::Invite>, String>>,
+    pub bans: Option<Result<Vec<rustcord_client::models::Ban>, String>>,
+}
+
+impl ServerSettings {
+    pub fn new(guild_id: String, name: String, category: ServerSettingsCategory) -> Self {
+        Self { guild_id, category, name, member_filter: String::new(), delete_confirm: String::new(), invites: None, bans: None }
+    }
 }
 
 pub const MUTE_CHOICES: &[(&str, i64)] = &[
@@ -535,7 +575,7 @@ pub struct AppState {
     pub show_hidden_channels: bool,
     pub channel_context: Option<String>,
     pub channel_editor: Option<ChannelEditor>,
-    pub invite_manager: Option<InviteManager>,
+    pub server_settings: Option<ServerSettings>,
     pub guild_settings: HashMap<String, rustcord_client::models::GuildSettings>,
     pub guild_context: Option<(String, Option<usize>)>,
     pub keybinds: crate::keybinds::Keybinds,
@@ -1232,6 +1272,9 @@ impl AppState {
         self.guild_emojis.remove(guild_id);
         self.guild_stickers.remove(guild_id);
         self.guild_members.remove(guild_id);
+        if self.server_settings.as_ref().is_some_and(|s| s.guild_id == guild_id) {
+            self.server_settings = None;
+        }
         if self.selected_guild.as_deref() == Some(guild_id) {
             self.selected_guild = None;
             self.selected_channel = None;
@@ -2129,6 +2172,16 @@ impl AppState {
     pub fn is_guild_owner(&self, guild_id: &str) -> bool {
         let Some(me) = &self.current_user else { return false };
         self.guilds.iter().any(|g| g.id == guild_id && g.owner_id.as_deref() == Some(me.id.as_str()))
+    }
+
+    pub fn server_settings_allowed(&self, guild_id: &str, category: ServerSettingsCategory) -> bool {
+        use rustcord_client::permissions::{BAN_MEMBERS, KICK_MEMBERS, MANAGE_GUILD};
+        match category {
+            ServerSettingsCategory::Profile | ServerSettingsCategory::Invites => self.has_guild_permission(guild_id, MANAGE_GUILD),
+            ServerSettingsCategory::Members => self.has_guild_permission(guild_id, KICK_MEMBERS) || self.has_guild_permission(guild_id, BAN_MEMBERS),
+            ServerSettingsCategory::Bans => self.has_guild_permission(guild_id, BAN_MEMBERS),
+            ServerSettingsCategory::Delete => self.is_guild_owner(guild_id),
+        }
     }
 
     pub fn has_guild_permission(&self, guild_id: &str, bit: u64) -> bool {

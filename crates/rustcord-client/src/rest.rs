@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use crate::identity::ClientIdentity;
-use crate::models::{Channel, ChannelType, Emoji, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Sticker, StickerPack, User};
+use crate::models::{Channel, ChannelType, Emoji, Ban, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Sticker, StickerPack, User};
 use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
@@ -534,6 +534,22 @@ impl RestClient {
         self.send_empty(|| self.http.delete(format!("{API_BASE}/invites/{code}"))).await
     }
 
+    pub async fn edit_guild(&self, guild_id: &str, patch: &serde_json::Value) -> Result<Guild, ClientError> {
+        self.request(Method::PATCH, &format!("/guilds/{guild_id}"), Some(patch)).await
+    }
+
+    pub async fn delete_guild(&self, guild_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}"))).await
+    }
+
+    pub async fn guild_bans(&self, guild_id: &str) -> Result<Vec<Ban>, ClientError> {
+        self.get(&format!("/guilds/{guild_id}/bans")).await
+    }
+
+    pub async fn unban_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}"))).await
+    }
+
     pub async fn update_guild_settings(&self, guild_key: &str, patch: &serde_json::Value) -> Result<GuildSettings, ClientError> {
         self.request(Method::PATCH, &format!("/users/@me/guilds/{guild_key}/settings"), Some(patch)).await
     }
@@ -804,6 +820,11 @@ fn gif_path(query: &str) -> String {
     } else {
         format!("/gifs/search?q={}&{params}", encode_path_segment(query))
     }
+}
+
+pub fn png_data_uri(png: &[u8]) -> String {
+    use base64::Engine;
+    format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png))
 }
 
 pub fn encode_path_segment(value: &str) -> String {
