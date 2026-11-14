@@ -537,6 +537,18 @@ pub fn drain_backend_events(
                     settings.bans = Some(result);
                 }
             }
+            BackendEvent::RoleCreated { guild_id, role } => {
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    settings.role_draft = Some(crate::app_state::RoleDraft::from(&role));
+                }
+                state.upsert_role(&guild_id, role);
+            }
+            BackendEvent::RoleSaved { guild_id, role } => {
+                state.upsert_role(&guild_id, role);
+            }
+            BackendEvent::RoleDeleted { guild_id, role_id } => {
+                state.remove_role(&guild_id, &role_id);
+            }
             BackendEvent::MemberUnbanned { guild_id, user_id } => {
                 if let Some(Some(Ok(bans))) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id).map(|s| s.bans.as_mut()) {
                     bans.retain(|b| b.user.id != user_id);

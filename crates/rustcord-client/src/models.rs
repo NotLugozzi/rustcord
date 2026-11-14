@@ -435,6 +435,10 @@ pub struct Role {
     pub color: u32,
     #[serde(default)]
     pub managed: bool,
+    #[serde(default)]
+    pub hoist: bool,
+    #[serde(default)]
+    pub mentionable: bool,
 }
 
 impl Role {

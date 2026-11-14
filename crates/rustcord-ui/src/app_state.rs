@@ -267,6 +267,7 @@ impl ChannelEditor {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ServerSettingsCategory {
     Profile,
+    Roles,
     Members,
     Invites,
     Bans,
@@ -274,8 +275,9 @@ pub enum ServerSettingsCategory {
 }
 
 impl ServerSettingsCategory {
-    pub const ALL: [ServerSettingsCategory; 5] = [
+    pub const ALL: [ServerSettingsCategory; 6] = [
         ServerSettingsCategory::Profile,
+        ServerSettingsCategory::Roles,
         ServerSettingsCategory::Members,
         ServerSettingsCategory::Invites,
         ServerSettingsCategory::Bans,
@@ -285,6 +287,7 @@ impl ServerSettingsCategory {
     pub fn label(self) -> &'static str {
         match self {
             ServerSettingsCategory::Profile => "Server Profile",
+            ServerSettingsCategory::Roles => "Roles",
             ServerSettingsCategory::Members => "Members",
             ServerSettingsCategory::Invites => "Invites",
             ServerSettingsCategory::Bans => "Bans",
@@ -301,11 +304,35 @@ pub struct ServerSettings {
     pub delete_confirm: String,
     pub invites: Option<Result<Vec<rustcord_client::models::Invite>, String>>,
     pub bans: Option<Result<Vec<rustcord_client::models::Ban>, String>>,
+    pub role_draft: Option<RoleDraft>,
 }
 
 impl ServerSettings {
     pub fn new(guild_id: String, name: String, category: ServerSettingsCategory) -> Self {
-        Self { guild_id, category, name, member_filter: String::new(), delete_confirm: String::new(), invites: None, bans: None }
+        Self { guild_id, category, name, member_filter: String::new(), delete_confirm: String::new(), invites: None, bans: None, role_draft: None }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub struct RoleDraft {
+    pub role_id: String,
+    pub name: String,
+    pub color: u32,
+    pub hoist: bool,
+    pub mentionable: bool,
+    pub permissions: u64,
+}
+
+impl From<&rustcord_client::models::Role> for RoleDraft {
+    fn from(role: &rustcord_client::models::Role) -> Self {
+        Self {
+            role_id: role.id.clone(),
+            name: role.name.clone(),
+            color: role.color,
+            hoist: role.hoist,
+            mentionable: role.mentionable,
+            permissions: role.permissions,
+        }
     }
 }
 
@@ -1714,6 +1741,11 @@ impl AppState {
                 member.roles.retain(|r| r != role_id);
             }
         }
+        if let Some(settings) = self.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+            if settings.role_draft.as_ref().is_some_and(|d| d.role_id == role_id) {
+                settings.role_draft = None;
+            }
+        }
     }
 
     pub fn upsert_relationship(&mut self, relationship: Relationship) {
@@ -2175,9 +2207,10 @@ impl AppState {
     }
 
     pub fn server_settings_allowed(&self, guild_id: &str, category: ServerSettingsCategory) -> bool {
-        use rustcord_client::permissions::{BAN_MEMBERS, KICK_MEMBERS, MANAGE_GUILD};
+        use rustcord_client::permissions::{BAN_MEMBERS, KICK_MEMBERS, MANAGE_GUILD, MANAGE_ROLES};
         match category {
             ServerSettingsCategory::Profile | ServerSettingsCategory::Invites => self.has_guild_permission(guild_id, MANAGE_GUILD),
+            ServerSettingsCategory::Roles => self.has_guild_permission(guild_id, MANAGE_ROLES),
             ServerSettingsCategory::Members => self.has_guild_permission(guild_id, KICK_MEMBERS) || self.has_guild_permission(guild_id, BAN_MEMBERS),
             ServerSettingsCategory::Bans => self.has_guild_permission(guild_id, BAN_MEMBERS),
             ServerSettingsCategory::Delete => self.is_guild_owner(guild_id),
@@ -2204,11 +2237,21 @@ impl AppState {
         rustcord_client::permissions::has_permission(permissions, bit)
     }
 
+    fn my_top_role_position(&self, guild_id: &str) -> i32 {
+        let Some(roles) = self.guild_roles.get(guild_id) else { return 0 };
+        let mine = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
+        roles.iter().filter(|r| mine.contains(&r.id)).map(|r| r.position).max().unwrap_or(0)
+    }
+
+    pub fn can_edit_role(&self, guild_id: &str, role: &rustcord_client::models::Role) -> bool {
+        self.is_guild_owner(guild_id)
+            || (self.has_guild_permission(guild_id, rustcord_client::permissions::MANAGE_ROLES) && role.position < self.my_top_role_position(guild_id))
+    }
+
     pub fn assignable_roles(&self, guild_id: &str) -> Vec<&rustcord_client::models::Role> {
         let Some(roles) = self.guild_roles.get(guild_id) else { return Vec::new() };
         let owner = self.is_guild_owner(guild_id);
-        let mine = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
-        let my_top = roles.iter().filter(|r| mine.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
+        let my_top = self.my_top_role_position(guild_id);
         let mut assignable: Vec<_> = roles
             .iter()
             .filter(|r| r.id != guild_id && !r.managed && (owner || r.position < my_top))
@@ -2386,7 +2429,7 @@ mod tests {
     }
 
     fn test_role(id: &str, permissions: u64) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions, position: 1, color: 0, managed: false }
+        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions, position: 1, color: 0, managed: false, hoist: false, mentionable: false }
     }
 
     #[test]
@@ -2551,7 +2594,7 @@ mod tests {
     }
 
     fn ranked_role(id: &str, position: i32, managed: bool) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions: 0, position, color: 0, managed }
+        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions: 0, position, color: 0, managed, hoist: false, mentionable: false }
     }
 
     fn moderator_state(owner: bool) -> AppState {
@@ -3163,7 +3206,7 @@ mod tests {
     }
 
     fn role(id: &str, name: &str, position: i32, color: u32) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color, managed: false }
+        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color, managed: false, hoist: false, mentionable: false }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use crate::identity::ClientIdentity;
-use crate::models::{Channel, ChannelType, Emoji, Ban, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Sticker, StickerPack, User};
+use crate::models::{Channel, ChannelType, Emoji, Ban, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Role, Sticker, StickerPack, User};
 use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
@@ -543,11 +543,33 @@ impl RestClient {
     }
 
     pub async fn guild_bans(&self, guild_id: &str) -> Result<Vec<Ban>, ClientError> {
-        self.get(&format!("/guilds/{guild_id}/bans")).await
+        const PAGE: usize = 1000;
+        let mut bans: Vec<Ban> = Vec::new();
+        loop {
+            let after = bans.last().map(|b| format!("&after={}", b.user.id)).unwrap_or_default();
+            let page: Vec<Ban> = self.get(&format!("/guilds/{guild_id}/bans?limit={PAGE}{after}")).await?;
+            let done = page.len() < PAGE;
+            bans.extend(page);
+            if done {
+                return Ok(bans);
+            }
+        }
     }
 
     pub async fn unban_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
         self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}"))).await
+    }
+
+    pub async fn create_role(&self, guild_id: &str) -> Result<Role, ClientError> {
+        self.post(&format!("/guilds/{guild_id}/roles"), &serde_json::json!({ "name": "new role" })).await
+    }
+
+    pub async fn edit_role(&self, guild_id: &str, role_id: &str, patch: &serde_json::Value) -> Result<Role, ClientError> {
+        self.request(Method::PATCH, &format!("/guilds/{guild_id}/roles/{role_id}"), Some(patch)).await
+    }
+
+    pub async fn delete_role(&self, guild_id: &str, role_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/roles/{role_id}"))).await
     }
 
     pub async fn update_guild_settings(&self, guild_key: &str, patch: &serde_json::Value) -> Result<GuildSettings, ClientError> {

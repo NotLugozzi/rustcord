@@ -358,6 +358,9 @@ pub enum UiCommand {
     DeleteGuild { guild_id: String },
     LoadGuildBans { guild_id: String },
     UnbanMember { guild_id: String, user_id: String },
+    CreateRole { guild_id: String },
+    SaveRole { guild_id: String, draft: crate::app_state::RoleDraft },
+    DeleteRole { guild_id: String, role_id: String },
     UpdateGuildSettings { guild_key: String, patch: serde_json::Value },
     SearchGifs { query: String },
     SendAttachments {
@@ -472,6 +475,9 @@ pub enum BackendEvent {
     GuildEdited(rustcord_client::models::Guild),
     GuildBansLoaded { guild_id: String, result: Result<Vec<rustcord_client::models::Ban>, String> },
     MemberUnbanned { guild_id: String, user_id: String },
+    RoleCreated { guild_id: String, role: rustcord_client::models::Role },
+    RoleSaved { guild_id: String, role: rustcord_client::models::Role },
+    RoleDeleted { guild_id: String, role_id: String },
     GuildSettingsUpdated(rustcord_client::models::GuildSettings),
     GifsLoaded { query: String, result: Result<Vec<rustcord_client::models::Gif>, String> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
@@ -1246,6 +1252,49 @@ pub fn spawn(
                             }
                             Err(e) => {
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to unban member: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::CreateRole { guild_id } => {
+                    if let Some(client) = &rest {
+                        match client.create_role(&guild_id).await {
+                            Ok(role) => {
+                                let _ = event_tx.send(BackendEvent::RoleCreated { guild_id, role });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to create role: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::SaveRole { guild_id, draft } => {
+                    if let Some(client) = &rest {
+                        let patch = serde_json::json!({
+                            "name": draft.name,
+                            "color": draft.color,
+                            "hoist": draft.hoist,
+                            "mentionable": draft.mentionable,
+                            "permissions": draft.permissions.to_string(),
+                        });
+                        match client.edit_role(&guild_id, &draft.role_id, &patch).await {
+                            Ok(role) => {
+                                let _ = event_tx.send(BackendEvent::RoleSaved { guild_id, role });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to save role: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::DeleteRole { guild_id, role_id } => {
+                    if let Some(client) = &rest {
+                        match client.delete_role(&guild_id, &role_id).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::RoleDeleted { guild_id, role_id });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to delete role: {e}")));
                             }
                         }
                     }

@@ -7588,7 +7588,7 @@ fn select_server_settings_category(state: &mut AppState, cmd_tx: &UnboundedSende
                 let _ = cmd_tx.send(UiCommand::RequestGuildMembers { guild_id });
             }
         }
-        ServerSettingsCategory::Profile | ServerSettingsCategory::Delete => {}
+        ServerSettingsCategory::Profile | ServerSettingsCategory::Roles | ServerSettingsCategory::Delete => {}
     }
 }
 
@@ -7639,7 +7639,7 @@ fn draw_server_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unbounded
                 ui.text(category.label());
                 ui.set_window_font_scale(1.0);
                 ui.same_line_with_spacing(heading_w, 0.0);
-                if icon_button(ui, textures, "close_server_settings", CHROME_ICONS[0], "Close server settings", None) || ui.is_key_pressed(imgui::Key::Escape) {
+                if icon_button(ui, textures, "close_server_settings", CHROME_ICONS[0], "Close server settings", None) {
                     close = true;
                 }
                 ui.spacing();
@@ -7651,6 +7651,7 @@ fn draw_server_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unbounded
                 }
                 match category {
                     ServerSettingsCategory::Profile => draw_server_profile(ui, state, cmd_tx, textures, &guild),
+                    ServerSettingsCategory::Roles => draw_server_roles(ui, state, cmd_tx, &guild),
                     ServerSettingsCategory::Members => draw_server_members(ui, state, cmd_tx, &guild),
                     ServerSettingsCategory::Invites => draw_server_invites(ui, state, cmd_tx),
                     ServerSettingsCategory::Bans => draw_server_bans(ui, state, cmd_tx, &guild),
@@ -7698,6 +7699,106 @@ fn draw_server_profile(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
             let _ = cmd_tx.send(UiCommand::SetGuildIcon { guild_id: guild.id.clone(), path: None });
         }
     }
+}
+
+fn draw_server_roles(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) {
+    let mut roles = state.guild_roles.get(&guild.id).cloned().unwrap_or_default();
+    roles.sort_by_key(|r| std::cmp::Reverse(r.position));
+    let editable: std::collections::HashSet<String> = roles.iter().filter(|r| state.can_edit_role(&guild.id, r)).map(|r| r.id.clone()).collect();
+    let muted = state.theme.text_muted;
+    let danger = state.theme.mention_badge();
+    let Some(settings) = state.server_settings.as_mut() else { return };
+
+    ui.child_window("role_list").size([220.0, 0.0]).build(|| {
+        if ui.button("Create Role") {
+            let _ = cmd_tx.send(UiCommand::CreateRole { guild_id: guild.id.clone() });
+        }
+        ui.spacing();
+        for role in &roles {
+            let selected = settings.role_draft.as_ref().is_some_and(|d| d.role_id == role.id);
+            let _tint = role.rgba().map(|c| ui.push_style_color(imgui::StyleColor::Text, c));
+            if ui.selectable_config(format!("{}##role_{}", role.name, role.id)).selected(selected).build() {
+                settings.role_draft = Some(crate::app_state::RoleDraft::from(role));
+            }
+        }
+    });
+    ui.same_line();
+    ui.child_window("role_editor").build(|| {
+        let Some(draft) = settings.role_draft.as_mut() else {
+            return ui.text_disabled("Select a role to edit it.");
+        };
+        let Some(role) = roles.iter().find(|r| r.id == draft.role_id) else { return };
+        let everyone = role.id == guild.id;
+        let can_edit = editable.contains(&role.id);
+        if !can_edit {
+            ui.text_colored(muted, "This role is above your highest role, so you can't edit it.");
+            ui.spacing();
+        }
+        ui.disabled(!can_edit, || {
+            ui.disabled(everyone, || {
+                ui.text("Role name");
+                ui.set_next_item_width(ui.content_region_avail()[0].min(480.0));
+                ui.input_text("##role_name", &mut draft.name).build();
+            });
+            let mut rgb = [16, 8, 0].map(|shift| ((draft.color >> shift) & 255) as f32 / 255.0);
+            if ui.color_edit3("Role color", &mut rgb) {
+                draft.color = rgb.iter().fold(0, |acc, v| (acc << 8) | (v.clamp(0.0, 1.0) * 255.0).round() as u32);
+            }
+            ui.same_line();
+            if ui.small_button("Default") {
+                draft.color = 0;
+            }
+            if !everyone {
+                ui.checkbox("Display role members separately from online members", &mut draft.hoist);
+                ui.checkbox("Allow anyone to @mention this role", &mut draft.mentionable);
+            }
+            for (group, permissions) in rustcord_client::permissions::PERMISSION_GROUPS {
+                ui.spacing();
+                ui.separator();
+                ui.text_colored(muted, group.to_uppercase());
+                for (bit, name) in *permissions {
+                    ui.checkbox_flags(name, &mut draft.permissions, *bit);
+                }
+            }
+        });
+        ui.spacing();
+        ui.separator();
+        ui.spacing();
+        let changed = *draft != crate::app_state::RoleDraft::from(role);
+        ui.disabled(!can_edit || !changed || draft.name.trim().is_empty(), || {
+            if ui.button("Save Changes") {
+                let mut draft = draft.clone();
+                draft.name = draft.name.trim().to_string();
+                let _ = cmd_tx.send(UiCommand::SaveRole { guild_id: guild.id.clone(), draft });
+            }
+            ui.same_line();
+            if ui.button("Reset") {
+                *draft = crate::app_state::RoleDraft::from(role);
+            }
+        });
+        if can_edit && !everyone && !role.managed {
+            ui.same_line();
+            let danger_token = ui.push_style_color(imgui::StyleColor::Button, danger);
+            if ui.button("Delete Role") {
+                ui.open_popup("Delete role##confirm_role_delete");
+            }
+            danger_token.pop();
+        }
+        if let Some(_modal) = ui.modal_popup_config("Delete role##confirm_role_delete").always_auto_resize(true).begin_popup() {
+            ui.text(format!("Delete the {} role?", role.name));
+            ui.text_colored(muted, "Members with this role will lose it. This can't be undone.");
+            ui.dummy([0.0, 6.0]);
+            if ui.button("Cancel") {
+                ui.close_current_popup();
+            }
+            ui.same_line();
+            let _danger = ui.push_style_color(imgui::StyleColor::Button, danger);
+            if ui.button("Delete") {
+                let _ = cmd_tx.send(UiCommand::DeleteRole { guild_id: guild.id.clone(), role_id: role.id.clone() });
+                ui.close_current_popup();
+            }
+        }
+    });
 }
 
 fn draw_server_members(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) {
@@ -7823,6 +7924,7 @@ fn draw_server_bans(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCo
 }
 
 fn draw_server_delete(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) -> bool {
+    let danger = state.theme.mention_badge();
     let Some(settings) = state.server_settings.as_mut() else { return false };
     ui.text_wrapped(format!("Deleting {} is permanent. All channels and messages will be lost.", guild.name));
     ui.spacing();
@@ -7830,7 +7932,7 @@ fn draw_server_delete(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<Ui
     ui.set_next_item_width(ui.content_region_avail()[0].min(480.0));
     ui.input_text("##delete_confirm", &mut settings.delete_confirm).build();
     let confirmed = settings.delete_confirm.trim() == guild.name;
-    let _red = ui.push_style_color(imgui::StyleColor::Button, RECORDING_RED);
+    let _danger = ui.push_style_color(imgui::StyleColor::Button, danger);
     let mut deleted = false;
     ui.disabled(!confirmed, || {
         if ui.button("Delete Server") {
