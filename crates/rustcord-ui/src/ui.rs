@@ -3554,6 +3554,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
     draw_settings_dialog(ui, state, cmd_tx, textures);
     draw_server_settings_dialog(ui, state, cmd_tx, textures);
+    draw_member_action_dialog(ui, state, cmd_tx);
     #[cfg(feature = "screenshare")]
     draw_screen_share_setup_dialog(ui, state, cmd_tx);
     draw_profile_popout(ui, state, cmd_tx, textures);
@@ -7005,13 +7006,67 @@ fn draw_member_row(
         if can_kick || can_ban {
             ui.separator();
         }
+        let name = member
+            .as_ref()
+            .and_then(|m| m.nick.clone())
+            .or_else(|| state.known_users.get(&member_id).map(|u| u.display_name().to_string()))
+            .unwrap_or_else(|| member_id.clone());
         if can_kick && ui.selectable("Kick") {
-            let _ = cmd_tx.send(UiCommand::KickMember { guild_id: guild_id.clone(), user_id: member_id.clone() });
+            state.member_action = Some(crate::app_state::MemberAction::new(guild_id.clone(), member_id.clone(), name.clone(), false));
         }
         if can_ban && ui.selectable("Ban") {
-            let _ = cmd_tx.send(UiCommand::BanMember { guild_id, user_id: member_id });
+            state.member_action = Some(crate::app_state::MemberAction::new(guild_id, member_id, name, true));
         }
     });
+}
+
+fn draw_member_action_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    const POPUP: &str = "Confirm##member_action";
+    let Some(action) = state.member_action.as_mut() else { return };
+    let Some(_modal) = ui.modal_popup_config(POPUP).always_auto_resize(true).begin_popup() else {
+        ui.open_popup(POPUP);
+        return;
+    };
+    let mut close = false;
+    ui.text(format!("{} {}?", if action.ban { "Ban" } else { "Kick" }, action.name));
+    ui.text_colored(
+        state.theme.text_muted,
+        if action.ban { "They won't be able to rejoin unless they're unbanned." } else { "They can rejoin with a new invite." },
+    );
+    ui.dummy([0.0, 6.0]);
+    if action.ban {
+        let current = crate::app_state::BAN_DELETE_CHOICES.iter().find(|(_, secs)| *secs == action.delete_message_seconds).map_or("", |(label, _)| *label);
+        ui.set_next_item_width(320.0);
+        if let Some(_combo) = ui.begin_combo("Delete message history", current) {
+            for (label, secs) in crate::app_state::BAN_DELETE_CHOICES {
+                if ui.selectable_config(label).selected(action.delete_message_seconds == *secs).build() {
+                    action.delete_message_seconds = *secs;
+                }
+            }
+        }
+    }
+    ui.set_next_item_width(320.0);
+    ui.input_text("Reason", &mut action.reason).hint("Shown in the audit log").build();
+    ui.dummy([0.0, 6.0]);
+    if ui.button("Cancel") || ui.is_key_pressed(imgui::Key::Escape) {
+        close = true;
+    }
+    ui.same_line();
+    let _danger = ui.push_style_color(imgui::StyleColor::Button, state.theme.mention_badge());
+    if ui.button(if action.ban { "Ban" } else { "Kick" }) {
+        let reason = Some(action.reason.trim().to_string()).filter(|r| !r.is_empty());
+        let (guild_id, user_id) = (action.guild_id.clone(), action.user_id.clone());
+        let _ = cmd_tx.send(if action.ban {
+            UiCommand::BanMember { guild_id, user_id, reason, delete_message_seconds: action.delete_message_seconds }
+        } else {
+            UiCommand::KickMember { guild_id, user_id, reason }
+        });
+        close = true;
+    }
+    if close {
+        ui.close_current_popup();
+        state.member_action = None;
+    }
 }
 
 fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
@@ -7312,9 +7367,13 @@ fn draw_profile_panel(
     }
 }
 
-fn snowflake_date(id: &str) -> String {
+fn snowflake_time(id: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let ms = (id.parse::<u64>().unwrap_or(0) >> 22) as i64 + 1_420_070_400_000;
-    chrono::DateTime::from_timestamp_millis(ms).map(|d| d.format("%b %d, %Y").to_string()).unwrap_or_default()
+    chrono::DateTime::from_timestamp_millis(ms)
+}
+
+fn snowflake_date(id: &str) -> String {
+    snowflake_time(id).map(|d| d.format("%b %d, %Y").to_string()).unwrap_or_default()
 }
 
 fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
@@ -7583,12 +7642,26 @@ fn select_server_settings_category(state: &mut AppState, cmd_tx: &UnboundedSende
             settings.bans = None;
             let _ = cmd_tx.send(UiCommand::LoadGuildBans { guild_id });
         }
-        ServerSettingsCategory::Members => {
+        ServerSettingsCategory::Members | ServerSettingsCategory::Roles => {
             if state.guild_members_requested.insert(guild_id.clone()) {
                 let _ = cmd_tx.send(UiCommand::RequestGuildMembers { guild_id });
             }
         }
-        ServerSettingsCategory::Profile | ServerSettingsCategory::Roles | ServerSettingsCategory::Delete => {}
+        ServerSettingsCategory::Emoji => {
+            if !state.guild_emojis.contains_key(&guild_id) {
+                let _ = cmd_tx.send(UiCommand::LoadAllGuildEmojis { guild_ids: vec![guild_id] });
+            }
+        }
+        ServerSettingsCategory::Stickers => {
+            if !state.guild_stickers.contains_key(&guild_id) && state.guild_stickers_requested.insert(guild_id.clone()) {
+                let _ = cmd_tx.send(UiCommand::LoadGuildStickers { guild_ids: vec![guild_id] });
+            }
+        }
+        ServerSettingsCategory::AuditLog => {
+            settings.audit_log = None;
+            let _ = cmd_tx.send(UiCommand::LoadAuditLog { guild_id, before: None });
+        }
+        ServerSettingsCategory::Profile | ServerSettingsCategory::Delete => {}
     }
 }
 
@@ -7652,14 +7725,13 @@ fn draw_server_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unbounded
                 match category {
                     ServerSettingsCategory::Profile => draw_server_profile(ui, state, cmd_tx, textures, &guild),
                     ServerSettingsCategory::Roles => draw_server_roles(ui, state, cmd_tx, &guild),
-                    ServerSettingsCategory::Members => draw_server_members(ui, state, cmd_tx, &guild),
+                    ServerSettingsCategory::Emoji => draw_server_emoji(ui, state, cmd_tx, textures, &guild),
+                    ServerSettingsCategory::Stickers => draw_server_stickers(ui, state, cmd_tx, textures, &guild),
+                    ServerSettingsCategory::AuditLog => draw_server_audit_log(ui, state, cmd_tx, &guild),
+                    ServerSettingsCategory::Members => draw_server_members(ui, state, &guild),
                     ServerSettingsCategory::Invites => draw_server_invites(ui, state, cmd_tx),
                     ServerSettingsCategory::Bans => draw_server_bans(ui, state, cmd_tx, &guild),
-                    ServerSettingsCategory::Delete => {
-                        if draw_server_delete(ui, state, cmd_tx, &guild) {
-                            close = true;
-                        }
-                    }
+                    ServerSettingsCategory::Delete => draw_server_delete(ui, state, cmd_tx, &guild),
                 }
             });
         });
@@ -7707,6 +7779,7 @@ fn draw_server_roles(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiC
     let editable: std::collections::HashSet<String> = roles.iter().filter(|r| state.can_edit_role(&guild.id, r)).map(|r| r.id.clone()).collect();
     let muted = state.theme.text_muted;
     let danger = state.theme.mention_badge();
+    let members = state.guild_members.get(&guild.id).map(Vec::as_slice);
     let Some(settings) = state.server_settings.as_mut() else { return };
 
     ui.child_window("role_list").size([220.0, 0.0]).build(|| {
@@ -7734,33 +7807,64 @@ fn draw_server_roles(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiC
             ui.text_colored(muted, "This role is above your highest role, so you can't edit it.");
             ui.spacing();
         }
-        ui.disabled(!can_edit, || {
-            ui.disabled(everyone, || {
-                ui.text("Role name");
-                ui.set_next_item_width(ui.content_region_avail()[0].min(480.0));
-                ui.input_text("##role_name", &mut draft.name).build();
-            });
-            let mut rgb = [16, 8, 0].map(|shift| ((draft.color >> shift) & 255) as f32 / 255.0);
-            if ui.color_edit3("Role color", &mut rgb) {
-                draft.color = rgb.iter().fold(0, |acc, v| (acc << 8) | (v.clamp(0.0, 1.0) * 255.0).round() as u32);
+        if !everyone {
+            let order: Vec<&str> = roles.iter().filter(|r| r.id != guild.id).map(|r| r.id.as_str()).collect();
+            let index = order.iter().position(|id| *id == role.id).unwrap_or(0);
+            let can_swap = |other: Option<&&str>| can_edit && other.is_some_and(|id| editable.contains(*id));
+            for (label, target) in [("Move Up", index.checked_sub(1)), ("Move Down", Some(index + 1))] {
+                ui.disabled(!can_swap(target.and_then(|t| order.get(t))), || {
+                    if ui.small_button(label) {
+                        let mut role_ids: Vec<String> = order.iter().map(|id| id.to_string()).collect();
+                        if let Some(target) = target {
+                            role_ids.swap(index, target);
+                        }
+                        let _ = cmd_tx.send(UiCommand::ReorderRoles { guild_id: guild.id.clone(), role_ids });
+                    }
+                });
+                ui.same_line();
             }
-            ui.same_line();
-            if ui.small_button("Default") {
-                draft.color = 0;
+            ui.new_line();
+            ui.spacing();
+        }
+        if let Some(_tabs) = ui.tab_bar("role_tabs") {
+            if let Some(_tab) = ui.tab_item("Display") {
+                ui.disabled(!can_edit, || {
+                    ui.disabled(everyone, || {
+                        ui.text("Role name");
+                        ui.set_next_item_width(ui.content_region_avail()[0].min(480.0));
+                        ui.input_text("##role_name", &mut draft.name).build();
+                    });
+                    let mut rgb = [16, 8, 0].map(|shift| ((draft.color >> shift) & 255) as f32 / 255.0);
+                    if ui.color_edit3("Role color", &mut rgb) {
+                        draft.color = rgb.iter().fold(0, |acc, v| (acc << 8) | (v.clamp(0.0, 1.0) * 255.0).round() as u32);
+                    }
+                    ui.same_line();
+                    if ui.small_button("Default") {
+                        draft.color = 0;
+                    }
+                    if !everyone {
+                        ui.checkbox("Display role members separately from online members", &mut draft.hoist);
+                        ui.checkbox("Allow anyone to @mention this role", &mut draft.mentionable);
+                    }
+                });
+            }
+            if let Some(_tab) = ui.tab_item("Permissions") {
+                ui.disabled(!can_edit, || {
+                    for (group, permissions) in rustcord_client::permissions::PERMISSION_GROUPS {
+                        ui.spacing();
+                        ui.text_colored(muted, group.to_uppercase());
+                        for (bit, name) in *permissions {
+                            ui.checkbox_flags(name, &mut draft.permissions, *bit);
+                        }
+                    }
+                });
             }
             if !everyone {
-                ui.checkbox("Display role members separately from online members", &mut draft.hoist);
-                ui.checkbox("Allow anyone to @mention this role", &mut draft.mentionable);
-            }
-            for (group, permissions) in rustcord_client::permissions::PERMISSION_GROUPS {
-                ui.spacing();
-                ui.separator();
-                ui.text_colored(muted, group.to_uppercase());
-                for (bit, name) in *permissions {
-                    ui.checkbox_flags(name, &mut draft.permissions, *bit);
+                if let Some(_tab) = ui.tab_item("Members") {
+                    draw_role_members(ui, cmd_tx, &guild.id, role, members, &mut settings.role_member_filter, can_edit);
                 }
             }
-        });
+        }
         ui.spacing();
         ui.separator();
         ui.spacing();
@@ -7801,7 +7905,280 @@ fn draw_server_roles(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiC
     });
 }
 
-fn draw_server_members(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) {
+fn draw_role_members(
+    ui: &Ui,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    guild_id: &str,
+    role: &rustcord_client::models::Role,
+    members: Option<&[rustcord_client::models::GuildMember]>,
+    filter: &mut String,
+    can_edit: bool,
+) {
+    let Some(members) = members else {
+        return ui.text_disabled("Loading members...");
+    };
+    let set_role = |user_id: &str, add: bool| {
+        let _ = cmd_tx.send(UiCommand::SetMemberRole { guild_id: guild_id.to_string(), user_id: user_id.to_string(), role_id: role.id.clone(), add });
+    };
+    let name = |m: &rustcord_client::models::GuildMember| m.nick.clone().unwrap_or_else(|| m.user.display_name().to_string());
+    if can_edit {
+        if ui.button("Add Members") {
+            filter.clear();
+            ui.open_popup("add_role_members");
+        }
+        ui.popup("add_role_members", || {
+            ui.set_next_item_width(240.0);
+            ui.input_text("##add_role_member_filter", filter).hint("Search members").build();
+            let needle = filter.trim().to_lowercase();
+            ui.child_window("add_role_member_list").size([240.0, 240.0]).build(|| {
+                for member in members.iter().filter(|m| !m.roles.contains(&role.id)) {
+                    let label = name(member);
+                    if !needle.is_empty() && !label.to_lowercase().contains(&needle) && !member.user.username.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    if ui.selectable(format!("{label}##add_{}", member.user.id)) {
+                        set_role(&member.user.id, true);
+                    }
+                }
+            });
+        });
+        ui.spacing();
+    }
+    let with_role: Vec<_> = members.iter().filter(|m| m.roles.contains(&role.id)).collect();
+    if with_role.is_empty() {
+        return ui.text_disabled("No members have this role.");
+    }
+    for member in with_role {
+        ui.text(name(member));
+        if can_edit {
+            ui.same_line();
+            if ui.small_button(format!("Remove##remove_{}", member.user.id)) {
+                set_role(&member.user.id, false);
+            }
+        }
+    }
+}
+
+fn draw_server_emoji(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, guild: &rustcord_client::models::Guild) {
+    let emojis = state.guild_emojis.get(&guild.id).cloned().unwrap_or_default();
+    let muted = state.theme.text_muted;
+    let Some(settings) = state.server_settings.as_mut() else { return };
+    ui.text_colored(muted, "PNG, JPG, WebP or GIF. Images are resized to fit 128x128; GIFs must be 256 KB or smaller.");
+    if ui.button("Upload Emoji") {
+        for path in rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]).pick_files().unwrap_or_default() {
+            let _ = cmd_tx.send(UiCommand::UploadEmoji { guild_id: guild.id.clone(), path });
+        }
+    }
+    ui.spacing();
+    if emojis.is_empty() {
+        return ui.text_disabled("This server has no custom emoji.");
+    }
+    let flags = imgui::TableFlags::ROW_BG | imgui::TableFlags::BORDERS_INNER_H | imgui::TableFlags::SIZING_STRETCH_PROP;
+    let Some(_table) = ui.begin_table_with_flags("emoji_table", 3, flags) else { return };
+    for header in ["Image", "Name", ""] {
+        ui.table_setup_column(header);
+    }
+    ui.table_headers_row();
+    for emoji in &emojis {
+        ui.table_next_row();
+        ui.table_next_column();
+        let url = rustcord_client::cdn::custom_emoji_url(emoji, 64);
+        match textures.get(&url) {
+            Some((texture_id, _)) => imgui::Image::new(texture_id, [32.0, 32.0]).build(ui),
+            None => {
+                textures.request(&url, cmd_tx);
+                ui.dummy([32.0, 32.0]);
+            }
+        }
+        ui.table_next_column();
+        let renaming = settings.emoji_rename.as_mut().filter(|(id, _)| *id == emoji.id);
+        let mut submit = None;
+        match renaming {
+            Some((_, name)) => {
+                ui.set_next_item_width(200.0);
+                if ui.input_text(format!("##rename_{}", emoji.id), name).enter_returns_true(true).build() {
+                    submit = Some(name.trim().to_string());
+                }
+                ui.table_next_column();
+                if ui.small_button(format!("Save##save_{}", emoji.id)) {
+                    submit = Some(name.trim().to_string());
+                }
+                ui.same_line();
+                if ui.small_button(format!("Cancel##cancel_{}", emoji.id)) {
+                    settings.emoji_rename = None;
+                }
+            }
+            None => {
+                ui.text(format!(":{}:", emoji.name));
+                ui.table_next_column();
+                if ui.small_button(format!("Rename##rename_{}", emoji.id)) {
+                    settings.emoji_rename = Some((emoji.id.clone(), emoji.name.clone()));
+                }
+                ui.same_line();
+                if ui.small_button(format!("Delete##delete_{}", emoji.id)) {
+                    let _ = cmd_tx.send(UiCommand::DeleteEmoji { guild_id: guild.id.clone(), emoji_id: emoji.id.clone() });
+                }
+            }
+        }
+        if let Some(name) = submit.filter(|n| n.len() >= 2) {
+            let _ = cmd_tx.send(UiCommand::RenameEmoji { guild_id: guild.id.clone(), emoji_id: emoji.id.clone(), name });
+        }
+    }
+}
+
+fn draw_server_stickers(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, guild: &rustcord_client::models::Guild) {
+    let stickers = state.guild_stickers.get(&guild.id).cloned();
+    let muted = state.theme.text_muted;
+    let Some(settings) = state.server_settings.as_mut() else { return };
+    ui.text_colored(muted, "PNG, JPG, WebP or GIF. Images are resized to fit 320x320; GIFs must be 512 KB or smaller.");
+    if ui.button("Upload Sticker") {
+        if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]).pick_file() {
+            let name = path.file_stem().map(|s| s.to_string_lossy().chars().take(30).collect()).unwrap_or_default();
+            let details = rustcord_client::rest::StickerDetails { name, ..Default::default() };
+            settings.sticker_form = Some(crate::app_state::StickerForm { target: crate::app_state::StickerTarget::Upload(path), details });
+        }
+    }
+    if let Some(form) = settings.sticker_form.as_mut() {
+        ui.spacing();
+        ui.separator();
+        match &form.target {
+            crate::app_state::StickerTarget::Upload(path) => {
+                ui.text("New sticker");
+                ui.text_colored(muted, path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default());
+            }
+            crate::app_state::StickerTarget::Edit(_) => ui.text("Edit sticker"),
+        }
+        let details = &mut form.details;
+        ui.set_next_item_width(320.0);
+        ui.input_text("Name", &mut details.name).build();
+        ui.set_next_item_width(320.0);
+        ui.input_text("Related emoji", &mut details.tags).hint("e.g. smile").build();
+        ui.set_next_item_width(320.0);
+        ui.input_text("Description", &mut details.description).build();
+        let name_len = details.name.trim().chars().count();
+        let valid = (2..=30).contains(&name_len) && !details.tags.trim().is_empty();
+        ui.disabled(!valid, || {
+            if ui.button("Save Sticker") {
+                let details = rustcord_client::rest::StickerDetails {
+                    name: details.name.trim().to_string(),
+                    description: details.description.trim().to_string(),
+                    tags: details.tags.trim().to_string(),
+                };
+                let guild_id = guild.id.clone();
+                let _ = cmd_tx.send(match &form.target {
+                    crate::app_state::StickerTarget::Upload(path) => UiCommand::UploadSticker { guild_id, path: path.clone(), details },
+                    crate::app_state::StickerTarget::Edit(sticker_id) => UiCommand::EditSticker { guild_id, sticker_id: sticker_id.clone(), details },
+                });
+            }
+        });
+        ui.same_line();
+        if ui.button("Cancel") {
+            settings.sticker_form = None;
+        }
+        ui.separator();
+    }
+    ui.spacing();
+    let Some(stickers) = stickers else {
+        return ui.text_disabled("Loading...");
+    };
+    if stickers.is_empty() {
+        return ui.text_disabled("This server has no stickers.");
+    }
+    let flags = imgui::TableFlags::ROW_BG | imgui::TableFlags::BORDERS_INNER_H | imgui::TableFlags::SIZING_STRETCH_PROP;
+    let Some(_table) = ui.begin_table_with_flags("sticker_table", 4, flags) else { return };
+    for header in ["Image", "Name", "Related emoji", ""] {
+        ui.table_setup_column(header);
+    }
+    ui.table_headers_row();
+    for sticker in &stickers {
+        ui.table_next_row();
+        ui.table_next_column();
+        match rustcord_client::cdn::sticker_url(&sticker.id, sticker.format_type, 160) {
+            Some(url) => match textures.get(&url) {
+                Some((texture_id, _)) => imgui::Image::new(texture_id, [64.0, 64.0]).build(ui),
+                None => {
+                    textures.request(&url, cmd_tx);
+                    ui.dummy([64.0, 64.0]);
+                }
+            },
+            None => ui.text_disabled("Lottie"),
+        }
+        ui.table_next_column();
+        ui.text(&sticker.name);
+        if let Some(description) = sticker.description.as_deref().filter(|d| !d.is_empty()) {
+            ui.text_colored(muted, description);
+        }
+        ui.table_next_column();
+        ui.text(sticker.tags.as_deref().unwrap_or(""));
+        ui.table_next_column();
+        if ui.small_button(format!("Edit##edit_{}", sticker.id)) {
+            let details = rustcord_client::rest::StickerDetails {
+                name: sticker.name.clone(),
+                description: sticker.description.clone().unwrap_or_default(),
+                tags: sticker.tags.clone().unwrap_or_default(),
+            };
+            settings.sticker_form = Some(crate::app_state::StickerForm { target: crate::app_state::StickerTarget::Edit(sticker.id.clone()), details });
+        }
+        ui.same_line();
+        if ui.small_button(format!("Delete##delete_{}", sticker.id)) {
+            let _ = cmd_tx.send(UiCommand::DeleteSticker { guild_id: guild.id.clone(), sticker_id: sticker.id.clone() });
+        }
+    }
+}
+
+fn draw_server_audit_log(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) {
+    let channel_names = state.channel_name_map();
+    let role_names: HashMap<&str, &str> = state.guild_roles.get(&guild.id).into_iter().flatten().map(|r| (r.id.as_str(), r.name.as_str())).collect();
+    let muted = state.theme.text_muted;
+    let Some(settings) = state.server_settings.as_ref() else { return };
+    let entries = match &settings.audit_log {
+        None => return ui.text_disabled("Loading..."),
+        Some(Err(e)) => return ui.text_colored(muted, format!("Couldn't load the audit log: {e}")),
+        Some(Ok(entries)) if entries.is_empty() => return ui.text_disabled("Nothing has happened in this server yet."),
+        Some(Ok(entries)) => entries,
+    };
+    let users = &settings.audit_log_users;
+    let user_name = |id: &str| users.get(id).map(|u| u.display_name().to_string());
+    let flags = imgui::TableFlags::ROW_BG | imgui::TableFlags::BORDERS_INNER_H | imgui::TableFlags::SIZING_STRETCH_PROP;
+    if let Some(_table) = ui.begin_table_with_flags("audit_log_table", 5, flags) {
+        for header in ["When", "Who", "Action", "Target", "Reason"] {
+            ui.table_setup_column(header);
+        }
+        ui.table_headers_row();
+        for entry in entries {
+            ui.table_next_row();
+            ui.table_next_column();
+            ui.text(snowflake_time(&entry.id).map(|t| t.with_timezone(&chrono::Local).format("%b %-d, %H:%M").to_string()).unwrap_or_default());
+            ui.table_next_column();
+            ui.text(entry.user_id.as_deref().and_then(user_name).unwrap_or_default());
+            ui.table_next_column();
+            ui.text(entry.action_label());
+            if !entry.changes.is_empty() {
+                let keys: Vec<&str> = entry.changes.iter().map(|c| c.key.as_str()).collect();
+                ui.text_colored(muted, keys.join(", "));
+            }
+            ui.table_next_column();
+            let target = entry.target_id.as_deref().map(|id| {
+                user_name(id)
+                    .or_else(|| role_names.get(id).map(|n| format!("@{n}")))
+                    .or_else(|| channel_names.get(id).map(|n| format!("#{n}")))
+                    .unwrap_or_else(|| id.to_string())
+            });
+            ui.text(target.unwrap_or_default());
+            ui.table_next_column();
+            ui.text_wrapped(entry.reason.as_deref().unwrap_or(""));
+        }
+    }
+    if !settings.audit_log_complete {
+        ui.spacing();
+        if ui.button("Load More") {
+            let before = entries.last().map(|e| e.id.clone());
+            let _ = cmd_tx.send(UiCommand::LoadAuditLog { guild_id: guild.id.clone(), before });
+        }
+    }
+}
+
+fn draw_server_members(ui: &Ui, state: &mut AppState, guild: &rustcord_client::models::Guild) {
     use rustcord_client::permissions::{BAN_MEMBERS, KICK_MEMBERS};
     let can_kick = state.has_guild_permission(&guild.id, KICK_MEMBERS);
     let can_ban = state.has_guild_permission(&guild.id, BAN_MEMBERS);
@@ -7813,15 +8190,34 @@ fn draw_server_members(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
     let Some(members) = state.guild_members.get(&guild.id) else {
         return ui.text_disabled("Loading members...");
     };
+    let mut action = None;
     let flags = imgui::TableFlags::ROW_BG | imgui::TableFlags::BORDERS_INNER_H | imgui::TableFlags::SIZING_STRETCH_PROP;
-    let Some(_table) = ui.begin_table_with_flags("server_members_table", 4, flags) else { return };
+    if let Some(_table) = ui.begin_table_with_flags("server_members_table", 4, flags) {
+        draw_server_member_rows(ui, members, &filter, guild, my_id.as_deref(), can_kick, can_ban, &mut action);
+    }
+    if action.is_some() {
+        state.member_action = action;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_server_member_rows(
+    ui: &Ui,
+    members: &[rustcord_client::models::GuildMember],
+    filter: &str,
+    guild: &rustcord_client::models::Guild,
+    my_id: Option<&str>,
+    can_kick: bool,
+    can_ban: bool,
+    action: &mut Option<crate::app_state::MemberAction>,
+) {
     for header in ["Name", "Username", "Joined", ""] {
         ui.table_setup_column(header);
     }
     ui.table_headers_row();
     for member in members {
         let name = member.nick.as_deref().unwrap_or(member.user.display_name());
-        if !filter.is_empty() && !name.to_lowercase().contains(&filter) && !member.user.username.to_lowercase().contains(&filter) {
+        if !filter.is_empty() && !name.to_lowercase().contains(filter) && !member.user.username.to_lowercase().contains(filter) {
             continue;
         }
         ui.table_next_row();
@@ -7833,17 +8229,17 @@ fn draw_server_members(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
         let joined = chrono::DateTime::parse_from_rfc3339(&member.joined_at).map_or_else(|_| String::new(), |t| t.with_timezone(&chrono::Local).format("%b %-d, %Y").to_string());
         ui.text(joined);
         ui.table_next_column();
-        if my_id.as_deref() == Some(member.user.id.as_str()) || guild.owner_id.as_deref() == Some(member.user.id.as_str()) {
+        if my_id == Some(member.user.id.as_str()) || guild.owner_id.as_deref() == Some(member.user.id.as_str()) {
             continue;
         }
         if can_kick && ui.small_button(format!("Kick##kick_{}", member.user.id)) {
-            let _ = cmd_tx.send(UiCommand::KickMember { guild_id: guild.id.clone(), user_id: member.user.id.clone() });
+            *action = Some(crate::app_state::MemberAction::new(guild.id.clone(), member.user.id.clone(), name.to_string(), false));
         }
         if can_kick && can_ban {
             ui.same_line();
         }
         if can_ban && ui.small_button(format!("Ban##ban_{}", member.user.id)) {
-            let _ = cmd_tx.send(UiCommand::BanMember { guild_id: guild.id.clone(), user_id: member.user.id.clone() });
+            *action = Some(crate::app_state::MemberAction::new(guild.id.clone(), member.user.id.clone(), name.to_string(), true));
         }
     }
 }
@@ -7923,24 +8319,32 @@ fn draw_server_bans(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCo
     }
 }
 
-fn draw_server_delete(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) -> bool {
+fn draw_server_delete(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild) {
     let danger = state.theme.mention_badge();
-    let Some(settings) = state.server_settings.as_mut() else { return false };
+    let muted = state.theme.text_muted;
+    let Some(settings) = state.server_settings.as_mut() else { return };
     ui.text_wrapped(format!("Deleting {} is permanent. All channels and messages will be lost.", guild.name));
     ui.spacing();
     ui.text("Type the server name to confirm");
     ui.set_next_item_width(ui.content_region_avail()[0].min(480.0));
     ui.input_text("##delete_confirm", &mut settings.delete_confirm).build();
-    let confirmed = settings.delete_confirm.trim() == guild.name;
+    let mut ready = settings.delete_confirm.trim() == guild.name;
+    if settings.delete_mfa_ticket.is_some() {
+        ui.spacing();
+        ui.text("Two-factor authentication code");
+        ui.text_colored(muted, "Enter the 6-digit code from your authenticator app, or a backup code.");
+        ui.set_next_item_width(200.0);
+        ui.input_text("##delete_mfa_code", &mut settings.mfa_code).build();
+        ready &= !settings.mfa_code.trim().is_empty();
+    }
+    ui.spacing();
     let _danger = ui.push_style_color(imgui::StyleColor::Button, danger);
-    let mut deleted = false;
-    ui.disabled(!confirmed, || {
+    ui.disabled(!ready, || {
         if ui.button("Delete Server") {
-            let _ = cmd_tx.send(UiCommand::DeleteGuild { guild_id: guild.id.clone() });
-            deleted = true;
+            let mfa = settings.delete_mfa_ticket.take().map(|ticket| crate::backend::MfaAnswer { ticket, code: std::mem::take(&mut settings.mfa_code) });
+            let _ = cmd_tx.send(UiCommand::DeleteGuild { guild_id: guild.id.clone(), mfa });
         }
     });
-    deleted
 }
 
 fn draw_settings_account(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) -> bool {

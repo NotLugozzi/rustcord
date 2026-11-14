@@ -549,6 +549,61 @@ pub fn drain_backend_events(
             BackendEvent::RoleDeleted { guild_id, role_id } => {
                 state.remove_role(&guild_id, &role_id);
             }
+            BackendEvent::GuildDeleteMfaRequired { guild_id, ticket } => {
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    settings.delete_mfa_ticket = Some(ticket);
+                    settings.mfa_code.clear();
+                }
+            }
+            BackendEvent::EmojiSaved { guild_id, emoji } => {
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    if settings.emoji_rename.as_ref().is_some_and(|(id, _)| *id == emoji.id) {
+                        settings.emoji_rename = None;
+                    }
+                }
+                let emojis = state.guild_emojis.entry(guild_id).or_default();
+                match emojis.iter_mut().find(|e| e.id == emoji.id) {
+                    Some(existing) => *existing = emoji,
+                    None => emojis.push(emoji),
+                }
+            }
+            BackendEvent::EmojiDeleted { guild_id, emoji_id } => {
+                if let Some(emojis) = state.guild_emojis.get_mut(&guild_id) {
+                    emojis.retain(|e| e.id != emoji_id);
+                }
+            }
+            BackendEvent::StickerSaved { guild_id, sticker } => {
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    settings.sticker_form = None;
+                }
+                let stickers = state.guild_stickers.entry(guild_id).or_default();
+                match stickers.iter_mut().find(|s| s.id == sticker.id) {
+                    Some(existing) => *existing = sticker,
+                    None => stickers.push(sticker),
+                }
+            }
+            BackendEvent::StickerDeleted { guild_id, sticker_id } => {
+                if let Some(stickers) = state.guild_stickers.get_mut(&guild_id) {
+                    stickers.retain(|s| s.id != sticker_id);
+                }
+            }
+            BackendEvent::AuditLogLoaded { guild_id, before, result } => {
+                if let Some(settings) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+                    match (result, settings.audit_log.as_mut()) {
+                        (Ok(page), Some(Ok(entries))) if before.is_some() => {
+                            settings.audit_log_complete = page.audit_log_entries.len() < rustcord_client::rest::AUDIT_LOG_PAGE;
+                            entries.extend(page.audit_log_entries);
+                            settings.audit_log_users.extend(page.users.into_iter().map(|u| (u.id.clone(), u)));
+                        }
+                        (Ok(page), _) => {
+                            settings.audit_log_complete = page.audit_log_entries.len() < rustcord_client::rest::AUDIT_LOG_PAGE;
+                            settings.audit_log = Some(Ok(page.audit_log_entries));
+                            settings.audit_log_users = page.users.into_iter().map(|u| (u.id.clone(), u)).collect();
+                        }
+                        (Err(e), _) => settings.audit_log = Some(Err(e)),
+                    }
+                }
+            }
             BackendEvent::MemberUnbanned { guild_id, user_id } => {
                 if let Some(Some(Ok(bans))) = state.server_settings.as_mut().filter(|s| s.guild_id == guild_id).map(|s| s.bans.as_mut()) {
                     bans.retain(|b| b.user.id != user_id);

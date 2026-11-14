@@ -264,23 +264,30 @@ impl ChannelEditor {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum ServerSettingsCategory {
+    #[default]
     Profile,
     Roles,
+    Emoji,
+    Stickers,
     Members,
     Invites,
     Bans,
+    AuditLog,
     Delete,
 }
 
 impl ServerSettingsCategory {
-    pub const ALL: [ServerSettingsCategory; 6] = [
+    pub const ALL: [ServerSettingsCategory; 9] = [
         ServerSettingsCategory::Profile,
         ServerSettingsCategory::Roles,
+        ServerSettingsCategory::Emoji,
+        ServerSettingsCategory::Stickers,
         ServerSettingsCategory::Members,
         ServerSettingsCategory::Invites,
         ServerSettingsCategory::Bans,
+        ServerSettingsCategory::AuditLog,
         ServerSettingsCategory::Delete,
     ];
 
@@ -288,30 +295,77 @@ impl ServerSettingsCategory {
         match self {
             ServerSettingsCategory::Profile => "Server Profile",
             ServerSettingsCategory::Roles => "Roles",
+            ServerSettingsCategory::Emoji => "Emoji",
+            ServerSettingsCategory::Stickers => "Stickers",
             ServerSettingsCategory::Members => "Members",
             ServerSettingsCategory::Invites => "Invites",
             ServerSettingsCategory::Bans => "Bans",
+            ServerSettingsCategory::AuditLog => "Audit Log",
             ServerSettingsCategory::Delete => "Delete Server",
         }
     }
 }
 
+#[derive(Default)]
 pub struct ServerSettings {
     pub guild_id: String,
     pub category: ServerSettingsCategory,
     pub name: String,
     pub member_filter: String,
     pub delete_confirm: String,
+    pub delete_mfa_ticket: Option<String>,
+    pub mfa_code: String,
     pub invites: Option<Result<Vec<rustcord_client::models::Invite>, String>>,
     pub bans: Option<Result<Vec<rustcord_client::models::Ban>, String>>,
     pub role_draft: Option<RoleDraft>,
+    pub role_member_filter: String,
+    pub emoji_rename: Option<(String, String)>,
+    pub sticker_form: Option<StickerForm>,
+    pub audit_log: Option<Result<Vec<rustcord_client::models::AuditLogEntry>, String>>,
+    pub audit_log_users: HashMap<String, User>,
+    pub audit_log_complete: bool,
 }
 
 impl ServerSettings {
     pub fn new(guild_id: String, name: String, category: ServerSettingsCategory) -> Self {
-        Self { guild_id, category, name, member_filter: String::new(), delete_confirm: String::new(), invites: None, bans: None, role_draft: None }
+        Self { guild_id, name, category, ..Default::default() }
     }
 }
+
+pub enum StickerTarget {
+    Upload(std::path::PathBuf),
+    Edit(String),
+}
+
+pub struct StickerForm {
+    pub target: StickerTarget,
+    pub details: rustcord_client::rest::StickerDetails,
+}
+
+pub struct MemberAction {
+    pub guild_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub ban: bool,
+    pub reason: String,
+    pub delete_message_seconds: u32,
+}
+
+impl MemberAction {
+    pub fn new(guild_id: String, user_id: String, name: String, ban: bool) -> Self {
+        Self { guild_id, user_id, name, ban, reason: String::new(), delete_message_seconds: 0 }
+    }
+}
+
+pub const BAN_DELETE_CHOICES: &[(&str, u32)] = &[
+    ("Don't delete any", 0),
+    ("Previous hour", 60 * 60),
+    ("Previous 6 hours", 6 * 60 * 60),
+    ("Previous 12 hours", 12 * 60 * 60),
+    ("Previous 24 hours", 24 * 60 * 60),
+    ("Previous 3 days", 3 * 24 * 60 * 60),
+    ("Previous 7 days", 7 * 24 * 60 * 60),
+];
 
 #[derive(Clone, PartialEq)]
 pub struct RoleDraft {
@@ -603,6 +657,7 @@ pub struct AppState {
     pub channel_context: Option<String>,
     pub channel_editor: Option<ChannelEditor>,
     pub server_settings: Option<ServerSettings>,
+    pub member_action: Option<MemberAction>,
     pub guild_settings: HashMap<String, rustcord_client::models::GuildSettings>,
     pub guild_context: Option<(String, Option<usize>)>,
     pub keybinds: crate::keybinds::Keybinds,
@@ -2207,10 +2262,14 @@ impl AppState {
     }
 
     pub fn server_settings_allowed(&self, guild_id: &str, category: ServerSettingsCategory) -> bool {
-        use rustcord_client::permissions::{BAN_MEMBERS, KICK_MEMBERS, MANAGE_GUILD, MANAGE_ROLES};
+        use rustcord_client::permissions::{BAN_MEMBERS, CREATE_EXPRESSIONS, KICK_MEMBERS, MANAGE_EXPRESSIONS, MANAGE_GUILD, MANAGE_ROLES, VIEW_AUDIT_LOG};
         match category {
             ServerSettingsCategory::Profile | ServerSettingsCategory::Invites => self.has_guild_permission(guild_id, MANAGE_GUILD),
             ServerSettingsCategory::Roles => self.has_guild_permission(guild_id, MANAGE_ROLES),
+            ServerSettingsCategory::Emoji | ServerSettingsCategory::Stickers => {
+                self.has_guild_permission(guild_id, MANAGE_EXPRESSIONS) || self.has_guild_permission(guild_id, CREATE_EXPRESSIONS)
+            }
+            ServerSettingsCategory::AuditLog => self.has_guild_permission(guild_id, VIEW_AUDIT_LOG),
             ServerSettingsCategory::Members => self.has_guild_permission(guild_id, KICK_MEMBERS) || self.has_guild_permission(guild_id, BAN_MEMBERS),
             ServerSettingsCategory::Bans => self.has_guild_permission(guild_id, BAN_MEMBERS),
             ServerSettingsCategory::Delete => self.is_guild_owner(guild_id),

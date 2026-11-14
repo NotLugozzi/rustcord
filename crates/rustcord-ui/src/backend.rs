@@ -210,13 +210,26 @@ mod credential_serialization_tests {
     static GATEWAY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
-    fn guild_icons_are_cropped_to_a_512_square_png() {
+    fn upload_images_are_cropped_or_fitted_into_png() {
         let path = std::env::temp_dir().join(format!("rustcord-icon-test-{}.png", std::process::id()));
         image::RgbImage::new(1000, 600).save(&path).unwrap();
-        let png = encode_guild_icon(&path);
+        let cropped = encode_upload_image(&path, 512, true, None);
+        let fitted = encode_upload_image(&path, 128, false, Some(256 * 1024));
         let _ = std::fs::remove_file(&path);
-        let icon = image::load_from_memory_with_format(&png.unwrap(), image::ImageFormat::Png).unwrap();
-        assert_eq!((icon.width(), icon.height()), (512, 512));
+        let dimensions = |encoded: Result<(&str, Vec<u8>), String>| {
+            let (mime, bytes) = encoded.unwrap();
+            assert_eq!(mime, "image/png");
+            let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png).unwrap();
+            (image.width(), image.height())
+        };
+        assert_eq!(dimensions(cropped), (512, 512));
+        assert_eq!(dimensions(fitted), (128, 77));
+    }
+
+    #[test]
+    fn emoji_names_come_from_the_file_name() {
+        assert_eq!(emoji_name_from_path(std::path::Path::new("/tmp/party parrot!.gif")), "partyparrot");
+        assert_eq!(emoji_name_from_path(std::path::Path::new("/tmp/✨.png")), "emoji");
     }
 
     #[test]
@@ -355,7 +368,15 @@ pub enum UiCommand {
     RevokeInvite { code: String },
     RenameGuild { guild_id: String, name: String },
     SetGuildIcon { guild_id: String, path: Option<std::path::PathBuf> },
-    DeleteGuild { guild_id: String },
+    DeleteGuild { guild_id: String, mfa: Option<MfaAnswer> },
+    ReorderRoles { guild_id: String, role_ids: Vec<String> },
+    UploadEmoji { guild_id: String, path: std::path::PathBuf },
+    RenameEmoji { guild_id: String, emoji_id: String, name: String },
+    DeleteEmoji { guild_id: String, emoji_id: String },
+    UploadSticker { guild_id: String, path: std::path::PathBuf, details: rustcord_client::rest::StickerDetails },
+    EditSticker { guild_id: String, sticker_id: String, details: rustcord_client::rest::StickerDetails },
+    DeleteSticker { guild_id: String, sticker_id: String },
+    LoadAuditLog { guild_id: String, before: Option<String> },
     LoadGuildBans { guild_id: String },
     UnbanMember { guild_id: String, user_id: String },
     CreateRole { guild_id: String },
@@ -409,8 +430,8 @@ pub enum UiCommand {
     AddDmRecipients { channel_id: String, existing: Vec<String>, group: bool, user_ids: Vec<String> },
     CreateGuild { name: String },
     RequestGuildMembers { guild_id: String },
-    KickMember { guild_id: String, user_id: String },
-    BanMember { guild_id: String, user_id: String },
+    KickMember { guild_id: String, user_id: String, reason: Option<String> },
+    BanMember { guild_id: String, user_id: String, reason: Option<String>, delete_message_seconds: u32 },
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
@@ -437,6 +458,11 @@ pub enum UiCommand {
 }
 
 pub const HISTORY_PAGE_SIZE: u32 = 50;
+
+pub struct MfaAnswer {
+    pub ticket: String,
+    pub code: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelationshipAction {
@@ -478,6 +504,12 @@ pub enum BackendEvent {
     RoleCreated { guild_id: String, role: rustcord_client::models::Role },
     RoleSaved { guild_id: String, role: rustcord_client::models::Role },
     RoleDeleted { guild_id: String, role_id: String },
+    GuildDeleteMfaRequired { guild_id: String, ticket: String },
+    EmojiSaved { guild_id: String, emoji: rustcord_client::models::Emoji },
+    EmojiDeleted { guild_id: String, emoji_id: String },
+    StickerSaved { guild_id: String, sticker: rustcord_client::models::Sticker },
+    StickerDeleted { guild_id: String, sticker_id: String },
+    AuditLogLoaded { guild_id: String, before: Option<String>, result: Result<rustcord_client::models::AuditLog, String> },
     GuildSettingsUpdated(rustcord_client::models::GuildSettings),
     GifsLoaded { query: String, result: Result<Vec<rustcord_client::models::Gif>, String> },
     DmChannelsLoaded(Vec<rustcord_client::models::Channel>),
@@ -1107,18 +1139,18 @@ pub fn spawn(
                         let _ = tx.send(frame);
                     }
                 }
-                UiCommand::KickMember { guild_id, user_id } => {
+                UiCommand::KickMember { guild_id, user_id, reason } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.kick_member(&guild_id, &user_id).await {
+                        if let Err(e) = client.kick_member(&guild_id, &user_id, reason.as_deref()).await {
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to kick member: {e}")));
                         } else {
                             let _ = event_tx.send(BackendEvent::MemberRemoved { guild_id, user_id });
                         }
                     }
                 }
-                UiCommand::BanMember { guild_id, user_id } => {
+                UiCommand::BanMember { guild_id, user_id, reason, delete_message_seconds } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.ban_member(&guild_id, &user_id).await {
+                        if let Err(e) = client.ban_member(&guild_id, &user_id, reason.as_deref(), delete_message_seconds).await {
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to ban member: {e}")));
                         } else {
                             let _ = event_tx.send(BackendEvent::MemberRemoved { guild_id, user_id });
@@ -1207,8 +1239,8 @@ pub fn spawn(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             let icon = match path {
-                                Some(path) => match tokio::task::spawn_blocking(move || encode_guild_icon(&path)).await {
-                                    Ok(Ok(png)) => serde_json::Value::String(rustcord_client::rest::png_data_uri(&png)),
+                                Some(path) => match tokio::task::spawn_blocking(move || encode_upload_image(&path, 512, true, None)).await {
+                                    Ok(Ok((mime, bytes))) => serde_json::Value::String(rustcord_client::rest::data_uri(mime, &bytes)),
                                     Ok(Err(e)) => {
                                         let _ = event_tx.send(BackendEvent::Error(format!("failed to read server icon: {e}")));
                                         return;
@@ -1228,11 +1260,143 @@ pub fn spawn(
                         });
                     }
                 }
-                UiCommand::DeleteGuild { guild_id } => {
+                UiCommand::DeleteGuild { guild_id, mfa } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.delete_guild(&guild_id).await {
-                            let _ = event_tx.send(BackendEvent::Error(format!("failed to delete server: {e}")));
+                        let token = match mfa {
+                            Some(answer) => match client.finish_mfa(&answer.ticket, &answer.code).await {
+                                Ok(token) => Some(token),
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("2FA verification failed: {e}")));
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        if let Err(e) = client.delete_guild(&guild_id, token.as_deref()).await {
+                            let _ = event_tx.send(match e.mfa_ticket() {
+                                Some(ticket) => BackendEvent::GuildDeleteMfaRequired { guild_id, ticket },
+                                None => BackendEvent::Error(format!("failed to delete server: {e}")),
+                            });
                         }
+                    }
+                }
+                UiCommand::ReorderRoles { guild_id, role_ids } => {
+                    if let Some(client) = &rest {
+                        match client.reorder_roles(&guild_id, &role_ids).await {
+                            Ok(roles) => {
+                                let _ = event_tx.send(BackendEvent::GuildRolesLoaded { guild_id, roles });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to reorder roles: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::UploadEmoji { guild_id, path } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let name = emoji_name_from_path(&path);
+                            let image = match tokio::task::spawn_blocking(move || encode_upload_image(&path, 128, false, Some(256 * 1024))).await {
+                                Ok(Ok((mime, bytes))) => rustcord_client::rest::data_uri(mime, &bytes),
+                                Ok(Err(e)) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to read emoji: {e}")));
+                                    return;
+                                }
+                                Err(_) => return,
+                            };
+                            match client.create_emoji(&guild_id, &name, &image).await {
+                                Ok(emoji) => {
+                                    let _ = event_tx.send(BackendEvent::EmojiSaved { guild_id, emoji });
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to upload emoji: {e}")));
+                                }
+                            }
+                        });
+                    }
+                }
+                UiCommand::RenameEmoji { guild_id, emoji_id, name } => {
+                    if let Some(client) = &rest {
+                        match client.rename_emoji(&guild_id, &emoji_id, &name).await {
+                            Ok(emoji) => {
+                                let _ = event_tx.send(BackendEvent::EmojiSaved { guild_id, emoji });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to rename emoji: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::DeleteEmoji { guild_id, emoji_id } => {
+                    if let Some(client) = &rest {
+                        match client.delete_emoji(&guild_id, &emoji_id).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::EmojiDeleted { guild_id, emoji_id });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to delete emoji: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::UploadSticker { guild_id, path, details } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let file = match tokio::task::spawn_blocking(move || encode_upload_image(&path, 320, false, Some(512 * 1024))).await {
+                                Ok(Ok((mime, bytes))) => {
+                                    let extension = if mime == "image/gif" { "gif" } else { "png" };
+                                    rustcord_client::rest::UploadFile { filename: format!("sticker.{extension}"), bytes, content_type: mime.to_string() }
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to read sticker: {e}")));
+                                    return;
+                                }
+                                Err(_) => return,
+                            };
+                            match client.create_sticker(&guild_id, &details, file).await {
+                                Ok(sticker) => {
+                                    let _ = event_tx.send(BackendEvent::StickerSaved { guild_id, sticker });
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to upload sticker: {e}")));
+                                }
+                            }
+                        });
+                    }
+                }
+                UiCommand::EditSticker { guild_id, sticker_id, details } => {
+                    if let Some(client) = &rest {
+                        match client.edit_sticker(&guild_id, &sticker_id, &details).await {
+                            Ok(sticker) => {
+                                let _ = event_tx.send(BackendEvent::StickerSaved { guild_id, sticker });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to save sticker: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::DeleteSticker { guild_id, sticker_id } => {
+                    if let Some(client) = &rest {
+                        match client.delete_sticker(&guild_id, &sticker_id).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::StickerDeleted { guild_id, sticker_id });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to delete sticker: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::LoadAuditLog { guild_id, before } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let result = client.audit_log(&guild_id, before.as_deref()).await.map_err(|e| e.to_string());
+                            let _ = event_tx.send(BackendEvent::AuditLogLoaded { guild_id, before, result });
+                        });
                     }
                 }
                 UiCommand::LoadGuildBans { guild_id } => {
@@ -1781,11 +1945,30 @@ async fn read_attachments(files: Vec<crate::app_state::PendingAttachment>) -> Re
     Ok(out)
 }
 
-fn encode_guild_icon(path: &std::path::Path) -> Result<Vec<u8>, String> {
-    let icon = image::open(path).map_err(|e| e.to_string())?.resize_to_fill(512, 512, image::imageops::FilterType::Lanczos3);
+fn encode_upload_image(path: &std::path::Path, size: u32, crop: bool, gif_limit: Option<usize>) -> Result<(&'static str, Vec<u8>), String> {
+    if let Some(limit) = gif_limit.filter(|_| path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gif"))) {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        if bytes.len() > limit {
+            return Err(format!("GIFs must be {} KB or smaller", limit / 1024));
+        }
+        return Ok(("image/gif", bytes));
+    }
+    let image = image::open(path).map_err(|e| e.to_string())?;
+    let filter = image::imageops::FilterType::Lanczos3;
+    let image = if crop { image.resize_to_fill(size, size, filter) } else { image.resize(size, size, filter) };
     let mut png = std::io::Cursor::new(Vec::new());
-    icon.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
-    Ok(png.into_inner())
+    image.write_to(&mut png, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+    Ok(("image/png", png.into_inner()))
+}
+
+fn emoji_name_from_path(path: &std::path::Path) -> String {
+    let stem = path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    let name: String = stem.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect();
+    if name.len() < 2 {
+        "emoji".to_string()
+    } else {
+        name
+    }
 }
 
 async fn load_guild_emojis(client: &RestClient, guild_id: String, event_tx: &mpsc::UnboundedSender<BackendEvent>) {

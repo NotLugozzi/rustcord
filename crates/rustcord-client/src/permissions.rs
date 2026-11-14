@@ -9,6 +9,9 @@ pub const MANAGE_CHANNELS: u64 = 1 << 4;
 pub const MANAGE_GUILD: u64 = 1 << 5;
 pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const MODERATE_MEMBERS: u64 = 1 << 40;
+pub const VIEW_AUDIT_LOG: u64 = 1 << 7;
+pub const MANAGE_EXPRESSIONS: u64 = 1 << 30;
+pub const CREATE_EXPRESSIONS: u64 = 1 << 43;
 
 pub const PERMISSION_GROUPS: &[(&str, &[(u64, &str)])] = &[
     (
@@ -17,9 +20,9 @@ pub const PERMISSION_GROUPS: &[(&str, &[(u64, &str)])] = &[
             (VIEW_CHANNEL, "View Channels"),
             (MANAGE_CHANNELS, "Manage Channels"),
             (MANAGE_ROLES, "Manage Roles"),
-            (1 << 43, "Create Expressions"),
-            (1 << 30, "Manage Expressions"),
-            (1 << 7, "View Audit Log"),
+            (CREATE_EXPRESSIONS, "Create Expressions"),
+            (MANAGE_EXPRESSIONS, "Manage Expressions"),
+            (VIEW_AUDIT_LOG, "View Audit Log"),
             (1 << 19, "View Server Insights"),
             (1 << 29, "Manage Webhooks"),
             (MANAGE_GUILD, "Manage Server"),

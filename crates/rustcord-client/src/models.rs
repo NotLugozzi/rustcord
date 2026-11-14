@@ -192,6 +192,92 @@ pub struct Guild {
     pub owner_id: Option<Snowflake>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct AuditLog {
+    #[serde(default)]
+    pub audit_log_entries: Vec<AuditLogEntry>,
+    #[serde(default)]
+    pub users: Vec<User>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuditLogEntry {
+    pub id: Snowflake,
+    #[serde(default)]
+    pub user_id: Option<Snowflake>,
+    #[serde(default)]
+    pub target_id: Option<Snowflake>,
+    pub action_type: u32,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub changes: Vec<AuditLogChange>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuditLogChange {
+    pub key: String,
+}
+
+impl AuditLogEntry {
+    pub fn action_label(&self) -> String {
+        let label = match self.action_type {
+            1 => "Updated the server",
+            10 => "Created a channel",
+            11 => "Updated a channel",
+            12 => "Deleted a channel",
+            13 => "Created channel permissions",
+            14 => "Updated channel permissions",
+            15 => "Deleted channel permissions",
+            20 => "Kicked a member",
+            21 => "Pruned members",
+            22 => "Banned a member",
+            23 => "Unbanned a member",
+            24 => "Updated a member",
+            25 => "Updated a member's roles",
+            26 => "Moved a member",
+            27 => "Disconnected a member",
+            28 => "Added a bot",
+            30 => "Created a role",
+            31 => "Updated a role",
+            32 => "Deleted a role",
+            40 => "Created an invite",
+            41 => "Updated an invite",
+            42 => "Deleted an invite",
+            50 => "Created a webhook",
+            51 => "Updated a webhook",
+            52 => "Deleted a webhook",
+            60 => "Created an emoji",
+            61 => "Updated an emoji",
+            62 => "Deleted an emoji",
+            72 => "Deleted a message",
+            73 => "Bulk deleted messages",
+            74 => "Pinned a message",
+            75 => "Unpinned a message",
+            80 => "Added an integration",
+            81 => "Updated an integration",
+            82 => "Removed an integration",
+            90 => "Created a sticker",
+            91 => "Updated a sticker",
+            92 => "Deleted a sticker",
+            100 => "Created an event",
+            101 => "Updated an event",
+            102 => "Deleted an event",
+            110 => "Created a thread",
+            111 => "Updated a thread",
+            112 => "Deleted a thread",
+            140 => "Created an AutoMod rule",
+            141 => "Updated an AutoMod rule",
+            142 => "Deleted an AutoMod rule",
+            143 => "AutoMod blocked a message",
+            144 => "AutoMod flagged a message",
+            145 => "AutoMod timed out a member",
+            other => return format!("Action {other}"),
+        };
+        label.to_string()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Ban {
     pub user: User,
@@ -709,6 +795,8 @@ pub struct Sticker {
     pub format_type: u8,
     #[serde(default)]
     pub tags: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default = "available_by_default")]
     pub available: bool,
 }

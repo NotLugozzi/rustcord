@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use crate::identity::ClientIdentity;
-use crate::models::{Channel, ChannelType, Emoji, Ban, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Role, Sticker, StickerPack, User};
+use crate::models::{AuditLog, Ban, Channel, ChannelType, Emoji, Gif, Guild, GuildMember, GuildSettings, Invite, Message, Role, Sticker, StickerPack, User};
 use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
@@ -482,15 +482,13 @@ impl RestClient {
         self.send_empty(|| self.http.delete(format!("{API_BASE}/users/@me/relationships/{user_id}"))).await
     }
 
-    pub async fn kick_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
-        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}"))).await
+    pub async fn kick_member(&self, guild_id: &str, user_id: &str, reason: Option<&str>) -> Result<(), ClientError> {
+        self.send_empty(|| with_reason(self.http.delete(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}")), reason)).await
     }
 
-    pub async fn ban_member(&self, guild_id: &str, user_id: &str) -> Result<(), ClientError> {
-        self.send_empty(|| {
-            self.http.put(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}")).json(&serde_json::json!({}))
-        })
-        .await
+    pub async fn ban_member(&self, guild_id: &str, user_id: &str, reason: Option<&str>, delete_message_seconds: u32) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "delete_message_seconds": delete_message_seconds });
+        self.send_empty(|| with_reason(self.http.put(format!("{API_BASE}/guilds/{guild_id}/bans/{user_id}")).json(&body), reason)).await
     }
 
     pub async fn timeout_member(&self, guild_id: &str, user_id: &str, until: Option<&str>) -> Result<GuildMember, ClientError> {
@@ -538,8 +536,78 @@ impl RestClient {
         self.request(Method::PATCH, &format!("/guilds/{guild_id}"), Some(patch)).await
     }
 
-    pub async fn delete_guild(&self, guild_id: &str) -> Result<(), ClientError> {
-        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}"))).await
+    pub async fn delete_guild(&self, guild_id: &str, mfa_token: Option<&str>) -> Result<(), ClientError> {
+        self.send_empty(|| {
+            let request = self.http.delete(format!("{API_BASE}/guilds/{guild_id}"));
+            match mfa_token {
+                Some(token) => request.header("X-Discord-MFA-Authorization", token),
+                None => request,
+            }
+        })
+        .await
+    }
+
+    pub async fn finish_mfa(&self, ticket: &str, code: &str) -> Result<String, ClientError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            token: String,
+        }
+        let code = code.trim();
+        let mfa_type = if code.contains('-') || code.len() == 8 { "backup" } else { "totp" };
+        let body = serde_json::json!({ "ticket": ticket, "mfa_type": mfa_type, "data": code });
+        let resp: Resp = self.post("/mfa/finish", &body).await?;
+        Ok(resp.token)
+    }
+
+    pub async fn audit_log(&self, guild_id: &str, before: Option<&str>) -> Result<AuditLog, ClientError> {
+        let before = before.map(|id| format!("&before={id}")).unwrap_or_default();
+        self.get(&format!("/guilds/{guild_id}/audit-logs?limit={AUDIT_LOG_PAGE}{before}")).await
+    }
+
+    pub async fn create_emoji(&self, guild_id: &str, name: &str, image: &str) -> Result<Emoji, ClientError> {
+        self.post(&format!("/guilds/{guild_id}/emojis"), &serde_json::json!({ "name": name, "image": image })).await
+    }
+
+    pub async fn rename_emoji(&self, guild_id: &str, emoji_id: &str, name: &str) -> Result<Emoji, ClientError> {
+        self.request(Method::PATCH, &format!("/guilds/{guild_id}/emojis/{emoji_id}"), Some(&serde_json::json!({ "name": name }))).await
+    }
+
+    pub async fn delete_emoji(&self, guild_id: &str, emoji_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/emojis/{emoji_id}"))).await
+    }
+
+    pub async fn create_sticker(&self, guild_id: &str, details: &StickerDetails, file: UploadFile) -> Result<Sticker, ClientError> {
+        let part = reqwest::multipart::Part::bytes(file.bytes)
+            .file_name(file.filename)
+            .mime_str(&file.content_type)
+            .map_err(|e| ClientError::Api { status: 0, message: e.to_string() })?;
+        let form = reqwest::multipart::Form::new()
+            .text("name", details.name.clone())
+            .text("description", details.description.clone())
+            .text("tags", details.tags.clone())
+            .part("file", part);
+        let resp = dispatch(self.http.post(format!("{API_BASE}/guilds/{guild_id}/stickers")).multipart(form)).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api { status: status.as_u16(), message });
+        }
+        Ok(resp.json::<Sticker>().await?)
+    }
+
+    pub async fn edit_sticker(&self, guild_id: &str, sticker_id: &str, details: &StickerDetails) -> Result<Sticker, ClientError> {
+        self.request(Method::PATCH, &format!("/guilds/{guild_id}/stickers/{sticker_id}"), Some(details)).await
+    }
+
+    pub async fn delete_sticker(&self, guild_id: &str, sticker_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/guilds/{guild_id}/stickers/{sticker_id}"))).await
+    }
+
+    pub async fn reorder_roles(&self, guild_id: &str, role_ids_top_down: &[String]) -> Result<Vec<Role>, ClientError> {
+        let count = role_ids_top_down.len();
+        let body: Vec<serde_json::Value> =
+            role_ids_top_down.iter().enumerate().map(|(i, id)| serde_json::json!({ "id": id, "position": count - i })).collect();
+        self.request(Method::PATCH, &format!("/guilds/{guild_id}/roles"), Some(&body)).await
     }
 
     pub async fn guild_bans(&self, guild_id: &str) -> Result<Vec<Ban>, ClientError> {
@@ -844,9 +912,25 @@ fn gif_path(query: &str) -> String {
     }
 }
 
-pub fn png_data_uri(png: &[u8]) -> String {
+pub const AUDIT_LOG_PAGE: usize = 50;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct StickerDetails {
+    pub name: String,
+    pub description: String,
+    pub tags: String,
+}
+
+fn with_reason(request: reqwest::RequestBuilder, reason: Option<&str>) -> reqwest::RequestBuilder {
+    match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(reason) => request.header("X-Audit-Log-Reason", encode_path_segment(reason)),
+        None => request,
+    }
+}
+
+pub fn data_uri(mime: &str, bytes: &[u8]) -> String {
     use base64::Engine;
-    format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png))
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
 pub fn encode_path_segment(value: &str) -> String {
