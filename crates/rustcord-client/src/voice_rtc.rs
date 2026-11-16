@@ -1,7 +1,7 @@
 use crate::error::ClientError;
 use crate::voice_sdp::{LocalIceParams, RemoteSdp};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use str0m::config::Fingerprint;
 use str0m::format::Codec;
 use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt};
@@ -23,12 +23,15 @@ pub struct RtcStats {
     pub loss_up: Option<f32>,
     pub loss_down: Option<f32>,
     pub jitter_ms: Option<f32>,
+    pub egress_estimate_bps: Option<u64>,
 }
+
+pub const INITIAL_BANDWIDTH_ESTIMATE_BPS: u64 = 2_500_000;
 
 pub enum RtcEvent {
     Connected,
     Disconnected,
-    AudioData { ssrc: u32, payload: Vec<u8> },
+    AudioData { ssrc: u32, timestamp: u32, payload: Vec<u8> },
     #[cfg(feature = "screenshare")]
     VideoData { ssrc: u32, payload: Vec<u8> },
 }
@@ -47,7 +50,7 @@ pub struct VoiceRtc {
     remote_audio_mids: Vec<(Mid, u32)>,
     #[cfg(feature = "screenshare")]
     remote_video_mids: Vec<(Mid, u32)>,
-    rtp_timestamp: u32,
+    last_audio: Option<(u32, Instant)>,
     rtp_packets_sent: u64,
     rtp_packets_received: u64,
     media_data_events: u64,
@@ -59,6 +62,7 @@ impl VoiceRtc {
     pub async fn new(
         ready_audio_ssrc: Option<u32>,
         ready_video_ssrcs: Option<(u32, u32)>,
+        estimate_bandwidth: bool,
     ) -> Result<(Self, LocalIceParams), ClientError> {
         #[cfg(not(feature = "screenshare"))]
         let _ = ready_video_ssrcs;
@@ -77,6 +81,11 @@ impl VoiceRtc {
         );
         #[cfg(feature = "screenshare")]
         config.codec_config().add_h264(Pt::from(105), Some(Pt::from(106)), true, 0x42e033);
+        let config = if estimate_bandwidth {
+            config.enable_bwe(Some(str0m::bwe::Bitrate::bps(INITIAL_BANDWIDTH_ESTIMATE_BPS)))
+        } else {
+            config
+        };
         let mut rtc = config.set_stats_interval(Some(std::time::Duration::from_secs(1))).build(Instant::now());
 
         let local_ice = {
@@ -133,7 +142,7 @@ impl VoiceRtc {
             remote_audio_mids: Vec::new(),
             #[cfg(feature = "screenshare")]
             remote_video_mids: Vec::new(),
-            rtp_timestamp: 0,
+            last_audio: None,
             rtp_packets_sent: 0,
             rtp_packets_received: 0,
             media_data_events: 0,
@@ -228,17 +237,23 @@ impl VoiceRtc {
         self.stats.jitter_ms = worst.map(|j| j as f32 / 48.0);
     }
 
-    pub fn send_audio_frame(&mut self, opus_payload: &[u8]) -> Result<(), ClientError> {
+    pub fn set_desired_bitrate(&mut self, bps: u64) {
+        self.rtc.bwe().set_desired_bitrate(str0m::bwe::Bitrate::bps(bps));
+    }
+
+    pub fn send_audio_frame(&mut self, opus_payload: &[u8], frames_since_last: Option<u32>) -> Result<(), ClientError> {
         let pt = Pt::from(OPUS_PT);
-        let media_time = MediaTime::new(self.rtp_timestamp as u64, Frequency::FORTY_EIGHT_KHZ);
+        let now = Instant::now();
+        let timestamp = next_audio_timestamp(self.last_audio, frames_since_last, now);
+        let media_time = MediaTime::new(timestamp as u64, Frequency::FORTY_EIGHT_KHZ);
         let writer = self
             .rtc
             .writer(self.audio_mid)
             .ok_or_else(|| ClientError::GatewayClosed("voice rtc: no writer for audio mid".into()))?;
         writer
-            .write(pt, Instant::now(), media_time, opus_payload.to_vec())
+            .write(pt, now, media_time, opus_payload.to_vec())
             .map_err(|e| ClientError::GatewayClosed(format!("voice rtc: audio write failed: {e}")))?;
-        self.rtp_timestamp = self.rtp_timestamp.wrapping_add(OPUS_FRAME_SAMPLES);
+        self.last_audio = Some((timestamp, now));
         Ok(())
     }
 
@@ -321,7 +336,7 @@ impl VoiceRtc {
                             tracing::trace!("voice rtc: received {} MediaData events so far, latest mid {:?}, pt {:?}, {} bytes", self.media_data_events, data.mid, data.pt, data.data.len());
                         }
                         if let Some((_, ssrc)) = self.remote_audio_mids.iter().find(|(mid, _)| *mid == data.mid) {
-                            return Ok(PollOutcome::Event(RtcEvent::AudioData { ssrc: *ssrc, payload: data.data.to_vec() }));
+                            return Ok(PollOutcome::Event(RtcEvent::AudioData { ssrc: *ssrc, timestamp: data.time.numer() as u32, payload: data.data.to_vec() }));
                         }
                         #[cfg(feature = "screenshare")]
                         if let Some((_, ssrc)) = self.remote_video_mids.iter().find(|(mid, _)| *mid == data.mid) {
@@ -343,6 +358,12 @@ impl VoiceRtc {
                         self.jitter_by_mid.insert(s.mid, s.jitter);
                         let worst = self.jitter_by_mid.values().copied().max().unwrap_or(0);
                         self.stats.jitter_ms = Some(worst as f32 / 48.0);
+                    }
+                    Event::EgressBitrateEstimate(str0m::bwe::BweKind::Twcc { estimate, .. }) => {
+                        if self.stats.egress_estimate_bps.is_none() {
+                            tracing::info!(estimate_bps = estimate.as_u64(), "voice rtc: transport-wide congestion feedback is driving the send rate");
+                        }
+                        self.stats.egress_estimate_bps = Some(estimate.as_u64());
                     }
                     _ => {}
                 },
@@ -415,4 +436,53 @@ fn local_outbound_ip(remote: SocketAddr) -> Result<std::net::IpAddr, ClientError
 
 fn format_fingerprint(fp: &Fingerprint) -> String {
     fp.bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+}
+
+const AUDIO_GAP_BEFORE_CLOCK_SYNC: Duration = Duration::from_millis(100);
+
+fn next_audio_timestamp(last: Option<(u32, Instant)>, frames_since_last: Option<u32>, now: Instant) -> u32 {
+    let Some((timestamp, sent_at)) = last else { return 0 };
+    let frames = match frames_since_last {
+        Some(frames) => frames,
+        None => {
+            let elapsed = now.duration_since(sent_at);
+            if elapsed < AUDIO_GAP_BEFORE_CLOCK_SYNC {
+                1
+            } else {
+                (elapsed.as_secs_f64() / 0.02).round() as u32
+            }
+        }
+    };
+    timestamp.wrapping_add(frames.max(1).wrapping_mul(OPUS_FRAME_SAMPLES))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_frame_starts_at_zero() {
+        assert_eq!(next_audio_timestamp(None, Some(7), Instant::now()), 0);
+    }
+
+    #[test]
+    fn gated_frames_still_advance_the_timestamp() {
+        let now = Instant::now();
+        assert_eq!(next_audio_timestamp(Some((960, now)), Some(1), now), 1920);
+        assert_eq!(next_audio_timestamp(Some((960, now)), Some(51), now), 960 + 51 * 960);
+    }
+
+    #[test]
+    fn a_continuous_stream_steps_one_frame_until_a_real_gap() {
+        let sent = Instant::now();
+        assert_eq!(next_audio_timestamp(Some((0, sent)), None, sent + Duration::from_millis(45)), 960);
+        assert_eq!(next_audio_timestamp(Some((0, sent)), None, sent + Duration::from_millis(1000)), 50 * 960);
+    }
+
+    #[test]
+    fn the_timestamp_wraps() {
+        let now = Instant::now();
+        assert_eq!(next_audio_timestamp(Some((u32::MAX, now)), Some(1), now), 959);
+    }
 }

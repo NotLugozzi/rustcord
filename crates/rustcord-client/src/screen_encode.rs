@@ -127,6 +127,62 @@ impl ScreenEncoder {
             Self::Hardware(encoder) => encoder.take_timing_sample(),
         }
     }
+
+    pub fn supports_live_bitrate(&self) -> bool {
+        matches!(self, Self::Hardware(encoder) if encoder.live_bitrate)
+    }
+
+    pub fn set_live_bitrate(&mut self, bitrate_bps: usize) -> bool {
+        match self {
+            Self::Hardware(encoder) if encoder.live_bitrate => {
+                unsafe { (*encoder.encoder.as_mut_ptr()).bit_rate = bitrate_bps as i64 };
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+pub const MIN_STREAM_BITRATE_BPS: usize = 500_000;
+const LIVE_CHANGE_FRACTION: f64 = 0.10;
+const REBUILD_CHANGE_FRACTION: f64 = 0.30;
+const REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const CONGESTED_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub fn stream_bitrate_cap(max_height: u32, frame_rate: u32) -> usize {
+    match (max_height >= 1080, frame_rate >= 60) {
+        (true, true) => 4_000_000,
+        (true, false) => 2_500_000,
+        (false, true) => 2_500_000,
+        (false, false) => 1_500_000,
+    }
+}
+
+pub fn desired_bitrate(cap: usize, target_bps: u64) -> usize {
+    if target_bps == 0 {
+        return cap;
+    }
+    usize::try_from(target_bps).unwrap_or(usize::MAX).clamp(MIN_STREAM_BITRATE_BPS.min(cap), cap)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BitrateChange {
+    Keep,
+    Live,
+    Rebuild,
+}
+
+pub fn bitrate_change(current: usize, desired: usize, live: bool, since_rebuild: std::time::Duration) -> BitrateChange {
+    let delta = (desired as f64 - current as f64) / current.max(1) as f64;
+    if live {
+        return if delta.abs() > LIVE_CHANGE_FRACTION { BitrateChange::Live } else { BitrateChange::Keep };
+    }
+    let wait = if delta < 0.0 { CONGESTED_REBUILD_INTERVAL } else { REBUILD_INTERVAL };
+    if delta.abs() > REBUILD_CHANGE_FRACTION && since_rebuild >= wait {
+        BitrateChange::Rebuild
+    } else {
+        BitrateChange::Keep
+    }
 }
 
 pub fn software_vp8() -> EncoderChoice {
@@ -396,6 +452,7 @@ pub struct HardwareEncoder {
     frames_sent: i64,
     started: Option<std::time::Instant>,
     timing: EncodeTimingSample,
+    live_bitrate: bool,
 }
 
 struct HardwareGpuFilter {
@@ -680,6 +737,7 @@ impl HardwareEncoder {
             frames_sent: 0,
             started: None,
             timing: EncodeTimingSample::default(),
+            live_bitrate: matches!(backend, EncoderBackend::Cuda { .. } | EncoderBackend::Qsv { .. }),
         })
     }
 
@@ -775,6 +833,38 @@ fn copy_into_plane(frame: &mut VideoFrame, pixels: &[u8], src_stride: usize) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    #[test]
+    fn without_an_estimate_the_stream_sends_at_its_cap() {
+        assert_eq!(desired_bitrate(2_500_000, 0), 2_500_000);
+    }
+
+    #[test]
+    fn the_estimate_is_held_between_the_floor_and_the_cap() {
+        assert_eq!(desired_bitrate(2_500_000, 1_200_000), 1_200_000);
+        assert_eq!(desired_bitrate(2_500_000, 90_000_000), 2_500_000);
+        assert_eq!(desired_bitrate(2_500_000, 100_000), MIN_STREAM_BITRATE_BPS);
+        assert_eq!(desired_bitrate(400_000, 100_000), 400_000);
+    }
+
+    #[test]
+    fn live_encoders_follow_changes_over_a_tenth() {
+        let now = Duration::ZERO;
+        assert_eq!(bitrate_change(2_000_000, 2_150_000, true, now), BitrateChange::Keep);
+        assert_eq!(bitrate_change(2_000_000, 2_300_000, true, now), BitrateChange::Live);
+        assert_eq!(bitrate_change(2_000_000, 1_700_000, true, now), BitrateChange::Live);
+    }
+
+    #[test]
+    fn rebuilt_encoders_wait_for_big_changes_and_back_off_sooner_than_they_rise() {
+        assert_eq!(bitrate_change(2_000_000, 2_400_000, false, Duration::from_secs(60)), BitrateChange::Keep);
+        assert_eq!(bitrate_change(2_000_000, 3_000_000, false, Duration::from_secs(3)), BitrateChange::Keep);
+        assert_eq!(bitrate_change(2_000_000, 3_000_000, false, Duration::from_secs(5)), BitrateChange::Rebuild);
+        assert_eq!(bitrate_change(2_000_000, 1_000_000, false, Duration::from_secs(1)), BitrateChange::Keep);
+        assert_eq!(bitrate_change(2_000_000, 1_000_000, false, Duration::from_secs(2)), BitrateChange::Rebuild);
+    }
+
     use super::*;
 
     fn synthetic_frame(width: u32, height: u32, tick: u8) -> CapturedFrame {

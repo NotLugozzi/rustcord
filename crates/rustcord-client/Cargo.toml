@@ -31,6 +31,7 @@ str0m = "0.24.1"
 cpal = { version = "0.18", features = ["pulseaudio"] }
 audiopus = "0.3.0-rc.0"
 nnnoiseless = "0.5"
+rtrb = "0.3"
 aes = "0.8"
 ghash = "0.5"
 hmac = "0.12"
@@ -38,6 +39,7 @@ sha2 = "0.10"
 subtle = "2"
 ffmpeg-next = { version = "9", optional = true, default-features = false, features = ["codec", "device", "filter", "format", "software-scaling"] }
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 ashpd = { version = "0.13", features = ["screencast"], optional = true }
 pipewire = { version = "0.10", optional = true }
 libspa-sys = { version = "0.10", optional = true }
