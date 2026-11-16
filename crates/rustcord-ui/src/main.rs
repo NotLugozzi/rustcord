@@ -216,6 +216,7 @@ pub fn drain_backend_events(
                     let _ = cmd_tx.send(UiCommand::RefreshDmChannels);
                 }
                 let is_actively_viewing = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
+                state.record_incoming_mention(&message, is_actively_viewing);
                 if is_actively_viewing && state.mark_channel_read(&message.channel_id, &message.id) {
                     let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: message.channel_id.clone(), message_id: message.id.clone() });
                 }
@@ -240,6 +241,15 @@ pub fn drain_backend_events(
             }
             BackendEvent::Gateway(GatewayEvent::ChannelUpsert(channel)) => {
                 state.upsert_channel(channel);
+            }
+            BackendEvent::Gateway(GatewayEvent::ThreadListSync { guild_id, channel_ids, threads }) => {
+                state.sync_threads(&guild_id, channel_ids.as_deref(), threads);
+            }
+            BackendEvent::Gateway(GatewayEvent::ThreadMemberUpdate { thread_id, member }) => {
+                state.set_thread_membership(&thread_id, Some(member));
+            }
+            BackendEvent::Gateway(GatewayEvent::ThreadMembersUpdate { thread_id, member_count, added, removed, .. }) => {
+                state.apply_thread_members_update(&thread_id, member_count, &added, &removed);
             }
             BackendEvent::Gateway(GatewayEvent::ChannelDelete { channel_id, guild_id }) => {
                 state.remove_channel(&channel_id, guild_id.as_deref());
@@ -511,6 +521,25 @@ pub fn drain_backend_events(
             BackendEvent::ChannelSaved(channel) => {
                 state.upsert_channel(channel);
             }
+            BackendEvent::ThreadCreated(mut thread) => {
+                if thread.thread.member.is_none() {
+                    thread.thread.member = Some(Default::default());
+                }
+                let thread_id = thread.id.clone();
+                state.upsert_channel(thread);
+                state.open_channel(&thread_id, cmd_tx);
+            }
+            BackendEvent::ArchivedThreadsLoaded { channel_id, offset, page } => {
+                state.apply_archived_threads(&channel_id, offset, page);
+            }
+            BackendEvent::ChannelFetchedToOpen(channel) => {
+                let channel_id = channel.id.clone();
+                state.upsert_channel(channel);
+                state.open_channel(&channel_id, cmd_tx);
+            }
+            BackendEvent::ThreadMembershipChanged { thread_id, joined } => {
+                state.set_thread_membership(&thread_id, joined.then(Default::default));
+            }
             BackendEvent::InviteCreated { code } => {
                 let link = format!("https://discord.gg/{code}");
                 state.status_message = Some(if crate::clipboard::write_text(&link) {
@@ -621,7 +650,7 @@ pub fn drain_backend_events(
                 state.mic_test_running = false;
             }
             BackendEvent::GuildChannelsLoaded { guild_id, channels } => {
-                state.guild_channels.insert(guild_id, channels);
+                state.replace_guild_channels(guild_id, channels);
             }
             BackendEvent::GuildRolesLoaded { guild_id, roles } => {
                 state.guild_roles.insert(guild_id, roles);

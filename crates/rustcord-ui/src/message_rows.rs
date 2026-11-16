@@ -7,7 +7,25 @@ use std::sync::Arc;
 const GROUP_WINDOW_SECS: i64 = 7 * 60;
 
 pub fn is_system(msg: &Message) -> bool {
-    !matches!(msg.kind, 0 | 19 | 20 | 23)
+    match msg.kind {
+        0 | 19 | 20 | 23 => false,
+        THREAD_STARTER_MESSAGE => msg.referenced_message.is_none(),
+        _ => true,
+    }
+}
+
+const THREAD_CREATED: u8 = 18;
+const THREAD_STARTER_MESSAGE: u8 = 21;
+
+fn thread_starter_display(msg: &Arc<Message>) -> Arc<Message> {
+    let Some(original) = msg.referenced_message.as_deref().filter(|_| msg.kind == THREAD_STARTER_MESSAGE) else { return msg.clone() };
+    let mut shown = original.clone();
+    shown.id = msg.id.clone();
+    shown.channel_id = msg.channel_id.clone();
+    shown.guild_id = msg.guild_id.clone().or(shown.guild_id);
+    shown.kind = 0;
+    shown.thread = None;
+    Arc::new(shown)
 }
 
 pub fn is_reply(msg: &Message) -> bool {
@@ -61,6 +79,7 @@ pub enum Tone {
 pub enum SystemAction {
     JumpTo { channel_id: String, message_id: String },
     JoinCall,
+    OpenThread { thread_id: String },
 }
 
 pub struct SystemRow {
@@ -174,6 +193,18 @@ pub fn system_row(msg: &Message, me: &str, peer: Option<&str>) -> SystemRow {
             }
         }
         7 => row(Icon::UserPlus, vec![bold(author), plain(" joined the server.")]),
+        THREAD_CREATED => {
+            let name = if msg.content.trim().is_empty() { "a thread".to_string() } else { msg.content.clone() };
+            let action = msg.message_reference.as_ref().and_then(|r| r.channel_id.clone()).map(|thread_id| SystemAction::OpenThread { thread_id });
+            SystemRow {
+                icon: Icon::MessageCircle,
+                tone: Tone::Muted,
+                parts: vec![bold(author), plain(" started a thread: "), bold(name), plain(".")],
+                action,
+                tooltip: None,
+            }
+        }
+        THREAD_STARTER_MESSAGE => row(Icon::MessageCircle, vec![plain("The message this thread was started from has been deleted.")]),
         46 => {
             let field = |name: &str| {
                 msg.embeds
@@ -296,6 +327,7 @@ impl ChannelRows {
         let mut rows: Vec<MessageRow> = Vec::with_capacity(messages.len());
         for (idx, msg) in messages.iter().enumerate() {
             let stamp = &stamps[idx];
+            let shown = thread_starter_display(msg);
             let prev = idx.checked_sub(1).map(|p| (&*messages[p], &stamps[p]));
             let starts = starts_group(prev, msg, stamp);
             if let Some(last) = rows.last_mut() {
@@ -307,6 +339,7 @@ impl ChannelRows {
                 Some(date) if prev.is_none() || prev_date != Some(date) => Some(format.long_date(date)),
                 _ => None,
             };
+            let msg = &shown;
             rows.push(MessageRow {
                 message: msg.clone(),
                 divider,
@@ -618,4 +651,38 @@ mod tests {
         let ends: Vec<bool> = ChannelRows::build(&messages, &utc(), today(), US, "me", None).rows.iter().map(|r| r.ends_group).collect();
         assert_eq!(ends, [false, true, true]);
     }
+
+    #[test]
+    fn a_thread_created_notice_opens_the_thread() {
+        let mut m = with_kind(msg("1", "luna", "2026-11-08T12:00:00+00:00"), 18);
+        m.content = "Plans".into();
+        m.message_reference = serde_json::from_value(serde_json::json!({ "channel_id": "t1", "guild_id": "g" })).ok();
+        let row = system_row_test(&m, "me");
+        assert_eq!(row.plain_text(), "luna started a thread: Plans.");
+        assert_eq!(row.action, Some(SystemAction::OpenThread { thread_id: "t1".into() }));
+    }
+
+    #[test]
+    fn a_thread_starter_shows_the_original_message() {
+        let original = msg("orig", "ada", "2026-11-08T11:00:00+00:00");
+        let mut starter = with_kind(msg("s", "system", "2026-11-08T12:00:00+00:00"), 21);
+        starter.content = String::new();
+        starter.channel_id = "t1".into();
+        starter.referenced_message = Some(Box::new(original));
+        assert!(!is_system(&starter));
+        let rows = ChannelRows::build(&[Arc::new(starter)], &utc(), today(), US, "me", None);
+        let shown = &rows.rows[0].message;
+        assert_eq!(shown.author.id, "ada");
+        assert_eq!(shown.content, "hi");
+        assert_eq!((shown.id.as_str(), shown.channel_id.as_str()), ("s", "t1"));
+        assert!(rows.rows[0].system.is_none());
+    }
+
+    #[test]
+    fn a_starter_whose_original_was_deleted_says_so() {
+        let starter = with_kind(msg("s", "system", "2026-11-08T12:00:00+00:00"), 21);
+        assert!(is_system(&starter));
+        assert!(system_row_test(&starter, "me").plain_text().contains("deleted"));
+    }
 }
+

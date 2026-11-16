@@ -92,35 +92,63 @@ impl ImguiState {
     }
 }
 
+const COMPACT_GLYPH_RANGES: &[u32] = &[
+    0x0020, 0x024F,
+    0x0370, 0x04FF,
+    0x1E00, 0x1EFF,
+    0x2000, 0x206F,
+    0x20A0, 0x20BF,
+    0x2100, 0x214F,
+    0x2190, 0x21FF,
+    0,
+];
+
+const INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.ttf");
+const INTER_MEDIUM: &[u8] = include_bytes!("../assets/fonts/Inter-Medium.ttf");
+const INTER_SEMIBOLD: &[u8] = include_bytes!("../assets/fonts/Inter-SemiBold.ttf");
+const INTER_BOLD: &[u8] = include_bytes!("../assets/fonts/Inter-Bold.ttf");
+const DEJAVU: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+
 fn add_fonts(context: &mut imgui::Context, hidpi_factor: f64, custom: &crate::fonts::CustomFonts) -> crate::ui::Fonts {
-    let font_size = (custom.size * hidpi_factor as f32).round();
+    let scale = hidpi_factor as f32;
+    let font_size = (custom.size * scale).round();
+    let at = |ratio: f32| (custom.size * ratio * scale).round();
     let mono_size = (14.0 * hidpi_factor) as f32;
-    let config = |size_pixels: f32| {
+    let oversample = if scale >= 2.0 { 1 } else { 2 };
+    let config = |size_pixels: f32, ranges: &'static [u32]| {
         Some(FontConfig {
-            oversample_h: 2,
-            oversample_v: 2,
+            oversample_h: oversample,
+            oversample_v: oversample,
             pixel_snap_h: true,
             size_pixels,
-            glyph_ranges: imgui::FontGlyphRanges::from_slice(TEXT_GLYPH_RANGES),
+            glyph_ranges: imgui::FontGlyphRanges::from_slice(ranges),
             ..Default::default()
         })
     };
-    let source = |data: &'static [u8], size_pixels: f32| FontSource::TtfData { data, size_pixels, config: config(size_pixels) };
-    let mut add = |custom: Option<&Vec<u8>>, builtin: &'static [u8], size_pixels: f32| {
+    let mut add = |custom: Option<&Vec<u8>>, builtin: &'static [u8], size_pixels: f32, ranges: &'static [u32]| {
         let mut sources = Vec::with_capacity(3);
         if let Some(data) = custom {
-            sources.push(FontSource::TtfData { data, size_pixels, config: config(size_pixels) });
+            sources.push(FontSource::TtfData { data, size_pixels, config: config(size_pixels, ranges) });
         }
-        sources.push(source(builtin, size_pixels));
-        sources.push(source(include_bytes!("../assets/fonts/DejaVuSans.ttf"), size_pixels));
+        sources.push(FontSource::TtfData { data: builtin, size_pixels, config: config(size_pixels, ranges) });
+        sources.push(FontSource::TtfData { data: DEJAVU, size_pixels, config: config(size_pixels, ranges) });
         context.fonts().add_font(&sources)
     };
-    let regular = add(custom.regular.as_ref(), include_bytes!("../assets/fonts/Inter-Regular.ttf"), font_size);
-    let bold = add(custom.bold.as_ref(), include_bytes!("../assets/fonts/Inter-Bold.ttf"), font_size);
-    let italic = add(custom.italic.as_ref(), include_bytes!("../assets/fonts/Inter-Italic.ttf"), font_size);
-    let bold_italic = add(custom.bold_italic.as_ref(), include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"), font_size);
-    let mono = add(custom.mono.as_ref(), include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"), mono_size);
-    crate::ui::Fonts { regular, bold, italic, bold_italic, mono }
+    let regular = add(custom.regular.as_ref(), INTER_REGULAR, font_size, TEXT_GLYPH_RANGES);
+    let bold = add(custom.bold.as_ref(), INTER_BOLD, font_size, TEXT_GLYPH_RANGES);
+    let italic = add(custom.italic.as_ref(), include_bytes!("../assets/fonts/Inter-Italic.ttf"), font_size, TEXT_GLYPH_RANGES);
+    let bold_italic = add(custom.bold_italic.as_ref(), include_bytes!("../assets/fonts/Inter-BoldItalic.ttf"), font_size, TEXT_GLYPH_RANGES);
+    let mono = add(custom.mono.as_ref(), include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"), mono_size, TEXT_GLYPH_RANGES);
+    let medium = add(custom.regular.as_ref(), INTER_MEDIUM, font_size, TEXT_GLYPH_RANGES);
+    let semibold = add(custom.bold.as_ref(), INTER_SEMIBOLD, font_size, TEXT_GLYPH_RANGES);
+    let xs = add(custom.regular.as_ref(), INTER_MEDIUM, at(crate::ui::XS_RATIO), TEXT_GLYPH_RANGES);
+    let sm = add(custom.regular.as_ref(), INTER_REGULAR, at(crate::ui::SM_RATIO), TEXT_GLYPH_RANGES);
+    let sm_semibold = add(custom.bold.as_ref(), INTER_SEMIBOLD, at(crate::ui::SM_RATIO), COMPACT_GLYPH_RANGES);
+    let title = add(custom.bold.as_ref(), INTER_BOLD, at(crate::ui::TITLE_RATIO), TEXT_GLYPH_RANGES);
+    let display = add(custom.bold.as_ref(), INTER_BOLD, at(crate::ui::DISPLAY_RATIO), COMPACT_GLYPH_RANGES);
+    let fonts = crate::ui::Fonts { regular, bold, italic, bold_italic, mono, medium, semibold, xs, sm, sm_semibold, title, display };
+    crate::ui::set_faces(fonts);
+    fonts
 }
 
 fn build_imgui(mut context: imgui::Context, window: &Window, device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> ImguiState {
@@ -689,7 +717,26 @@ mod redraw_tests {
 
 #[cfg(test)]
 mod glyph_range_tests {
-    use super::TEXT_GLYPH_RANGES;
+    use super::{add_fonts, COMPACT_GLYPH_RANGES, TEXT_GLYPH_RANGES};
+
+    #[test]
+    fn the_compact_ranges_are_shaped_the_way_imgui_demands() {
+        assert_eq!(COMPACT_GLYPH_RANGES.len() % 2, 1);
+        assert_eq!(COMPACT_GLYPH_RANGES.last(), Some(&0));
+    }
+
+    #[test]
+    fn every_face_fits_one_gpu_texture_on_a_hidpi_screen() {
+        for scale in [1.0, 2.0] {
+            let mut context = imgui::Context::create();
+            let custom = crate::fonts::CustomFonts { size: crate::fonts::DEFAULT_SIZE, ..Default::default() };
+            let fonts = add_fonts(&mut context, scale, &custom);
+            assert_ne!(fonts.xs, fonts.display);
+            let atlas = context.fonts().build_rgba32_texture();
+            assert!(atlas.width <= 8192 && atlas.height <= 8192, "atlas at {scale}x is {}x{}", atlas.width, atlas.height);
+            eprintln!("atlas at {scale}x: {}x{}", atlas.width, atlas.height);
+        }
+    }
 
     #[test]
     fn the_range_table_is_shaped_the_way_imgui_demands() {

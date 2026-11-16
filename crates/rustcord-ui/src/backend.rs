@@ -419,6 +419,19 @@ pub enum UiCommand {
     LoadProfile { user_id: String },
     EditMessage { channel_id: String, message_id: String, content: String },
     DeleteMessage { channel_id: String, message_id: String },
+    CreateThread {
+        channel_id: String,
+        message_id: Option<String>,
+        name: String,
+        kind: rustcord_client::models::ChannelType,
+        auto_archive_minutes: u32,
+        starter: Option<String>,
+    },
+    JoinThread { thread_id: String },
+    OpenChannelById { channel_id: String },
+    LoadArchivedThreads { channel_id: String, guild_id: String, offset: u32 },
+    SetThreadArchived { thread_id: String, archived: bool },
+    LeaveThread { thread_id: String },
     ToggleReaction { channel_id: String, message_id: String, emoji: String, add: bool },
     AckMessage { channel_id: String, message_id: String },
     SearchMessages { scope: SearchScope, query: String, filters: SearchFilters, offset: u32 },
@@ -495,6 +508,10 @@ pub enum BackendEvent {
     MemberUpdated { guild_id: String, member: rustcord_client::models::GuildMember },
     MemberRoleChanged { guild_id: String, user_id: String, role_id: String, add: bool },
     ChannelSaved(rustcord_client::models::Channel),
+    ThreadCreated(rustcord_client::models::Channel),
+    ChannelFetchedToOpen(rustcord_client::models::Channel),
+    ThreadMembershipChanged { thread_id: String, joined: bool },
+    ArchivedThreadsLoaded { channel_id: String, offset: u32, page: rustcord_client::rest::ThreadSearchPage },
     InviteCreated { code: String },
     GuildInvitesLoaded { guild_id: String, result: Result<Vec<rustcord_client::models::Invite>, String> },
     InviteRevoked { code: String },
@@ -601,6 +618,9 @@ pub fn spawn(
                         match client.guild_channels(&guild_id).await {
                             Ok(channels) => {
                                 let _ = event_tx.send(BackendEvent::GuildChannelsLoaded { guild_id: guild_id.clone(), channels });
+                                if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                                    let _ = tx.send(rustcord_client::gateway::guild_subscription_frame(&guild_id));
+                                }
                             }
                             Err(e) => {
                                 tracing::error!("failed to load channels for guild {guild_id}: {e}");
@@ -688,6 +708,92 @@ pub fn spawn(
                         if let Err(e) = client.send_message_reply(&channel_id, &content, reply_to.as_deref()).await {
                             tracing::warn!("send failed: {e}");
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to send message: {e}")));
+                        }
+                    }
+                }
+                UiCommand::CreateThread { channel_id, message_id, name, kind, auto_archive_minutes, starter } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match client.start_thread(&channel_id, message_id.as_deref(), &name, kind, auto_archive_minutes).await {
+                                Ok(thread) => {
+                                    let thread_id = thread.id.clone();
+                                    let _ = event_tx.send(BackendEvent::ThreadCreated(thread));
+                                    if let Some(starter) = starter {
+                                        if let Err(e) = client.send_message(&thread_id, &starter).await {
+                                            let _ = event_tx.send(BackendEvent::Error(format!("the thread was created, but its first message failed to send: {e}")));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to create thread: {e}")));
+                                }
+                            }
+                        });
+                    }
+                }
+                UiCommand::LoadArchivedThreads { channel_id, guild_id, offset } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match client.search_archived_threads(&channel_id, &guild_id, offset).await {
+                                Ok(page) => {
+                                    let _ = event_tx.send(BackendEvent::ArchivedThreadsLoaded { channel_id, offset, page });
+                                }
+                                Err(e) => {
+                                    let _ = event_tx.send(BackendEvent::ArchivedThreadsLoaded { channel_id, offset, page: Default::default() });
+                                    let _ = event_tx.send(BackendEvent::Error(format!("failed to load older threads: {e}")));
+                                }
+                            }
+                        });
+                    }
+                }
+                UiCommand::SetThreadArchived { thread_id, archived } => {
+                    if let Some(client) = &rest {
+                        match client.set_thread_archived(&thread_id, archived).await {
+                            Ok(thread) => {
+                                let _ = event_tx.send(BackendEvent::ChannelSaved(thread));
+                            }
+                            Err(e) => {
+                                let verb = if archived { "close" } else { "reopen" };
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to {verb} thread: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::OpenChannelById { channel_id } => {
+                    if let Some(client) = &rest {
+                        match client.channel(&channel_id).await {
+                            Ok(channel) => {
+                                let _ = event_tx.send(BackendEvent::ChannelFetchedToOpen(channel));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("couldn't open that channel: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::JoinThread { thread_id } => {
+                    if let Some(client) = &rest {
+                        match client.join_thread(&thread_id).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::ThreadMembershipChanged { thread_id, joined: true });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to join thread: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::LeaveThread { thread_id } => {
+                    if let Some(client) = &rest {
+                        match client.leave_thread(&thread_id).await {
+                            Ok(()) => {
+                                let _ = event_tx.send(BackendEvent::ThreadMembershipChanged { thread_id, joined: false });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to leave thread: {e}")));
+                            }
                         }
                     }
                 }

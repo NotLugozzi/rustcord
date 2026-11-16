@@ -52,6 +52,9 @@ pub enum GatewayEvent {
     GuildEmojisUpdate { guild_id: String, emojis: Vec<Emoji> },
     GuildStickersUpdate { guild_id: String, stickers: Vec<Sticker> },
     GuildSettings(Vec<GuildSettings>),
+    ThreadListSync { guild_id: String, channel_ids: Option<Vec<String>>, threads: Vec<Channel> },
+    ThreadMemberUpdate { thread_id: String, member: crate::models::ThreadMember },
+    ThreadMembersUpdate { thread_id: String, guild_id: String, member_count: Option<u32>, added: Vec<String>, removed: Vec<String> },
     RelationshipAdd(Relationship),
     RelationshipRemove { user_id: String },
     Unknown { op_name: String, raw: Value },
@@ -105,6 +108,12 @@ pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>
         }
     })
     .to_string()
+}
+
+pub fn guild_subscription_frame(guild_id: &str) -> String {
+    let mut subscriptions = serde_json::Map::new();
+    subscriptions.insert(guild_id.to_string(), json!({ "typing": true, "threads": true, "activities": true }));
+    json!({ "op": 37, "d": { "subscriptions": subscriptions } }).to_string()
 }
 
 pub fn request_guild_members_frame(guild_id: &str) -> String {
@@ -516,7 +525,42 @@ impl Gateway {
                         Some((user_id, roles))
                     })
                     .collect();
+                let threads = parse_guild_threads(&data, &guild_id, None);
+                let _ = tx.send(GatewayEvent::ThreadListSync { guild_id: guild_id.clone(), channel_ids: None, threads });
                 GatewayEvent::GuildCreate { guild_id, roles, member_roles }
+            }
+            Some("THREAD_CREATE") | Some("THREAD_UPDATE") => {
+                let channel: Channel = serde_json::from_value(data)?;
+                GatewayEvent::ChannelUpsert(channel)
+            }
+            Some("THREAD_DELETE") => {
+                let channel_id = data["id"].as_str().unwrap_or_default().to_string();
+                let guild_id = data["guild_id"].as_str().map(str::to_string);
+                GatewayEvent::ChannelDelete { channel_id, guild_id }
+            }
+            Some("THREAD_LIST_SYNC") => {
+                let guild_id = data["guild_id"].as_str().unwrap_or_default().to_string();
+                let channel_ids = data.get("channel_ids").and_then(|ids| serde_json::from_value(ids.clone()).ok());
+                let threads = parse_guild_threads(&data, &guild_id, data.get("members"));
+                GatewayEvent::ThreadListSync { guild_id, channel_ids, threads }
+            }
+            Some("THREAD_MEMBER_UPDATE") => {
+                let thread_id = data["id"].as_str().unwrap_or_default().to_string();
+                let member: crate::models::ThreadMember = serde_json::from_value(data)?;
+                GatewayEvent::ThreadMemberUpdate { thread_id, member }
+            }
+            Some("THREAD_MEMBERS_UPDATE") => {
+                let thread_id = data["id"].as_str().unwrap_or_default().to_string();
+                let guild_id = data["guild_id"].as_str().unwrap_or_default().to_string();
+                let member_count = data["member_count"].as_u64().map(|count| count as u32);
+                let added = data["added_members"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|member| member["user_id"].as_str().map(str::to_string))
+                    .collect();
+                let removed = serde_json::from_value(data["removed_member_ids"].clone()).unwrap_or_default();
+                GatewayEvent::ThreadMembersUpdate { thread_id, guild_id, member_count, added, removed }
             }
             Some("CHANNEL_CREATE") | Some("CHANNEL_UPDATE") => {
                 let channel: Channel = serde_json::from_value(data)?;
@@ -674,6 +718,31 @@ fn frame_is_resumable(reason: &str) -> bool {
     !reason.starts_with("1000") && !reason.starts_with("1001") && !reason.starts_with("4004")
 }
 
+pub(crate) fn parse_guild_threads(container: &Value, guild_id: &str, members: Option<&Value>) -> Vec<Channel> {
+    let memberships: std::collections::HashMap<&str, &Value> = members
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|member| Some((member.get("id")?.as_str()?, member)))
+        .collect();
+    container
+        .get("threads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|raw| {
+            let mut raw = raw.clone();
+            let obj = raw.as_object_mut()?;
+            obj.entry("guild_id").or_insert_with(|| Value::String(guild_id.to_string()));
+            let thread_id = obj.get("id")?.as_str()?.to_string();
+            if let Some(member) = memberships.get(thread_id.as_str()) {
+                obj.entry("member").or_insert_with(|| (*member).clone());
+            }
+            serde_json::from_value(raw).ok()
+        })
+        .collect()
+}
+
 fn parse_initial_guild_channels(guilds: Option<&Value>) -> Vec<(String, Vec<crate::models::Channel>)> {
     let Some(guilds) = guilds.and_then(Value::as_array) else { return Vec::new() };
     let mut out = Vec::new();
@@ -683,7 +752,7 @@ fn parse_initial_guild_channels(guilds: Option<&Value>) -> Vec<(String, Vec<crat
         }
         let Some(id) = guild.get("id").and_then(Value::as_str) else { continue };
         let Some(raw) = guild.get("channels").and_then(Value::as_array) else { continue };
-        let channels: Vec<crate::models::Channel> = raw
+        let mut channels: Vec<crate::models::Channel> = raw
             .iter()
             .filter_map(|c| {
                 let mut c = c.clone();
@@ -693,6 +762,7 @@ fn parse_initial_guild_channels(guilds: Option<&Value>) -> Vec<(String, Vec<crat
                 serde_json::from_value(c).ok()
             })
             .collect();
+        channels.extend(parse_guild_threads(guild, id, None));
         if !channels.is_empty() {
             out.push((id.to_string(), channels));
         }
@@ -932,4 +1002,35 @@ mod tests {
         assert!(parse_read_state(Some(&json!("nonsense"))).is_empty());
         assert!(parse_read_state(Some(&json!({ "entries": 5 }))).is_empty());
     }
+
+    #[test]
+    fn guild_threads_take_the_guild_id_and_the_accounts_membership() {
+        let sync = serde_json::json!({
+            "guild_id": "g",
+            "threads": [
+                { "id": "t1", "type": 11, "parent_id": "c", "name": "Plans" },
+                { "id": "t2", "type": 11, "parent_id": "c", "name": "Other" }
+            ],
+            "members": [ { "id": "t1", "user_id": "me", "flags": 1 } ]
+        });
+        let threads = parse_guild_threads(&sync, "g", sync.get("members"));
+        assert_eq!(threads.len(), 2);
+        assert!(threads.iter().all(|t| t.guild_id.as_deref() == Some("g")));
+        assert!(threads[0].is_joined_thread());
+        assert!(!threads[1].is_joined_thread());
+    }
+
+    #[test]
+    fn ready_guilds_list_their_threads_with_their_channels() {
+        let guilds = serde_json::json!([{
+            "id": "g",
+            "channels": [ { "id": "c", "type": 0, "name": "general" } ],
+            "threads": [ { "id": "t1", "type": 11, "parent_id": "c", "name": "Plans", "member": { "flags": 1 } } ]
+        }]);
+        let seeded = parse_initial_guild_channels(Some(&guilds));
+        let ids: Vec<&str> = seeded[0].1.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["c", "t1"]);
+        assert!(seeded[0].1[1].is_joined_thread());
+    }
 }
+
