@@ -1,10 +1,32 @@
 use base64::Engine;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Serialize;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 pub const APP_NAME: &str = "Rustcord";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const RELEASE_CHANNEL: &str = match option_env!("RUSTCORD_RELEASE_CHANNEL") {
+    Some(channel) => channel,
+    None => "stable",
+};
+
+const HEARTBEAT_SESSION_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+fn heartbeat_session_id() -> String {
+    static SESSION: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    let mut session = SESSION.lock().unwrap_or_else(PoisonError::into_inner);
+    let (started, id) = session.get_or_insert_with(|| (Instant::now(), new_uuid()));
+    if started.elapsed() >= HEARTBEAT_SESSION_LIFETIME {
+        *started = Instant::now();
+        *id = new_uuid();
+    }
+    id.clone()
+}
+
+fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Runtime {
@@ -81,6 +103,7 @@ pub struct ClientIdentity {
     browser: String,
     user_agent: String,
     runtime: Runtime,
+    launch_id: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -96,6 +119,10 @@ pub struct SuperProperties<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os_version: Option<&'a str>,
     pub os_arch: &'a str,
+    pub release_channel: &'a str,
+    pub has_client_mods: bool,
+    pub client_launch_id: &'a str,
+    pub client_heartbeat_session_id: String,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -103,6 +130,10 @@ pub struct GatewayProperties<'a> {
     pub os: &'a str,
     pub browser: &'a str,
     pub device: &'a str,
+    pub release_channel: &'a str,
+    pub has_client_mods: bool,
+    pub client_launch_id: &'a str,
+    pub client_heartbeat_session_id: String,
 }
 
 impl ClientIdentity {
@@ -120,6 +151,7 @@ impl ClientIdentity {
             browser: APP_NAME.into(),
             user_agent,
             runtime,
+            launch_id: new_uuid(),
         }
     }
 
@@ -141,6 +173,10 @@ impl ClientIdentity {
             browser_version: product_version(&self.user_agent, &self.browser),
             os_version: self.runtime.os_version.as_deref(),
             os_arch: &self.runtime.arch,
+            release_channel: RELEASE_CHANNEL,
+            has_client_mods: false,
+            client_launch_id: &self.launch_id,
+            client_heartbeat_session_id: heartbeat_session_id(),
         }
     }
 
@@ -157,6 +193,10 @@ impl ClientIdentity {
             os: &self.runtime.os,
             browser: &self.browser,
             device: &self.browser,
+            release_channel: RELEASE_CHANNEL,
+            has_client_mods: false,
+            client_launch_id: &self.launch_id,
+            client_heartbeat_session_id: heartbeat_session_id(),
         }
     }
 
@@ -198,6 +238,7 @@ pub(crate) mod fixtures {
                 os_version: Some("10".into()),
                 locale: Some("en-US".into()),
             },
+            launch_id: "00000000-0000-4000-8000-000000000001".into(),
         }
     }
 
@@ -211,6 +252,7 @@ pub(crate) mod fixtures {
                 os_version: None,
                 locale: None,
             },
+            launch_id: "00000000-0000-4000-8000-000000000002".into(),
         }
     }
 }
@@ -337,8 +379,6 @@ mod tests {
             "system_locale",
             "os_version",
             "client_build_number",
-            "release_channel",
-            "has_client_mods",
             "launch_signature",
         ] {
             assert!(!keys.contains(&absent), "{absent} should not be sent");
@@ -350,11 +390,28 @@ mod tests {
     fn gateway_properties_share_the_runtime_os_and_name_rustcord() {
         let identity = ClientIdentity::rustcord(bare_runtime());
         let gateway = serde_json::to_value(identity.gateway_properties()).unwrap();
-        assert_eq!(
-            gateway,
-            serde_json::json!({ "os": "Linux", "browser": "Rustcord", "device": "Rustcord" })
-        );
-        assert_eq!(gateway["os"], decoded(&identity)["os"]);
+        assert_eq!(gateway["os"], "Linux");
+        assert_eq!(gateway["browser"], "Rustcord");
+        assert_eq!(gateway["device"], "Rustcord");
+        let rest = decoded(&identity);
+        for shared in ["os", "release_channel", "has_client_mods", "client_launch_id", "client_heartbeat_session_id"] {
+            assert_eq!(gateway[shared], rest[shared], "{shared}");
+        }
+    }
+
+    #[test]
+    fn telemetry_reports_one_launch_and_an_unmodified_client() {
+        let identity = ClientIdentity::rustcord(bare_runtime());
+        let json = decoded(&identity);
+        assert_eq!(json["release_channel"], RELEASE_CHANNEL);
+        assert_eq!(json["has_client_mods"], false);
+        let launch = json["client_launch_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(launch).is_ok());
+        assert_eq!(decoded(&identity)["client_launch_id"], launch);
+        assert_ne!(ClientIdentity::rustcord(bare_runtime()).launch_id, launch);
+        let session = json["client_heartbeat_session_id"].as_str().unwrap();
+        assert!(uuid::Uuid::parse_str(session).is_ok());
+        assert_eq!(heartbeat_session_id(), session);
     }
 
     #[test]

@@ -778,7 +778,9 @@ mod tests {
         assert_eq!(d["properties"]["browser"], "Rustcord");
         assert_eq!(d["properties"]["device"], "Rustcord");
         assert_eq!(d["properties"]["os"], ClientIdentity::current().runtime().os.as_str());
-        assert_eq!(d["properties"].as_object().unwrap().len(), 3);
+        let mut keys: Vec<&str> = d["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["browser", "client_heartbeat_session_id", "client_launch_id", "device", "has_client_mods", "os", "release_channel"]);
     }
 
     fn user_json(id: &str) -> Value {
