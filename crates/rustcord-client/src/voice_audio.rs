@@ -5,7 +5,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 1;
@@ -74,9 +73,127 @@ fn process_mic_frame(frame: &mut [i16], processing: &MicProcessing, denoiser: &m
     }
 }
 
+const OPUS_SILENCE: [u8; 3] = [0xf8, 0xff, 0xfe];
+const TRAILING_SILENCE_FRAMES: u32 = 5;
+const RING_CAPACITY: usize = SAMPLE_RATE as usize / 5;
+const PLAYOUT_QUEUE_FRAMES: usize = 3;
+const QUIET_RMS: f64 = 103.6;
+const MIXER_WAKE: std::time::Duration = std::time::Duration::from_millis(5);
+
+pub(crate) fn raise_thread_priority(thread: &str, priority: i32) {
+    if std::env::var_os("RUSTCORD_VOICE_NO_PRIORITY").is_some() {
+        tracing::info!(thread, "voice: audio thread stays at normal priority (RUSTCORD_VOICE_NO_PRIORITY)");
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let param = libc::sched_param { sched_priority: priority };
+        let rc = unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
+        if rc == 0 {
+            tracing::info!(thread, priority, "voice: audio thread raised to real-time priority");
+        } else {
+            tracing::info!(thread, error = %std::io::Error::from_raw_os_error(rc), "voice: audio thread stays at normal priority");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = priority;
+        tracing::debug!(thread, "voice: raising audio thread priority is not implemented on this platform");
+    }
+}
+
+pub enum MicAudio {
+    Voice(Vec<i16>),
+    Silence,
+}
+
+impl MicAudio {
+    pub fn opus(&self, codec: &AudioCodec) -> Result<Vec<u8>, ClientError> {
+        match self {
+            MicAudio::Voice(pcm) => codec.encode(pcm),
+            MicAudio::Silence => Ok(OPUS_SILENCE.to_vec()),
+        }
+    }
+
+    pub fn is_silence(&self) -> bool {
+        matches!(self, MicAudio::Silence)
+    }
+}
+
+pub struct MicFrame {
+    pub audio: MicAudio,
+    pub frames_since_last: Option<u32>,
+}
+
+struct VoiceGate {
+    hang_remaining: u32,
+    open: bool,
+    trailing_silence: u32,
+    skipped: u32,
+    sent_any: bool,
+}
+
+impl VoiceGate {
+    const THRESHOLD: f64 = 200.0;
+    const HANG_FRAMES: u32 = 15;
+
+    fn new() -> Self {
+        Self { hang_remaining: 0, open: false, trailing_silence: 0, skipped: 0, sent_any: false }
+    }
+
+    fn passes(&mut self, frame: Option<&[i16]>) -> bool {
+        let Some(frame) = frame else {
+            self.hang_remaining = 0;
+            return false;
+        };
+        if rms(frame) >= Self::THRESHOLD {
+            self.hang_remaining = Self::HANG_FRAMES;
+            true
+        } else if self.hang_remaining > 0 {
+            self.hang_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn next(&mut self, frame: Option<Vec<i16>>) -> Option<MicFrame> {
+        let audio = if self.passes(frame.as_deref()) {
+            self.open = true;
+            self.trailing_silence = 0;
+            MicAudio::Voice(frame.unwrap_or_default())
+        } else {
+            if self.open {
+                self.open = false;
+                self.trailing_silence = TRAILING_SILENCE_FRAMES;
+            }
+            if self.trailing_silence == 0 {
+                self.skipped = self.skipped.saturating_add(1);
+                return None;
+            }
+            self.trailing_silence -= 1;
+            MicAudio::Silence
+        };
+        let frames_since_last = self.sent_any.then_some(self.skipped + 1);
+        self.sent_any = true;
+        self.skipped = 0;
+        Some(MicFrame { audio, frames_since_last })
+    }
+}
+
+fn rms(frame: &[i16]) -> f64 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: i64 = frame.iter().map(|&s| i64::from(s) * i64::from(s)).sum();
+    (sum_sq as f64 / frame.len() as f64).sqrt()
+}
+
 pub struct MicCapture {
     _stream: cpal::Stream,
     pub muted: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    worker: std::thread::Thread,
 }
 
 impl MicCapture {
@@ -84,54 +201,75 @@ impl MicCapture {
         device_name: Option<&str>,
         muted: Arc<AtomicBool>,
         processing: MicProcessing,
-        mut on_frame: impl FnMut(Vec<i16>) + Send + 'static,
+        mut on_frame: impl FnMut(MicFrame) + Send + 'static,
     ) -> Result<Self, ClientError> {
         let host = audio_host();
         let device = find_device(&host, device_name, true)
             .ok_or_else(|| ClientError::GatewayClosed("voice audio: no input device available".into()))?;
 
         let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
+        let (mut producer, mut consumer) = rtrb::RingBuffer::<i16>::new(RING_CAPACITY);
+        let stop = Arc::new(AtomicBool::new(false));
 
-        let muted_cb = muted.clone();
-        let mut pending: Vec<i16> = Vec::with_capacity(FRAME_SAMPLES);
-
-        const GATE_THRESHOLD: i64 = 200;
-        const GATE_HANG_FRAMES: u32 = 15;
-        let mut gate_hang_remaining: u32 = 0;
-        let mut denoiser: Option<Box<nnnoiseless::DenoiseState<'static>>> = None;
+        let worker = {
+            let stop = stop.clone();
+            let muted = muted.clone();
+            std::thread::Builder::new()
+                .name("rustcord-voice-mic".into())
+                .spawn(move || {
+                    raise_thread_priority("microphone", 9);
+                    let mut gate = VoiceGate::new();
+                    let mut denoiser: Option<Box<nnnoiseless::DenoiseState<'static>>> = None;
+                    while !stop.load(Ordering::Relaxed) {
+                        let Ok(chunk) = consumer.read_chunk(FRAME_SAMPLES) else {
+                            std::thread::park_timeout(std::time::Duration::from_millis(20));
+                            continue;
+                        };
+                        let (head, tail) = chunk.as_slices();
+                        let mut frame = Vec::with_capacity(FRAME_SAMPLES);
+                        frame.extend_from_slice(head);
+                        frame.extend_from_slice(tail);
+                        chunk.commit_all();
+                        let frame = if muted.load(Ordering::Relaxed) {
+                            None
+                        } else {
+                            process_mic_frame(&mut frame, &processing, &mut denoiser);
+                            Some(frame)
+                        };
+                        if let Some(out) = gate.next(frame) {
+                            on_frame(out);
+                        }
+                    }
+                })
+                .map_err(|e| ClientError::GatewayClosed(format!("voice audio: failed to start microphone thread: {e}")))?
+                .thread()
+                .clone()
+        };
 
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: input stream error: {e}");
+        let wake = worker.clone();
         let stream = device
             .build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    if muted_cb.load(Ordering::Relaxed) {
-                        return;
+                    let (written, _) = producer.push_partial_slice(data);
+                    if written.len() < data.len() {
+                        tracing::trace!("voice audio: microphone ring full, dropped {} samples", data.len() - written.len());
                     }
-                    pending.extend_from_slice(data);
-                    while pending.len() >= FRAME_SAMPLES {
-                        let mut frame: Vec<i16> = pending.drain(..FRAME_SAMPLES).collect();
-                        process_mic_frame(&mut frame, &processing, &mut denoiser);
-                        let sum_sq: i64 = frame.iter().map(|&s| (s as i64) * (s as i64)).sum();
-                        let rms = ((sum_sq / frame.len() as i64) as f64).sqrt() as i64;
-                        if rms >= GATE_THRESHOLD {
-                            gate_hang_remaining = GATE_HANG_FRAMES;
-                        } else if gate_hang_remaining > 0 {
-                            gate_hang_remaining -= 1;
-                        } else {
-                            continue;
-                        }
-                        on_frame(frame);
-                    }
+                    wake.unpark();
                 },
                 err_fn,
                 None,
             )
             .map_err(|e| ClientError::GatewayClosed(format!("voice audio: build_input_stream failed: {e}")))?;
 
-        stream.play().map_err(|e| ClientError::GatewayClosed(format!("voice audio: stream play failed: {e}")))?;
+        if let Err(e) = stream.play() {
+            stop.store(true, Ordering::Relaxed);
+            worker.unpark();
+            return Err(ClientError::GatewayClosed(format!("voice audio: stream play failed: {e}")));
+        }
 
-        Ok(Self { _stream: stream, muted })
+        Ok(Self { _stream: stream, muted, stop, worker })
     }
 
     pub fn set_muted(&self, muted: bool) {
@@ -139,9 +277,157 @@ impl MicCapture {
     }
 }
 
+impl Drop for MicCapture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.worker.unpark();
+    }
+}
+
+enum PlayoutCommand {
+    Packet { ssrc: u32, timestamp: u32, payload: Vec<u8>, gain: f32 },
+    Forget(u32),
+}
+
+struct RemoteSpeaker {
+    jitter: crate::voice_playout::JitterBuffer,
+    decoder: OpusDecoder,
+}
+
+impl RemoteSpeaker {
+    fn new() -> Option<Self> {
+        let channels = if CHANNELS == 2 { Channels::Stereo } else { Channels::Mono };
+        match OpusDecoder::new(SampleRate::Hz48000, channels) {
+            Ok(decoder) => Some(Self { jitter: Default::default(), decoder }),
+            Err(e) => {
+                tracing::warn!("voice audio: opus decoder init failed: {e}");
+                None
+            }
+        }
+    }
+
+    fn decode(&mut self, payload: Option<&[u8]>, fec: bool, out: &mut [i16]) -> bool {
+        let packet = match payload.map(audiopus::packet::Packet::try_from).transpose() {
+            Ok(packet) => packet,
+            Err(e) => {
+                tracing::debug!("voice audio: invalid opus packet: {e}");
+                return false;
+            }
+        };
+        let Ok(signals) = audiopus::MutSignals::try_from(&mut *out) else { return false };
+        match self.decoder.decode(packet, signals, fec) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!("voice audio: opus decode failed: {e}");
+                false
+            }
+        }
+    }
+
+    fn mix_into(&mut self, mix: &mut [i32], scratch: &mut [i16], now: std::time::Instant) {
+        use crate::voice_playout::{Playout, Skip};
+        let mut playout = self.jitter.tick(now);
+        let gain = loop {
+            match playout {
+                Playout::Idle => return,
+                Playout::Decode { payload, gain } => {
+                    if !self.decode(Some(&payload), false, scratch) {
+                        return;
+                    }
+                    let skip = self.jitter.skip();
+                    if skip == Skip::Always || (skip == Skip::IfQuiet && rms(scratch) < QUIET_RMS) {
+                        self.jitter.skipped();
+                        let following = self.jitter.tick(now);
+                        if following != Playout::Idle {
+                            playout = following;
+                            continue;
+                        }
+                    }
+                    break gain;
+                }
+                Playout::Recover { next_payload, gain } => {
+                    if !self.decode(Some(&next_payload), true, scratch) {
+                        return;
+                    }
+                    break gain;
+                }
+                Playout::Conceal { gain } => {
+                    if !self.decode(None, false, scratch) {
+                        return;
+                    }
+                    break gain;
+                }
+            }
+        };
+        for (acc, &sample) in mix.iter_mut().zip(scratch.iter()) {
+            *acc += if gain == 1.0 { i32::from(sample) } else { (f32::from(sample) * gain) as i32 };
+        }
+    }
+}
+
+fn run_mixer(
+    commands: std::sync::mpsc::Receiver<PlayoutCommand>,
+    mut producer: rtrb::Producer<i16>,
+    deafened: Arc<AtomicBool>,
+    device_request: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    raise_thread_priority("speakers", 10);
+    let mut speakers: std::collections::HashMap<u32, RemoteSpeaker> = std::collections::HashMap::new();
+    let mut mix = vec![0i32; FRAME_SAMPLES];
+    let mut scratch = vec![0i16; FRAME_SAMPLES];
+    let mut frame = vec![0i16; FRAME_SAMPLES];
+    loop {
+        let first = match commands.recv_timeout(MIXER_WAKE) {
+            Ok(command) => Some(command),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let deaf = deafened.load(Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        for command in first.into_iter().chain(std::iter::from_fn(|| commands.try_recv().ok())) {
+            match command {
+                PlayoutCommand::Packet { ssrc, timestamp, payload, gain } => {
+                    if deaf {
+                        continue;
+                    }
+                    if !speakers.contains_key(&ssrc) {
+                        let Some(speaker) = RemoteSpeaker::new() else { continue };
+                        speakers.insert(ssrc, speaker);
+                    }
+                    if let Some(speaker) = speakers.get_mut(&ssrc) {
+                        speaker.jitter.push(timestamp, payload, gain, now);
+                    }
+                }
+                PlayoutCommand::Forget(ssrc) => {
+                    speakers.remove(&ssrc);
+                }
+            }
+        }
+        if deaf {
+            speakers.values_mut().for_each(|speaker| speaker.jitter.reset());
+        }
+
+        let target = (PLAYOUT_QUEUE_FRAMES * FRAME_SAMPLES).max(device_request.load(Ordering::Relaxed) + FRAME_SAMPLES).min(RING_CAPACITY);
+        while producer.slots() >= FRAME_SAMPLES && RING_CAPACITY - producer.slots() < target {
+            mix.fill(0);
+            if !deaf {
+                for speaker in speakers.values_mut() {
+                    speaker.mix_into(&mut mix, &mut scratch, now);
+                }
+            }
+            for (out, &sample) in frame.iter_mut().zip(mix.iter()) {
+                *out = sample.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            }
+            if producer.push_entire_slice(&frame).is_err() {
+                break;
+            }
+        }
+    }
+}
+
 pub struct SpeakerPlayback {
     _stream: cpal::Stream,
-    tx: mpsc::UnboundedSender<(u32, Vec<i16>)>,
+    commands: std::sync::mpsc::Sender<PlayoutCommand>,
     pub deafened: Arc<AtomicBool>,
 }
 
@@ -152,49 +438,28 @@ impl SpeakerPlayback {
             .ok_or_else(|| ClientError::GatewayClosed("voice audio: no output device available".into()))?;
 
         let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
+        let (producer, mut consumer) = rtrb::RingBuffer::<i16>::new(RING_CAPACITY);
+        let (commands, command_rx) = std::sync::mpsc::channel();
+        let device_request = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<(u32, Vec<i16>)>();
-        let deafened_cb = deafened.clone();
-        let mut pending: std::collections::HashMap<u32, std::collections::VecDeque<i16>> = std::collections::HashMap::new();
-        let mut primed: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        const PREBUFFER_SAMPLES: usize = FRAME_SAMPLES * CHANNELS as usize * 2;
-        const MAX_QUEUED_SAMPLES: usize = SAMPLE_RATE as usize * CHANNELS as usize / 5;
+        {
+            let deafened = deafened.clone();
+            let device_request = device_request.clone();
+            std::thread::Builder::new()
+                .name("rustcord-voice-speakers".into())
+                .spawn(move || run_mixer(command_rx, producer, deafened, device_request))
+                .map_err(|e| ClientError::GatewayClosed(format!("voice audio: failed to start speaker thread: {e}")))?;
+        }
 
         let err_fn = |e: cpal::Error| tracing::warn!("voice audio: output stream error: {e}");
         let stream = device
             .build_output_stream(
                 config,
                 move |out: &mut [i16], _| {
-                    if deafened_cb.load(Ordering::Relaxed) {
-                        out.fill(0);
-                        return;
-                    }
-                    while let Ok((ssrc, frame)) = rx.try_recv() {
-                        let queue = pending.entry(ssrc).or_default();
-                        queue.extend(frame);
-                        if queue.len() > MAX_QUEUED_SAMPLES {
-                            let drop = queue.len() - MAX_QUEUED_SAMPLES;
-                            queue.drain(..drop);
-                        }
-                    }
-                    out.fill(0);
-                    for (ssrc, queue) in pending.iter_mut() {
-                        if !primed.contains(ssrc) {
-                            if queue.len() < PREBUFFER_SAMPLES {
-                                continue;
-                            }
-                            primed.insert(*ssrc);
-                        }
-                        if queue.is_empty() {
-                            primed.remove(ssrc);
-                            continue;
-                        }
-                        for sample in out.iter_mut() {
-                            let Some(mixed) = queue.pop_front() else { break };
-                            *sample = sample.saturating_add(mixed);
-                        }
-                    }
-                    pending.retain(|_, queue| !queue.is_empty());
+                    device_request.fetch_max(out.len(), Ordering::Relaxed);
+                    let (filled, _) = consumer.pop_partial_slice(out);
+                    let filled = filled.len();
+                    out[filled..].fill(0);
                 },
                 err_fn,
                 None,
@@ -203,11 +468,15 @@ impl SpeakerPlayback {
 
         stream.play().map_err(|e| ClientError::GatewayClosed(format!("voice audio: stream play failed: {e}")))?;
 
-        Ok(Self { _stream: stream, tx, deafened })
+        Ok(Self { _stream: stream, commands, deafened })
     }
 
-    pub fn push_frame(&self, ssrc: u32, pcm: Vec<i16>) {
-        let _ = self.tx.send((ssrc, pcm));
+    pub fn push_packet(&self, ssrc: u32, timestamp: u32, payload: Vec<u8>, gain: f32) {
+        let _ = self.commands.send(PlayoutCommand::Packet { ssrc, timestamp, payload, gain });
+    }
+
+    pub fn forget(&self, ssrc: u32) {
+        let _ = self.commands.send(PlayoutCommand::Forget(ssrc));
     }
 
     pub fn set_deafened(&self, deafened: bool) {
@@ -215,18 +484,53 @@ impl SpeakerPlayback {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioProfile {
+    Voice,
+    StreamSound,
+}
+
+const OPUS_BITRATE_BPS: i32 = 64_000;
+const MIN_EXPECTED_LOSS_PCT: u8 = 5;
+const MAX_EXPECTED_LOSS_PCT: u8 = 30;
+
 pub struct AudioCodec {
     encoder: OpusEncoder,
-    decoders: std::collections::HashMap<u32, OpusDecoder>,
-    last_decode: std::collections::HashMap<u32, std::time::Instant>,
+    expected_loss_pct: u8,
+    last_seen: std::collections::HashMap<u32, std::time::Instant>,
 }
 
 impl AudioCodec {
-    pub fn new() -> Result<Self, ClientError> {
+    pub fn new(profile: AudioProfile) -> Result<Self, ClientError> {
         let channels = if CHANNELS == 2 { Channels::Stereo } else { Channels::Mono };
-        let encoder = OpusEncoder::new(SampleRate::Hz48000, channels, Application::Voip)
-            .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus encoder init failed: {e}")))?;
-        Ok(Self { encoder, decoders: std::collections::HashMap::new(), last_decode: std::collections::HashMap::new() })
+        let application = match profile {
+            AudioProfile::Voice => Application::Voip,
+            AudioProfile::StreamSound => Application::Audio,
+        };
+        let opus_error = |e: audiopus::Error| ClientError::GatewayClosed(format!("voice audio: opus encoder setup failed: {e}"));
+        let mut encoder = OpusEncoder::new(SampleRate::Hz48000, channels, application).map_err(opus_error)?;
+        encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(OPUS_BITRATE_BPS)).map_err(opus_error)?;
+        encoder.set_inband_fec(true).map_err(opus_error)?;
+        encoder.set_packet_loss_perc(MIN_EXPECTED_LOSS_PCT).map_err(opus_error)?;
+        Ok(Self { encoder, expected_loss_pct: MIN_EXPECTED_LOSS_PCT, last_seen: std::collections::HashMap::new() })
+    }
+
+    pub fn set_measured_loss(&mut self, loss_pct: Option<f32>) {
+        let target = loss_pct
+            .filter(|pct| pct.is_finite())
+            .map(|pct| pct.ceil().clamp(f32::from(MIN_EXPECTED_LOSS_PCT), f32::from(MAX_EXPECTED_LOSS_PCT)) as u8)
+            .unwrap_or(MIN_EXPECTED_LOSS_PCT);
+        if target == self.expected_loss_pct {
+            return;
+        }
+        match self.encoder.set_packet_loss_perc(target) {
+            Ok(()) => self.expected_loss_pct = target,
+            Err(e) => tracing::debug!("voice audio: failed to update opus expected loss: {e}"),
+        }
+    }
+
+    pub fn expected_loss_pct(&self) -> u8 {
+        self.expected_loss_pct
     }
 
     pub fn encode(&self, pcm: &[i16]) -> Result<Vec<u8>, ClientError> {
@@ -238,41 +542,21 @@ impl AudioCodec {
         Ok(out[..len].to_vec())
     }
 
-    pub fn decode(&mut self, ssrc: u32, opus: &[u8]) -> Result<Vec<i16>, ClientError> {
-        let channels = if CHANNELS == 2 { Channels::Stereo } else { Channels::Mono };
-        let decoder = match self.decoders.entry(ssrc) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let decoder = OpusDecoder::new(SampleRate::Hz48000, channels)
-                    .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus decoder init failed: {e}")))?;
-                entry.insert(decoder)
-            }
-        };
-        self.last_decode.insert(ssrc, std::time::Instant::now());
-        let mut out = vec![0i16; FRAME_SAMPLES * CHANNELS as usize];
-        let packet: audiopus::packet::Packet =
-            opus.try_into().map_err(|e| ClientError::GatewayClosed(format!("voice audio: invalid opus packet: {e}")))?;
-        let signals: audiopus::MutSignals<i16> =
-            out.as_mut_slice().try_into().map_err(|e| ClientError::GatewayClosed(format!("voice audio: invalid output buffer: {e}")))?;
-        let samples = decoder
-            .decode(Some(packet), signals, false)
-            .map_err(|e| ClientError::GatewayClosed(format!("voice audio: opus decode failed: {e}")))?;
-        out.truncate(samples * CHANNELS as usize);
-        Ok(out)
+    pub fn note_packet(&mut self, ssrc: u32) {
+        self.last_seen.insert(ssrc, std::time::Instant::now());
     }
 
     pub fn track_ssrc(&mut self, ssrc: u32) {
-        self.last_decode.entry(ssrc).or_insert_with(std::time::Instant::now);
+        self.last_seen.entry(ssrc).or_insert_with(std::time::Instant::now);
     }
 
     pub fn drop_ssrc(&mut self, ssrc: u32) {
-        self.decoders.remove(&ssrc);
-        self.last_decode.remove(&ssrc);
+        self.last_seen.remove(&ssrc);
     }
 
     pub fn idle_ssrcs(&self, idle_for: std::time::Duration) -> Vec<u32> {
         let now = std::time::Instant::now();
-        self.last_decode
+        self.last_seen
             .iter()
             .filter(|(_, seen)| now.duration_since(**seen) > idle_for)
             .map(|(ssrc, _)| *ssrc)
@@ -475,4 +759,113 @@ pub fn play_ding(join: bool, device_name: Option<String>) {
             std::thread::sleep(std::time::Duration::from_millis(400));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loud() -> Option<Vec<i16>> {
+        Some(vec![4000; FRAME_SAMPLES])
+    }
+
+    fn quiet() -> Option<Vec<i16>> {
+        Some(vec![0; FRAME_SAMPLES])
+    }
+
+    fn sent(gate: &mut VoiceGate, frame: Option<Vec<i16>>) -> Option<(bool, Option<u32>)> {
+        gate.next(frame).map(|out| (out.audio.is_silence(), out.frames_since_last))
+    }
+
+    #[test]
+    fn the_first_frame_has_no_clock_to_follow() {
+        let mut gate = VoiceGate::new();
+        for _ in 0..10 {
+            assert!(sent(&mut gate, quiet()).is_none());
+        }
+        assert_eq!(sent(&mut gate, loud()), Some((false, None)));
+        assert_eq!(sent(&mut gate, loud()), Some((false, Some(1))));
+    }
+
+    #[test]
+    fn closing_the_gate_sends_five_silence_frames_then_counts_the_pause() {
+        let mut gate = VoiceGate::new();
+        sent(&mut gate, loud());
+        for _ in 0..VoiceGate::HANG_FRAMES {
+            assert_eq!(sent(&mut gate, quiet()), Some((false, Some(1))));
+        }
+        for _ in 0..TRAILING_SILENCE_FRAMES {
+            assert_eq!(sent(&mut gate, quiet()), Some((true, Some(1))));
+        }
+        for _ in 0..40 {
+            assert!(sent(&mut gate, quiet()).is_none());
+        }
+        assert_eq!(sent(&mut gate, loud()), Some((false, Some(41))));
+    }
+
+    #[test]
+    fn muting_closes_the_gate_at_once() {
+        let mut gate = VoiceGate::new();
+        sent(&mut gate, loud());
+        assert_eq!(sent(&mut gate, None), Some((true, Some(1))));
+        for _ in 1..TRAILING_SILENCE_FRAMES {
+            assert_eq!(sent(&mut gate, None), Some((true, Some(1))));
+        }
+        assert!(sent(&mut gate, None).is_none());
+        assert!(sent(&mut gate, None).is_none());
+        assert_eq!(sent(&mut gate, loud()), Some((false, Some(3))));
+    }
+
+    #[test]
+    fn real_opus_plays_through_loss_and_concealment() {
+        let codec = AudioCodec::new(AudioProfile::Voice).unwrap();
+        let tone: Vec<i16> = (0..FRAME_SAMPLES).map(|i| ((i as f32 * 0.07).sin() * 8000.0) as i16).collect();
+        let packets: Vec<Vec<u8>> = (0..6).map(|_| codec.encode(&tone).unwrap()).collect();
+        let mut speaker = RemoteSpeaker::new().unwrap();
+        let now = std::time::Instant::now();
+        for (n, packet) in packets.iter().enumerate() {
+            if n != 2 {
+                speaker.jitter.push(n as u32 * 960, packet.clone(), 0.5, now);
+            }
+        }
+        let mut scratch = vec![0i16; FRAME_SAMPLES];
+        for tick in 0..9 {
+            let mut mix = vec![0i32; FRAME_SAMPLES];
+            speaker.mix_into(&mut mix, &mut scratch, now);
+            let peak = mix.iter().map(|s| s.unsigned_abs()).max().unwrap();
+            assert!(peak <= 6000, "tick {tick}: gain not applied, peak {peak}");
+            if (1..6).contains(&tick) {
+                assert!(peak > 500, "tick {tick}: expected audible audio, peak {peak}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_encoder_follows_measured_uplink_loss_within_bounds() {
+        let mut codec = AudioCodec::new(AudioProfile::Voice).unwrap();
+        assert_eq!(codec.expected_loss_pct(), MIN_EXPECTED_LOSS_PCT);
+        codec.set_measured_loss(Some(12.2));
+        assert_eq!(codec.expected_loss_pct(), 13);
+        codec.set_measured_loss(Some(80.0));
+        assert_eq!(codec.expected_loss_pct(), MAX_EXPECTED_LOSS_PCT);
+        codec.set_measured_loss(Some(f32::NAN));
+        assert_eq!(codec.expected_loss_pct(), MIN_EXPECTED_LOSS_PCT);
+        codec.set_measured_loss(None);
+        assert_eq!(codec.expected_loss_pct(), MIN_EXPECTED_LOSS_PCT);
+    }
+
+    #[test]
+    fn voice_packets_carry_fec_that_recovers_a_lost_frame() {
+        let mut codec = AudioCodec::new(AudioProfile::Voice).unwrap();
+        codec.set_measured_loss(Some(20.0));
+        let tone: Vec<i16> = (0..FRAME_SAMPLES).map(|i| ((i as f32 * 0.05).sin() * 6000.0) as i16).collect();
+        let packets: Vec<Vec<u8>> = (0..10).map(|_| codec.encode(&tone).unwrap()).collect();
+        let mut speaker = RemoteSpeaker::new().unwrap();
+        let mut out = vec![0i16; FRAME_SAMPLES];
+        for packet in &packets[..8] {
+            assert!(speaker.decode(Some(packet), false, &mut out));
+        }
+        assert!(speaker.decode(Some(&packets[9]), true, &mut out));
+        assert!(rms(&out) > 1000.0, "fec frame should carry the tone, rms {}", rms(&out));
+    }
 }

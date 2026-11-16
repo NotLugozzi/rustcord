@@ -459,6 +459,60 @@ pub struct Channel {
     pub icon: Option<String>,
     #[serde(default)]
     pub permission_overwrites: Vec<PermissionOverwrite>,
+    #[serde(flatten)]
+    pub thread: ThreadFields,
+}
+
+impl Channel {
+    pub fn is_thread(&self) -> bool {
+        matches!(self.kind, ChannelType::GuildAnnouncementThread | ChannelType::GuildPublicThread | ChannelType::GuildPrivateThread)
+    }
+
+    pub fn is_joined_thread(&self) -> bool {
+        self.is_thread() && self.thread.member.is_some()
+    }
+
+    pub fn is_archived_thread(&self) -> bool {
+        self.thread.thread_metadata.as_ref().is_some_and(|meta| meta.archived)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ThreadFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_metadata: Option<ThreadMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<Snowflake>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<ThreadMember>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_auto_archive_duration: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ThreadMetadata {
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub auto_archive_duration: Option<u32>,
+    #[serde(default)]
+    pub archive_timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ThreadMember {
+    #[serde(default)]
+    pub join_timestamp: Option<String>,
+    #[serde(default)]
+    pub flags: u64,
+    #[serde(default)]
+    pub muted: bool,
 }
 
 fn deserialize_permissions_bits<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
@@ -637,6 +691,8 @@ pub struct Message {
     pub flags: u64,
     #[serde(default)]
     pub message_snapshots: Vec<MessageSnapshot>,
+    #[serde(default)]
+    pub thread: Option<Box<Channel>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1343,3 +1399,45 @@ mod poll_tests {
         assert_eq!((payload["duration"].as_u64(), payload["allow_multiselect"].as_bool()), (Some(24), Some(true)));
     }
 }
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    #[test]
+    fn a_joined_thread_parses_with_its_metadata_and_membership() {
+        let channel: Channel = serde_json::from_value(serde_json::json!({
+            "id": "t1", "type": 11, "guild_id": "g", "parent_id": "c", "name": "Plans",
+            "owner_id": "u", "message_count": 4, "member_count": 2,
+            "thread_metadata": { "archived": false, "locked": false, "auto_archive_duration": 4320, "archive_timestamp": "2026-11-08T12:00:00+00:00" },
+            "member": { "join_timestamp": "2026-11-08T12:00:00+00:00", "flags": 1 }
+        }))
+        .unwrap();
+        assert!(channel.is_thread());
+        assert!(channel.is_joined_thread());
+        assert!(!channel.is_archived_thread());
+        assert_eq!(channel.thread.message_count, Some(4));
+        assert_eq!(channel.parent_id.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn an_ordinary_channel_has_no_thread_fields() {
+        let channel: Channel = serde_json::from_value(serde_json::json!({ "id": "c", "type": 0, "name": "general" })).unwrap();
+        assert!(!channel.is_thread());
+        assert!(channel.thread.thread_metadata.is_none());
+        let json = serde_json::to_value(&channel).unwrap();
+        assert!(json.get("thread_metadata").is_none());
+    }
+
+    #[test]
+    fn a_message_that_started_a_thread_carries_it() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "m", "channel_id": "c", "content": "hi", "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null,
+            "author": { "id": "u", "username": "u", "discriminator": "0" },
+            "thread": { "id": "t1", "type": 11, "parent_id": "c", "name": "Plans", "message_count": 3 }
+        }))
+        .unwrap();
+        assert_eq!(message.thread.as_ref().map(|t| t.id.as_str()), Some("t1"));
+    }
+}
+

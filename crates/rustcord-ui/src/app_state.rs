@@ -18,6 +18,8 @@ fn merge_read_state(
     advanced
 }
 
+const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
+
 fn snowflake_value(id: &str) -> u64 {
     id.parse().unwrap_or(0)
 }
@@ -685,6 +687,8 @@ pub struct AppState {
     pub voice_recording: Option<VoiceRecording>,
     pub voice_messages_sending: std::collections::HashSet<String>,
     pub forward_dialog: Option<ForwardDialog>,
+    pub thread_form: Option<ThreadForm>,
+    pub thread_browser: Option<ThreadBrowser>,
 }
 
 pub enum VoiceClip {
@@ -721,6 +725,117 @@ impl VoiceRecording {
 
 const RECORDING_LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 const RECORDING_LEVEL_HISTORY: usize = 160;
+
+pub struct ThreadBrowser {
+    pub channel_id: String,
+    pub archived: Vec<Channel>,
+    pub loading: bool,
+    pub has_more: bool,
+    pub indexing: bool,
+}
+
+impl ThreadBrowser {
+    pub fn new(channel_id: String) -> Self {
+        Self { channel_id, archived: Vec::new(), loading: true, has_more: false, indexing: false }
+    }
+}
+
+pub struct ThreadBrowserLists {
+    pub joined: Vec<Channel>,
+    pub active: Vec<Channel>,
+    pub archived: Vec<Channel>,
+}
+
+pub struct ThreadForm {
+    pub channel_id: String,
+    pub parent_kind: ChannelType,
+    pub auto_archive_minutes: u32,
+    pub message_id: Option<String>,
+    pub message_preview: Option<String>,
+    pub default_name: String,
+    pub name: String,
+    pub private: bool,
+    pub starter: String,
+    pub error: Option<String>,
+}
+
+pub const THREAD_NAME_LIMIT: usize = 100;
+const DEFAULT_THREAD_NAME_CHARS: usize = 40;
+const DEFAULT_AUTO_ARCHIVE_MINUTES: u32 = 4320;
+
+impl ThreadForm {
+    pub fn new(parent: &Channel, message: Option<&Message>) -> Self {
+        Self {
+            channel_id: parent.id.clone(),
+            parent_kind: parent.kind,
+            auto_archive_minutes: parent.thread.default_auto_archive_duration.unwrap_or(DEFAULT_AUTO_ARCHIVE_MINUTES),
+            message_id: message.map(|m| m.id.clone()),
+            message_preview: message.map(|m| m.content.chars().take(200).collect()),
+            default_name: message.map(default_thread_name).unwrap_or_default(),
+            name: String::new(),
+            private: false,
+            starter: String::new(),
+            error: None,
+        }
+    }
+
+    pub fn allows_private(&self) -> bool {
+        self.message_id.is_none() && self.parent_kind == ChannelType::GuildText
+    }
+
+    pub fn thread_kind(&self) -> ChannelType {
+        match (self.parent_kind, self.private && self.allows_private()) {
+            (ChannelType::GuildAnnouncement, _) => ChannelType::GuildAnnouncementThread,
+            (_, true) => ChannelType::GuildPrivateThread,
+            (_, false) => ChannelType::GuildPublicThread,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(String, Option<String>), &'static str> {
+        let name = self.name.trim();
+        let name = if name.is_empty() { self.default_name.as_str() } else { name };
+        if name.is_empty() {
+            return Err("Thread Name is required");
+        }
+        let starter = self.starter.trim();
+        if self.message_id.is_none() && starter.is_empty() {
+            return Err("Starter Message is required");
+        }
+        let name: String = name.chars().take(THREAD_NAME_LIMIT).collect();
+        Ok((name, (!starter.is_empty()).then(|| starter.to_string())))
+    }
+}
+
+pub fn default_thread_name(message: &Message) -> String {
+    if let Some(title) = message.embeds.iter().find_map(|embed| embed.title.as_deref()).map(str::trim).filter(|t| !t.is_empty()) {
+        return title.chars().take(THREAD_NAME_LIMIT).collect();
+    }
+    let first_line = message
+        .content
+        .lines()
+        .map(|line| line.trim_start_matches(['#', '-', ' ', '\t']).trim_end())
+        .find(|line| !line.is_empty());
+    let Some(line) = first_line else { return "Thread".into() };
+    if line.chars().count() <= DEFAULT_THREAD_NAME_CHARS {
+        return line.to_string();
+    }
+    let mut name = String::new();
+    for word in line.split_whitespace() {
+        let extra = if name.is_empty() { 0 } else { 1 };
+        if name.chars().count() + extra + word.chars().count() > DEFAULT_THREAD_NAME_CHARS {
+            break;
+        }
+        if extra == 1 {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
+    if name.is_empty() {
+        name = line.chars().take(DEFAULT_THREAD_NAME_CHARS).collect();
+    }
+    name.push_str("...");
+    name
+}
 
 pub struct ForwardDialog {
     pub source: rustcord_client::models::MessageReference,
@@ -1262,6 +1377,9 @@ impl AppState {
             if let Some(channels) = self.guild_channels.get_mut(guild_id) {
                 if let Some(channel) = channels.iter_mut().find(|c| c.id == message.channel_id) {
                     channel.last_message_id = Some(message.id.clone());
+                    if channel.is_thread() {
+                        channel.thread.message_count = Some(channel.thread.message_count.unwrap_or(0) + 1);
+                    }
                 }
             }
         }
@@ -1314,12 +1432,17 @@ impl AppState {
         advanced
     }
 
-    pub fn upsert_channel(&mut self, channel: Channel) {
+    pub fn upsert_channel(&mut self, mut channel: Channel) {
         match channel.guild_id.clone() {
             Some(guild_id) => {
                 let channels = self.guild_channels.entry(guild_id).or_default();
                 match channels.iter_mut().find(|c| c.id == channel.id) {
-                    Some(existing) => *existing = channel,
+                    Some(existing) => {
+                        if channel.is_thread() && channel.thread.member.is_none() {
+                            channel.thread.member = existing.thread.member.take();
+                        }
+                        *existing = channel;
+                    }
                     None => channels.push(channel),
                 }
             }
@@ -1490,6 +1613,140 @@ impl AppState {
         self.color_for_roles(guild_id, &member.roles)
     }
 
+    pub fn replace_guild_channels(&mut self, guild_id: String, mut channels: Vec<Channel>) {
+        if let Some(previous) = self.guild_channels.remove(&guild_id) {
+            let known: std::collections::HashSet<String> = channels.iter().map(|c| c.id.clone()).collect();
+            channels.extend(previous.into_iter().filter(|c| c.is_thread() && !known.contains(&c.id)));
+        }
+        self.guild_channels.insert(guild_id, channels);
+    }
+
+    pub fn sync_threads(&mut self, guild_id: &str, parent_ids: Option<&[String]>, threads: Vec<Channel>) {
+        let selected = self.selected_channel.clone();
+        let channels = self.guild_channels.entry(guild_id.to_string()).or_default();
+        channels.retain(|c| {
+            let in_scope = c.is_thread() && parent_ids.is_none_or(|ids| c.parent_id.as_ref().is_some_and(|p| ids.contains(p)));
+            !in_scope || selected.as_deref() == Some(c.id.as_str())
+        });
+        for thread in threads {
+            match channels.iter_mut().find(|c| c.id == thread.id) {
+                Some(existing) => *existing = thread,
+                None => channels.push(thread),
+            }
+        }
+    }
+
+    fn thread_mut(&mut self, thread_id: &str) -> Option<&mut Channel> {
+        self.guild_channels.values_mut().flatten().find(|c| c.id == thread_id && c.is_thread())
+    }
+
+    pub fn set_thread_membership(&mut self, thread_id: &str, member: Option<rustcord_client::models::ThreadMember>) {
+        if let Some(thread) = self.thread_mut(thread_id) {
+            thread.thread.member = member;
+        }
+    }
+
+    pub fn apply_thread_members_update(&mut self, thread_id: &str, member_count: Option<u32>, added: &[String], removed: &[String]) {
+        let me = self.current_user.as_ref().map(|u| u.id.clone());
+        let Some(thread) = self.thread_mut(thread_id) else { return };
+        if member_count.is_some() {
+            thread.thread.member_count = member_count;
+        }
+        let Some(me) = me else { return };
+        if removed.contains(&me) {
+            thread.thread.member = None;
+        } else if added.contains(&me) && thread.thread.member.is_none() {
+            thread.thread.member = Some(Default::default());
+        }
+    }
+
+    pub fn sidebar_threads(&self, guild_id: &str, parent_id: &str) -> Vec<&Channel> {
+        let Some(channels) = self.guild_channels.get(guild_id) else { return Vec::new() };
+        let mut threads: Vec<&Channel> = channels
+            .iter()
+            .filter(|c| c.is_thread() && c.parent_id.as_deref() == Some(parent_id))
+            .filter(|c| {
+                let selected = self.selected_channel.as_deref() == Some(c.id.as_str());
+                selected || (c.is_joined_thread() && !c.is_archived_thread())
+            })
+            .collect();
+        threads.sort_by(|a, b| {
+            let newest = |c: &Channel| c.last_message_id.clone().unwrap_or_else(|| c.id.clone());
+            snowflake_order(&newest(b), &newest(a))
+        });
+        threads
+    }
+
+    pub fn open_channel(&mut self, channel_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let _ = cmd_tx.send(crate::backend::UiCommand::SelectChannel { channel_id: channel_id.to_string() });
+        self.selected_channel = Some(channel_id.to_string());
+        self.server_call_minimized = true;
+        let last_id = self.find_guild_channel(channel_id).and_then(|c| c.last_message_id.clone());
+        if let Some(last_id) = last_id {
+            if self.mark_channel_read(channel_id, &last_id) {
+                let _ = cmd_tx.send(crate::backend::UiCommand::AckMessage { channel_id: channel_id.to_string(), message_id: last_id });
+            }
+        }
+    }
+
+    pub fn apply_archived_threads(&mut self, channel_id: &str, offset: u32, page: rustcord_client::rest::ThreadSearchPage) {
+        let Some(browser) = self.thread_browser.as_mut().filter(|b| b.channel_id == channel_id) else { return };
+        browser.loading = false;
+        browser.indexing = page.indexing;
+        browser.has_more = page.has_more;
+        if offset == 0 {
+            browser.archived.clear();
+        }
+        for thread in page.threads {
+            if !browser.archived.iter().any(|t| t.id == thread.id) {
+                browser.archived.push(thread);
+            }
+        }
+    }
+
+    pub fn thread_browser_lists(&self, guild_id: &str, parent_id: &str) -> ThreadBrowserLists {
+        let newest_first = |threads: &mut Vec<Channel>| {
+            threads.sort_by(|a, b| {
+                let newest = |c: &Channel| c.last_message_id.clone().unwrap_or_else(|| c.id.clone());
+                snowflake_order(&newest(b), &newest(a))
+            })
+        };
+        let known: Vec<&Channel> = self
+            .guild_channels
+            .get(guild_id)
+            .into_iter()
+            .flatten()
+            .filter(|c| c.is_thread() && c.parent_id.as_deref() == Some(parent_id))
+            .filter(|c| c.kind != ChannelType::GuildPrivateThread || c.is_joined_thread() || self.can_manage_threads(guild_id, c))
+            .collect();
+        let mut joined: Vec<Channel> = known.iter().filter(|c| c.is_joined_thread() && !c.is_archived_thread()).map(|c| (*c).clone()).collect();
+        let mut active: Vec<Channel> = known.iter().filter(|c| !c.is_joined_thread() && !c.is_archived_thread()).map(|c| (*c).clone()).collect();
+        let listed: std::collections::HashSet<&str> = joined.iter().chain(active.iter()).map(|c| c.id.as_str()).collect();
+        let mut archived: Vec<Channel> = self
+            .thread_browser
+            .as_ref()
+            .filter(|b| b.channel_id == parent_id)
+            .map(|b| b.archived.iter().filter(|t| !listed.contains(t.id.as_str())).cloned().collect())
+            .unwrap_or_default();
+        newest_first(&mut joined);
+        newest_first(&mut active);
+        newest_first(&mut archived);
+        ThreadBrowserLists { joined, active, archived }
+    }
+
+    pub fn can_manage_threads(&self, guild_id: &str, channel: &Channel) -> bool {
+        self.current_user.is_some() && self.has_channel_permission(guild_id, channel, rustcord_client::permissions::MANAGE_THREADS)
+    }
+
+    pub fn can_close_thread(&self, guild_id: &str, thread: &Channel) -> bool {
+        let owns = self.current_user.as_ref().is_some_and(|me| thread.thread.owner_id.as_deref() == Some(me.id.as_str()));
+        owns || self.can_manage_threads(guild_id, thread)
+    }
+
+    pub fn find_guild_channel(&self, channel_id: &str) -> Option<&Channel> {
+        self.guild_channels.values().flatten().find(|c| c.id == channel_id)
+    }
+
     pub fn seed_guild_channels(&mut self, guilds: Vec<(String, Vec<Channel>)>) -> usize {
         let mut seeded = 0;
         for (guild_id, channels) in guilds {
@@ -1513,11 +1770,20 @@ impl AppState {
 
     pub fn channel_is_unread(&self, channel_id: &str, last_message_id: Option<&str>) -> bool {
         let Some(last_message_id) = last_message_id else { return false };
-        let seen = self.last_read_message_id.get(channel_id);
-        match seen {
-            Some(seen) => snowflake_value(last_message_id) > snowflake_value(seen),
-            None => true,
-        }
+        let seen = match self.last_read_message_id.get(channel_id) {
+            Some(seen) => snowflake_value(seen),
+            None => match self.thread_join_snowflake(channel_id) {
+                Some(joined) => joined,
+                None => return true,
+            },
+        };
+        snowflake_value(last_message_id) > seen
+    }
+
+    fn thread_join_snowflake(&self, channel_id: &str) -> Option<u64> {
+        let joined = self.find_guild_channel(channel_id)?.thread.member.as_ref()?.join_timestamp.as_deref()?;
+        let millis = chrono::DateTime::parse_from_rfc3339(joined).ok()?.timestamp_millis();
+        Some((millis.checked_sub(DISCORD_EPOCH_MS)?.max(0) as u64) << 22)
     }
 
     pub fn guild_has_unread(&self, guild_id: &str) -> bool {
@@ -1528,7 +1794,10 @@ impl AppState {
         let Some(channels) = self.guild_channels.get(guild_id) else { return false };
         channels
             .iter()
-            .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement))
+            .filter(|c| {
+                matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement)
+                    || (c.is_joined_thread() && !c.is_archived_thread() && !c.thread.member.as_ref().is_some_and(|m| m.muted))
+            })
             .any(|c| !self.is_channel_muted(Some(guild_id), &c.id, now) && self.channel_is_unread(&c.id, c.last_message_id.as_deref()))
     }
 
@@ -1584,6 +1853,20 @@ impl AppState {
             .map(|o| o.message_notifications)
             .find(|level| *level != rustcord_client::models::NOTIFY_INHERIT)
             .unwrap_or_else(|| self.guild_notification_level(guild_id))
+    }
+
+    pub fn record_incoming_mention(&mut self, message: &Message, viewing: bool) {
+        let Some(me) = self.current_user.as_ref().map(|u| u.id.clone()) else { return };
+        if viewing || message.author.id == me {
+            return;
+        }
+        let counts = match message.guild_id.as_deref() {
+            None => !self.is_channel_muted(None, &message.channel_id, chrono::Utc::now()),
+            Some(_) => message.mentions.iter().any(|u| u.id == me),
+        };
+        if counts {
+            *self.mention_counts.entry(message.channel_id.clone()).or_default() += 1;
+        }
     }
 
     pub fn should_notify(&self, message: &Message, now: chrono::DateTime<chrono::Utc>) -> bool {
@@ -2281,6 +2564,10 @@ impl AppState {
     }
 
     pub fn has_channel_permission(&self, guild_id: &str, channel: &Channel, bit: u64) -> bool {
+        let channel = match channel.parent_id.as_deref().filter(|_| channel.is_thread()) {
+            Some(parent_id) => self.find_guild_channel(parent_id).unwrap_or(channel),
+            None => channel,
+        };
         let Some(me) = &self.current_user else { return false };
         if self.is_guild_owner(guild_id) {
             return true;
@@ -2586,6 +2873,18 @@ mod tests {
         child.parent_id = Some("cat".into());
         state.guild_channels.insert("g".into(), vec![child]);
         state
+    }
+
+    #[test]
+    fn live_dms_and_mentions_raise_the_badge_unless_open() {
+        let mut state = notifying_state();
+        state.record_incoming_mention(&incoming(None, "dm", false), false);
+        state.record_incoming_mention(&incoming(None, "dm", false), false);
+        state.record_incoming_mention(&incoming(Some("g"), "c", false), false);
+        state.record_incoming_mention(&incoming(Some("g"), "c", true), false);
+        state.record_incoming_mention(&incoming(Some("g"), "c", true), true);
+        assert_eq!(state.mention_count("dm"), 2);
+        assert_eq!(state.mention_count("c"), 1);
     }
 
     #[test]
@@ -3127,6 +3426,7 @@ mod tests {
             last_message_id: Some("999".into()),
             icon: None,
             permission_overwrites: Vec::new(),
+            thread: Default::default(),
         }
     }
 
@@ -3147,6 +3447,7 @@ mod tests {
             last_message_id: None,
             icon: None,
             permission_overwrites: Vec::new(),
+            thread: Default::default(),
         }
     }
 
@@ -3438,6 +3739,7 @@ mod tests {
             last_message_id: None,
             icon: None,
             permission_overwrites: Vec::new(),
+            thread: Default::default(),
         });
 
         let entries = state.switcher_entries();
@@ -3558,3 +3860,155 @@ mod tests {
         assert_eq!(labels, vec!["Unloaded".to_string()]);
     }
 }
+
+fn snowflake_order(a: &str, b: &str) -> std::cmp::Ordering {
+    snowflake_value(a).cmp(&snowflake_value(b))
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    fn thread(id: &str, parent: &str, joined: bool, archived: bool) -> Channel {
+        let mut value = serde_json::json!({
+            "id": id, "type": 11, "guild_id": "g", "parent_id": parent, "name": id,
+            "thread_metadata": { "archived": archived }
+        });
+        if joined {
+            value["member"] = serde_json::json!({ "flags": 1 });
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn text(id: &str) -> Channel {
+        serde_json::from_value(serde_json::json!({ "id": id, "type": 0, "guild_id": "g", "name": id })).unwrap()
+    }
+
+    fn message(content: &str) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": "m", "channel_id": "c", "content": content, "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null,
+            "author": { "id": "u", "username": "u", "discriminator": "0" }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn reloading_a_guilds_channels_keeps_its_threads() {
+        let mut state = AppState::default();
+        state.replace_guild_channels("g".into(), vec![text("c"), thread("t", "c", true, false)]);
+        state.replace_guild_channels("g".into(), vec![text("c")]);
+        assert!(state.find_guild_channel("t").is_some());
+    }
+
+    #[test]
+    fn a_thread_update_without_membership_keeps_the_accounts_membership() {
+        let mut state = AppState::default();
+        state.upsert_channel(thread("t", "c", true, false));
+        state.upsert_channel(thread("t", "c", false, false));
+        assert!(state.find_guild_channel("t").unwrap().is_joined_thread());
+    }
+
+    #[test]
+    fn a_list_sync_replaces_only_the_named_channels_threads_and_keeps_the_open_one() {
+        let mut state = AppState::default();
+        state.replace_guild_channels("g".into(), vec![text("a"), text("b"), thread("ta", "a", true, false), thread("tb", "b", true, false), thread("open", "a", false, false)]);
+        state.selected_channel = Some("open".into());
+        state.sync_threads("g", Some(&["a".to_string()]), vec![thread("ta2", "a", true, false)]);
+        let ids: Vec<&str> = state.guild_channels["g"].iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"tb") && ids.contains(&"ta2") && ids.contains(&"open"));
+        assert!(!ids.contains(&"ta"));
+    }
+
+    #[test]
+    fn the_sidebar_lists_joined_active_threads_and_the_open_one() {
+        let mut state = AppState::default();
+        state.replace_guild_channels("g".into(), vec![
+            text("c"),
+            thread("1001", "c", true, false),
+            thread("1002", "c", true, true),
+            thread("1003", "c", false, false),
+            thread("1004", "c", true, false),
+        ]);
+        state.selected_channel = Some("1003".into());
+        let ids: Vec<&str> = state.sidebar_threads("g", "c").iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["1004", "1003", "1001"]);
+    }
+
+    #[test]
+    fn joining_and_leaving_follow_thread_members_updates() {
+        let mut state = AppState::default();
+        state.current_user = Some(serde_json::from_value(serde_json::json!({ "id": "me", "username": "me", "discriminator": "0" })).unwrap());
+        state.upsert_channel(thread("t", "c", false, false));
+        state.apply_thread_members_update("t", Some(3), &["me".into()], &[]);
+        assert!(state.find_guild_channel("t").unwrap().is_joined_thread());
+        assert_eq!(state.find_guild_channel("t").unwrap().thread.member_count, Some(3));
+        state.apply_thread_members_update("t", None, &[], &["me".into()]);
+        assert!(!state.find_guild_channel("t").unwrap().is_joined_thread());
+    }
+
+    #[test]
+    fn the_browser_splits_joined_active_and_archived_threads() {
+        let mut state = AppState::default();
+        state.replace_guild_channels("g".into(), vec![text("c"), thread("10", "c", true, false), thread("11", "c", false, false), thread("12", "c", true, true)]);
+        state.thread_browser = Some(ThreadBrowser::new("c".into()));
+        state.apply_archived_threads("c", 0, rustcord_client::rest::ThreadSearchPage {
+            threads: vec![thread("12", "c", true, true), thread("13", "c", false, true), thread("10", "c", true, false)],
+            has_more: true,
+            indexing: false,
+        });
+        let lists = state.thread_browser_lists("g", "c");
+        let ids = |list: &[Channel]| list.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&lists.joined), ["10"]);
+        assert_eq!(ids(&lists.active), ["11"]);
+        assert_eq!(ids(&lists.archived), ["13", "12"]);
+        assert!(state.thread_browser.as_ref().unwrap().has_more);
+    }
+
+    #[test]
+    fn a_later_archived_page_appends_without_duplicates() {
+        let mut state = AppState::default();
+        state.thread_browser = Some(ThreadBrowser::new("c".into()));
+        let page = |ids: &[&str]| rustcord_client::rest::ThreadSearchPage { threads: ids.iter().map(|id| thread(id, "c", false, true)).collect(), has_more: false, indexing: false };
+        state.apply_archived_threads("c", 0, page(&["1", "2"]));
+        state.apply_archived_threads("c", 25, page(&["2", "3"]));
+        state.apply_archived_threads("other", 0, page(&["9"]));
+        let ids: Vec<&str> = state.thread_browser.as_ref().unwrap().archived.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn a_joined_thread_without_read_state_counts_as_read_up_to_joining() {
+        let mut state = AppState::default();
+        let mut joined = thread("t", "c", true, false);
+        joined.thread.member.as_mut().unwrap().join_timestamp = Some("2026-11-08T12:00:00+00:00".into());
+        state.upsert_channel(joined);
+        let at_join = ((chrono::DateTime::parse_from_rfc3339("2026-11-08T12:00:00+00:00").unwrap().timestamp_millis() - DISCORD_EPOCH_MS) as u64) << 22;
+        assert!(!state.channel_is_unread("t", Some(&(at_join - 1).to_string())));
+        assert!(state.channel_is_unread("t", Some(&(at_join + (1 << 22)).to_string())));
+        assert!(state.channel_is_unread("other", Some("5")));
+    }
+
+    #[test]
+    fn default_thread_names_follow_the_messages_first_line() {
+        assert_eq!(default_thread_name(&message("## Release plans\nmore")), "Release plans");
+        assert_eq!(default_thread_name(&message("   ")), "Thread");
+        let long = default_thread_name(&message("this sentence is definitely going to be much longer than forty characters"));
+        assert_eq!(long, "this sentence is definitely going to be...");
+    }
+
+    #[test]
+    fn the_thread_form_requires_a_name_and_a_starter_without_a_message() {
+        let mut form = ThreadForm::new(&text("c"), None);
+        assert_eq!(form.validate(), Err("Thread Name is required"));
+        form.name = "Plans".into();
+        assert_eq!(form.validate(), Err("Starter Message is required"));
+        form.starter = "hello".into();
+        assert_eq!(form.validate(), Ok(("Plans".into(), Some("hello".into()))));
+        form.private = true;
+        assert_eq!(form.thread_kind(), ChannelType::GuildPrivateThread);
+        let from_message = ThreadForm::new(&text("c"), Some(&message("hey all")));
+        assert_eq!(from_message.validate(), Ok(("hey all".into(), None)));
+        assert!(!from_message.allows_private());
+    }
+}
+

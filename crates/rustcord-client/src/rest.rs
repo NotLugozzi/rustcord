@@ -510,6 +510,52 @@ impl RestClient {
         self.post(&format!("/guilds/{guild_id}/channels"), &body).await
     }
 
+    pub async fn start_thread(
+        &self,
+        channel_id: &str,
+        message_id: Option<&str>,
+        name: &str,
+        kind: ChannelType,
+        auto_archive_minutes: u32,
+    ) -> Result<Channel, ClientError> {
+        match message_id {
+            Some(message_id) => {
+                let body = serde_json::json!({ "name": name, "auto_archive_duration": auto_archive_minutes });
+                self.post(&format!("/channels/{channel_id}/messages/{message_id}/threads"), &body).await
+            }
+            None => {
+                let body = serde_json::json!({ "name": name, "type": kind, "auto_archive_duration": auto_archive_minutes });
+                self.post(&format!("/channels/{channel_id}/threads"), &body).await
+            }
+        }
+    }
+
+    pub async fn channel(&self, channel_id: &str) -> Result<Channel, ClientError> {
+        self.get(&format!("/channels/{channel_id}")).await
+    }
+
+    pub async fn search_archived_threads(&self, channel_id: &str, guild_id: &str, offset: u32) -> Result<ThreadSearchPage, ClientError> {
+        let value: serde_json::Value = self
+            .get(&format!(
+                "/channels/{channel_id}/threads/search?archived=true&sort_by=last_message_time&sort_order=desc&limit={ARCHIVED_THREAD_PAGE}&offset={offset}"
+            ))
+            .await?;
+        Ok(ThreadSearchPage::from_response(&value, guild_id))
+    }
+
+    pub async fn set_thread_archived(&self, thread_id: &str, archived: bool) -> Result<Channel, ClientError> {
+        let body = serde_json::json!({ "archived": archived });
+        self.request(Method::PATCH, &format!("/channels/{thread_id}"), Some(&body)).await
+    }
+
+    pub async fn join_thread(&self, thread_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.put(format!("{API_BASE}/channels/{thread_id}/thread-members/@me"))).await
+    }
+
+    pub async fn leave_thread(&self, thread_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/channels/{thread_id}/thread-members/@me"))).await
+    }
+
     pub async fn edit_channel(&self, channel_id: &str, name: &str, topic: Option<&str>) -> Result<Channel, ClientError> {
         let mut body = serde_json::json!({ "name": name });
         if let Some(topic) = topic {
@@ -1114,3 +1160,53 @@ mod tests {
         assert!(encoded.contains("%E2%80%8D"), "zero-width joiner must survive: {encoded}");
     }
 }
+
+pub const ARCHIVED_THREAD_PAGE: u32 = 25;
+
+#[derive(Debug, Clone, Default)]
+pub struct ThreadSearchPage {
+    pub threads: Vec<Channel>,
+    pub has_more: bool,
+    pub indexing: bool,
+}
+
+impl ThreadSearchPage {
+    fn from_response(value: &serde_json::Value, guild_id: &str) -> Self {
+        if value.get("threads").is_none() {
+            return Self { indexing: true, ..Default::default() };
+        }
+        Self {
+            threads: crate::gateway::parse_guild_threads(value, guild_id, value.get("members")),
+            has_more: value.get("has_more").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            indexing: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod thread_search_tests {
+    use super::*;
+
+    #[test]
+    fn a_search_page_carries_its_threads_and_the_accounts_membership() {
+        let page = ThreadSearchPage::from_response(
+            &serde_json::json!({
+                "threads": [ { "id": "t", "type": 11, "parent_id": "c", "name": "old", "thread_metadata": { "archived": true } } ],
+                "members": [ { "id": "t", "user_id": "me", "flags": 1 } ],
+                "has_more": true
+            }),
+            "g",
+        );
+        assert_eq!(page.threads.len(), 1);
+        assert!(page.threads[0].is_joined_thread() && page.threads[0].is_archived_thread());
+        assert_eq!(page.threads[0].guild_id.as_deref(), Some("g"));
+        assert!(page.has_more && !page.indexing);
+    }
+
+    #[test]
+    fn an_index_still_building_reads_as_indexing() {
+        let page = ThreadSearchPage::from_response(&serde_json::json!({ "message": "Index not yet available", "code": 110000 }), "g");
+        assert!(page.indexing && page.threads.is_empty());
+    }
+}
+

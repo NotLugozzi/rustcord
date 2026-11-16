@@ -13,6 +13,41 @@ pub struct Fonts {
     pub italic: imgui::FontId,
     pub bold_italic: imgui::FontId,
     pub mono: imgui::FontId,
+    pub medium: imgui::FontId,
+    pub semibold: imgui::FontId,
+    pub xs: imgui::FontId,
+    pub sm: imgui::FontId,
+    pub sm_semibold: imgui::FontId,
+    pub title: imgui::FontId,
+    pub display: imgui::FontId,
+}
+
+pub const XS_RATIO: f32 = 0.75;
+pub const SM_RATIO: f32 = 0.875;
+pub const TITLE_RATIO: f32 = 1.25;
+pub const DISPLAY_RATIO: f32 = 1.5;
+
+thread_local! {
+    static FACES: std::cell::Cell<Option<Fonts>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn set_faces(fonts: Fonts) {
+    FACES.with(|faces| faces.set(Some(fonts)));
+}
+
+pub fn faces() -> Fonts {
+    FACES.with(|faces| faces.get()).expect("fonts are built before the first frame")
+}
+
+fn scaled_face(scale: f32) -> imgui::FontId {
+    let faces = faces();
+    match scale {
+        s if s <= 0.8 => faces.xs,
+        s if s < 0.95 => faces.sm,
+        s if s < 1.1 => faces.regular,
+        s if s < 1.45 => faces.title,
+        _ => faces.display,
+    }
 }
 
 impl Fonts {
@@ -28,9 +63,9 @@ impl Fonts {
 
 fn timestamp_text(ui: &Ui, color: [f32; 4], label: &str, full: &str, scale: f32) {
     let token = ui.push_style_color(imgui::StyleColor::Text, color);
-    ui.set_window_font_scale(scale);
+    let font_scope = ui.push_font(scaled_face(scale));
     ui.text(label);
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     token.pop();
     if ui.is_item_hovered() {
         ui.tooltip_text(full);
@@ -41,7 +76,7 @@ fn draw_day_divider(ui: &Ui, theme: &crate::theme::Theme, label: &str) {
     ui.dummy([0.0, 4.0]);
     let start = ui.cursor_screen_pos();
     let width = ui.content_region_avail()[0];
-    ui.set_window_font_scale(0.8);
+    let font_scope = ui.push_font(scaled_face(0.8));
     let text_size = ui.calc_text_size(label);
     let line_y = start[1] + text_size[1] / 2.0;
     let text_x = start[0] + (width - text_size[0]) / 2.0;
@@ -49,7 +84,7 @@ fn draw_day_divider(ui: &Ui, theme: &crate::theme::Theme, label: &str) {
     dl.add_line([start[0] + 16.0, line_y], [text_x - 8.0, line_y], theme.border).thickness(1.0).build();
     dl.add_line([text_x + text_size[0] + 8.0, line_y], [start[0] + width - 8.0, line_y], theme.border).thickness(1.0).build();
     dl.add_text([text_x, start[1]], theme.text_muted, label);
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     ui.dummy([width, text_size[1] + 8.0]);
 }
 
@@ -176,22 +211,21 @@ fn draw_markdown(
                     2 => fonts.bold,
                     _ => fonts.bold,
                 };
-                let scale = match level {
-                    1 => 1.4,
-                    2 => 1.2,
-                    _ => 1.05,
+                let face = match level {
+                    1 => fonts.display,
+                    2 => fonts.title,
+                    _ => fonts.semibold,
                 };
-                let token = ui.push_font(font);
-                ui.set_window_font_scale(scale);
+                let _ = font;
+                let token = ui.push_font(face);
                 draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
-                ui.set_window_font_scale(1.0);
                 token.pop();
             }
             Block::Subtext(spans) => {
                 let color = ui.push_style_color(imgui::StyleColor::Text, theme.text_muted);
-                ui.set_window_font_scale(0.85);
+                let font_scope = ui.push_font(scaled_face(0.85));
                 draw_spans(ui, fonts, theme, spans, revealed_spoilers, id_seed, block_idx, textures, cmd_tx, mentions);
-                ui.set_window_font_scale(1.0);
+                font_scope.pop();
                 color.pop();
             }
             Block::Blockquote { depth, spans } => {
@@ -823,9 +857,9 @@ fn draw_user_row(
     if let Some(platform) = platform {
         ui.same_line();
         let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
-        ui.set_window_font_scale(0.8);
+        let font_scope = ui.push_font(scaled_face(0.8));
         ui.text(platform);
-        ui.set_window_font_scale(1.0);
+        font_scope.pop();
         token.pop();
     }
 
@@ -837,11 +871,11 @@ fn draw_user_row(
             ui.same_line_with_spacing(0.0, 4.0);
         }
         let token = ui.push_style_color(imgui::StyleColor::Text, [0.6, 0.62, 0.66, 1.0]);
-        ui.set_window_font_scale(0.8);
+        let font_scope = ui.push_font(scaled_face(0.8));
         let text = activity.unwrap_or_default();
         let room = ui.content_region_avail()[0] - 4.0;
         ui.text(truncate_to_width(ui, text, room).as_deref().unwrap_or(text));
-        ui.set_window_font_scale(1.0);
+        font_scope.pop();
         token.pop();
     }
 
@@ -859,7 +893,7 @@ fn draw_server_tag(
     const BADGE: f32 = 12.0;
     let Some(label) = tag.visible_tag() else { return };
     let line = ui.text_line_height();
-    ui.set_window_font_scale(0.75);
+    let font_scope = ui.push_font(scaled_face(0.75));
     let text_size = ui.calc_text_size(label);
     let badge_room = if badge_url.is_some() { BADGE + 3.0 } else { 0.0 };
     let pad = 4.0;
@@ -881,7 +915,7 @@ fn draw_server_tag(
         dl.add_image(texture, [min[0] + pad, y], [min[0] + pad + BADGE, y + BADGE]).build();
     }
     dl.add_text([min[0] + pad + badge_room, min[1] + 1.0], ui.style_color(imgui::StyleColor::Text), label);
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     ui.dummy([size[0], line]);
 }
 
@@ -2972,10 +3006,10 @@ fn draw_forwarded(
             None => when,
         };
         if !footer.is_empty() {
-            ui.set_window_font_scale(0.8);
+            let font_scope = ui.push_font(scaled_face(0.8));
             let jump = reference.and_then(|r| Some((r.channel_id.clone()?, r.message_id.clone()?)));
             let clicked = clickable_text(ui, &format!("fwd_src_{}", msg.id), &footer, state.theme.text_muted);
-            ui.set_window_font_scale(1.0);
+            font_scope.pop();
             if let (true, Some((channel_id, message_id))) = (clicked, jump) {
                 let _ = cmd_tx.send(UiCommand::JumpToMessage { channel_id, message_id });
             }
@@ -3057,6 +3091,340 @@ fn draw_recording_bar(ui: &Ui, state: &mut AppState, textures: &TextureCache, cm
         state.finish_voice_recording(true, cmd_tx);
     } else if discard || ui.is_key_pressed(imgui::Key::Escape) {
         state.finish_voice_recording(false, cmd_tx);
+    }
+}
+
+struct SidebarThread {
+    id: String,
+    name: String,
+    last_message_id: Option<String>,
+    joined: bool,
+}
+
+const THREAD_ROW_INDENT: f32 = 24.0;
+const THREAD_SPINE_X: f32 = 10.0;
+
+fn draw_sidebar_thread(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, thread: &SidebarThread, first: bool) {
+    let row_start = ui.cursor_screen_pos();
+    let is_unread = state.channel_shows_unread(state.selected_guild.as_deref(), &thread.id, thread.last_message_id.as_deref());
+    let mentions = state.mention_count(&thread.id);
+    let selected = state.selected_channel.as_deref() == Some(thread.id.as_str());
+    let _dim = (!is_unread && !selected).then(|| ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted));
+    let badge_room = if mentions > 0 { 34.0 } else { 0.0 };
+    ui.set_cursor_screen_pos([row_start[0] + THREAD_ROW_INDENT, row_start[1]]);
+    let width = (ui.content_region_avail()[0] - badge_room).max(1.0);
+    let shown = truncate_to_width(ui, &thread.name, width);
+    let clicked = ui
+        .selectable_config(format!("{}##thread_row_{}", shown.as_deref().unwrap_or(&thread.name), thread.id))
+        .selected(selected)
+        .size([width, CHANNEL_ROW_HEIGHT])
+        .build();
+    if shown.is_some() && ui.is_item_hovered() {
+        ui.tooltip_text(&thread.name);
+    }
+    let popup_id = format!("thread_row_ctx_{}", thread.id);
+    if ui.is_item_clicked_with_button(imgui::MouseButton::Right) {
+        ui.open_popup(&popup_id);
+    }
+    ui.popup(&popup_id, || {
+        if let Some(last_id) = thread.last_message_id.as_deref() {
+            if ui.selectable("Mark As Read") && state.mark_channel_read(&thread.id, last_id) {
+                let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: thread.id.clone(), message_id: last_id.to_string() });
+            }
+        }
+        if thread.joined {
+            if ui.selectable("Leave Thread") {
+                let _ = cmd_tx.send(UiCommand::LeaveThread { thread_id: thread.id.clone() });
+            }
+        } else if ui.selectable("Join Thread") {
+            let _ = cmd_tx.send(UiCommand::JoinThread { thread_id: thread.id.clone() });
+        }
+    });
+    if clicked {
+        state.open_channel(&thread.id, cmd_tx);
+    }
+    let row_height = ui.item_rect_size()[1];
+    {
+        let spine = with_alpha(state.theme.text_muted, 0.45);
+        let dl = ui.get_window_draw_list();
+        let x = row_start[0] + THREAD_SPINE_X;
+        let mid = row_start[1] + row_height / 2.0;
+        let top = if first { row_start[1] - 4.0 } else { row_start[1] };
+        dl.add_line([x, top], [x, mid - 4.0], spine).thickness(1.5).build();
+        dl.add_bezier_curve([x, mid - 4.0], [x, mid], [x, mid], [x + 4.0, mid], spine).thickness(1.5).build();
+        dl.add_line([x + 4.0, mid], [row_start[0] + THREAD_ROW_INDENT - 4.0, mid], spine).thickness(1.5).build();
+    }
+    if is_unread {
+        draw_unread_dot(ui, row_start, row_height);
+    }
+    if mentions > 0 {
+        draw_mention_badge(ui, state.theme.mention_badge(), row_start, row_height, mentions);
+    }
+}
+
+fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], color[3] * alpha]
+}
+
+fn open_thread(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, thread: &rustcord_client::models::Channel, guild_id: Option<&str>) {
+    if state.find_guild_channel(&thread.id).is_none() {
+        let mut thread = thread.clone();
+        if thread.guild_id.is_none() {
+            thread.guild_id = guild_id.map(str::to_string).or_else(|| state.selected_guild.clone());
+        }
+        state.upsert_channel(thread);
+    }
+    state.open_channel(&thread.id, cmd_tx);
+}
+
+fn draw_thread_chip(
+    ui: &Ui,
+    state: &mut AppState,
+    textures: &TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    thread: &rustcord_client::models::Channel,
+    guild_id: Option<&str>,
+) {
+    const ICON: f32 = 16.0;
+    const PAD: [f32; 2] = [10.0, 6.0];
+    let name = thread.name.clone().unwrap_or_else(|| "Thread".into());
+    let count = state.find_guild_channel(&thread.id).and_then(|t| t.thread.message_count).or(thread.thread.message_count);
+    let detail = match count {
+        Some(1) => "1 Message".to_string(),
+        Some(n) => format!("{n} Messages"),
+        None => "See Thread".to_string(),
+    };
+    let chip_font = ui.push_font(faces().sm_semibold);
+    let name_w = ui.calc_text_size(&name)[0];
+    let detail_w = ui.calc_text_size(&detail)[0];
+    let size = [PAD[0] * 2.0 + ICON + 8.0 + name_w + 12.0 + detail_w, ui.text_line_height() + PAD[1] * 2.0];
+    ui.dummy([0.0, 2.0]);
+    let min = ui.cursor_screen_pos();
+    let clicked = ui.invisible_button(format!("##thread_chip_{}", thread.id), size);
+    let hovered = ui.is_item_hovered();
+    let max = [min[0] + size[0], min[1] + size[1]];
+    let fill = if hovered { with_alpha(state.theme.text_muted, 0.22) } else { with_alpha(state.theme.text_muted, 0.12) };
+    let text_y = min[1] + PAD[1];
+    let name_x = min[0] + PAD[0] + ICON + 8.0;
+    {
+        let dl = ui.get_window_draw_list();
+        dl.add_rect(min, max, fill).filled(true).rounding(6.0).build();
+        dl.add_text([name_x, text_y], ui.style_color(imgui::StyleColor::Text), &name);
+        dl.add_text([name_x + name_w + 12.0, text_y], state.theme.link(), &detail);
+    }
+    chip_font.pop();
+    draw_icon_at(ui, textures, crate::icons::Icon::MessageCircle, [min[0] + PAD[0], min[1] + (size[1] - ICON) / 2.0], ICON, state.theme.text_muted);
+    if clicked {
+        open_thread(state, cmd_tx, thread, guild_id);
+    }
+}
+
+fn open_thread_browser(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, parent_id: String) {
+    let guild_id = state.find_guild_channel(&parent_id).and_then(|c| c.guild_id.clone()).or_else(|| state.selected_guild.clone()).unwrap_or_default();
+    let _ = cmd_tx.send(UiCommand::LoadArchivedThreads { channel_id: parent_id.clone(), guild_id, offset: 0 });
+    state.thread_browser = Some(crate::app_state::ThreadBrowser::new(parent_id));
+}
+
+fn thread_browser_section(
+    ui: &Ui,
+    theme: &crate::theme::Theme,
+    heading: &str,
+    threads: &[rustcord_client::models::Channel],
+    opened: &mut Option<rustcord_client::models::Channel>,
+) {
+    if threads.is_empty() {
+        return;
+    }
+    ui.dummy([0.0, 6.0]);
+    ui.text_colored(theme.text_muted, heading);
+    for thread in threads {
+        let name = thread.name.clone().unwrap_or_else(|| "Thread".into());
+        let detail = match (thread.thread.message_count, thread.is_archived_thread()) {
+            (Some(1), _) => "1 message".to_string(),
+            (Some(n), _) => format!("{n} messages"),
+            (None, true) => "Closed".to_string(),
+            (None, false) => String::new(),
+        };
+        let detail_w = ui.calc_text_size(&detail)[0];
+        let row_w = ui.content_region_avail()[0];
+        let shown = truncate_to_width(ui, &name, row_w - detail_w - 16.0);
+        let row_start = ui.cursor_pos();
+        if ui.selectable_config(format!("{}##browse_{}", shown.as_deref().unwrap_or(&name), thread.id)).size([row_w, 28.0]).build() {
+            *opened = Some(thread.clone());
+        }
+        if !detail.is_empty() {
+            let after = ui.cursor_pos();
+            ui.set_cursor_pos([row_start[0] + row_w - detail_w, row_start[1] + (28.0 - ui.text_line_height()) / 2.0]);
+            ui.text_colored(theme.text_muted, &detail);
+            ui.set_cursor_pos(after);
+        }
+    }
+}
+
+fn draw_thread_browser(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some(parent_id) = state.thread_browser.as_ref().map(|b| b.channel_id.clone()) else { return };
+    let Some(parent) = state.find_guild_channel(&parent_id).cloned() else {
+        state.thread_browser = None;
+        return;
+    };
+    let guild_id = parent.guild_id.clone().or_else(|| state.selected_guild.clone()).unwrap_or_default();
+    let lists = state.thread_browser_lists(&guild_id, &parent_id);
+    let current = state
+        .selected_channel
+        .as_deref()
+        .and_then(|id| state.find_guild_channel(id))
+        .filter(|c| c.is_thread() && c.parent_id.as_deref() == Some(parent_id.as_str()))
+        .cloned();
+    let can_close = current.as_ref().is_some_and(|t| state.can_close_thread(&guild_id, t));
+    let (loading, has_more, indexing, loaded) = state
+        .thread_browser
+        .as_ref()
+        .map(|b| (b.loading, b.has_more, b.indexing, b.archived.len() as u32))
+        .unwrap_or_default();
+    let theme = state.theme.clone();
+    let mut open = true;
+    let mut opened: Option<rustcord_client::models::Channel> = None;
+    let mut create = false;
+    let mut load_more = false;
+    let mut action: Option<UiCommand> = None;
+    let display = ui.io().display_size;
+    let width = (display[0] * 0.35).clamp(480.0, 600.0);
+    let height = (display[1] * 0.8).min(560.0).max(400.0);
+    ui.window(format!("Threads in #{}###thread_browser", parent.name.clone().unwrap_or_default()))
+        .opened(&mut open)
+        .size([width, height], imgui::Condition::Appearing)
+        .position([display[0] / 2.0, display[1] / 2.0], imgui::Condition::Appearing)
+        .position_pivot([0.5, 0.5])
+        .collapsible(false)
+        .build(|| {
+            if ui.button("Create Thread") {
+                create = true;
+            }
+            if let Some(thread) = &current {
+                ui.same_line();
+                if thread.is_joined_thread() {
+                    if ui.button("Leave Thread") {
+                        action = Some(UiCommand::LeaveThread { thread_id: thread.id.clone() });
+                    }
+                } else if ui.button("Join Thread") {
+                    action = Some(UiCommand::JoinThread { thread_id: thread.id.clone() });
+                }
+                if can_close {
+                    ui.same_line();
+                    let archived = thread.is_archived_thread();
+                    if ui.button(if archived { "Reopen Thread" } else { "Close Thread" }) {
+                        action = Some(UiCommand::SetThreadArchived { thread_id: thread.id.clone(), archived: !archived });
+                    }
+                }
+            }
+            ui.separator();
+            ui.child_window("thread_browser_list").build(|| {
+                let joined = format!("{} joined threads", lists.joined.len());
+                let active = format!("{} other active threads", lists.active.len());
+                thread_browser_section(ui, &theme, &joined, &lists.joined, &mut opened);
+                thread_browser_section(ui, &theme, &active, &lists.active, &mut opened);
+                thread_browser_section(ui, &theme, "Older threads", &lists.archived, &mut opened);
+                ui.dummy([0.0, 6.0]);
+                if loading {
+                    ui.text_disabled("Loading older threads...");
+                } else if indexing {
+                    ui.text_disabled("Discord is still indexing this channel's threads.");
+                    if ui.button("Try again") {
+                        load_more = true;
+                    }
+                } else if has_more && ui.button("Load more") {
+                    load_more = true;
+                }
+                if !loading && lists.joined.is_empty() && lists.active.is_empty() && lists.archived.is_empty() && !indexing {
+                    ui.text_disabled("There are no threads here yet.");
+                }
+            });
+        });
+    if let Some(command) = action {
+        let _ = cmd_tx.send(command);
+    }
+    if load_more {
+        let offset = if indexing { 0 } else { loaded };
+        let _ = cmd_tx.send(UiCommand::LoadArchivedThreads { channel_id: parent_id.clone(), guild_id: guild_id.clone(), offset });
+        if let Some(browser) = state.thread_browser.as_mut() {
+            browser.loading = true;
+        }
+    }
+    if create {
+        state.thread_form = Some(crate::app_state::ThreadForm::new(&parent, None));
+    }
+    if let Some(thread) = opened {
+        state.thread_browser = None;
+        open_thread(state, cmd_tx, &thread, Some(&guild_id));
+    } else if !open {
+        state.thread_browser = None;
+    }
+}
+
+fn draw_thread_form(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let theme = state.theme.clone();
+    let Some(form) = state.thread_form.as_mut() else { return };
+    let mut open = true;
+    let mut create = false;
+    let display = ui.io().display_size;
+    ui.window("New Thread")
+        .opened(&mut open)
+        .size([440.0, 0.0], imgui::Condition::Always)
+        .position([display[0] / 2.0, display[1] / 2.0], imgui::Condition::Appearing)
+        .position_pivot([0.5, 0.5])
+        .collapsible(false)
+        .resizable(false)
+        .build(|| {
+            if let Some(preview) = form.message_preview.as_deref().filter(|p| !p.is_empty()) {
+                ui.text_colored(theme.text_muted, "Starting from");
+                ui.text_wrapped(preview);
+                ui.spacing();
+            }
+            ui.text_colored(theme.text_muted, "Thread Name");
+            ui.set_next_item_width(-1.0);
+            if ui.is_window_appearing() {
+                ui.set_keyboard_focus_here();
+            }
+            let hint = if form.default_name.is_empty() { "New Thread" } else { form.default_name.as_str() };
+            let hint = hint.to_string();
+            ui.input_text("##thread_name", &mut form.name).hint(hint).build();
+            if form.name.chars().count() > crate::app_state::THREAD_NAME_LIMIT {
+                form.name = form.name.chars().take(crate::app_state::THREAD_NAME_LIMIT).collect();
+            }
+            if form.allows_private() {
+                ui.spacing();
+                ui.checkbox("Private Thread", &mut form.private);
+                ui.text_colored(theme.text_muted, "Only people you invite and moderators can see");
+            }
+            ui.spacing();
+            ui.text_colored(theme.text_muted, if form.message_id.is_some() { "First Message (optional)" } else { "Starter Message" });
+            ui.input_text_multiline("##thread_starter", &mut form.starter, [-1.0, 90.0])
+                .build();
+            if let Some(error) = &form.error {
+                ui.text_colored(theme.mention_badge(), error);
+            }
+            ui.spacing();
+            if ui.button("Create Thread") {
+                create = true;
+            }
+        });
+    if create {
+        match form.validate() {
+            Ok((name, starter)) => {
+                let _ = cmd_tx.send(UiCommand::CreateThread {
+                    channel_id: form.channel_id.clone(),
+                    message_id: form.message_id.clone(),
+                    name,
+                    kind: form.thread_kind(),
+                    auto_archive_minutes: form.auto_archive_minutes,
+                    starter,
+                });
+                state.thread_form = None;
+            }
+            Err(error) => form.error = Some(error.to_string()),
+        }
+    } else if !open {
+        state.thread_form = None;
     }
 }
 
@@ -3281,7 +3649,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             _child_bg.pop();
             _no_pad.pop();
         });
-        _server_bg.pop(); // <- Non dimenticare il pop()!
+        _server_bg.pop();
 
     let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, surface_bg);
     ui.window("channels")
@@ -3319,6 +3687,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     ui.open_popup("channel_list_ctx");
                 }
                 ui.popup("channel_list_ctx", || {
+                    let thread_parent = state
+                        .channel_context
+                        .as_deref()
+                        .and_then(|id| state.find_guild_channel(id))
+                        .filter(|c| matches!(c.kind, rustcord_client::models::ChannelType::GuildText | rustcord_client::models::ChannelType::GuildAnnouncement))
+                        .cloned();
+                    if let Some(parent) = thread_parent {
+                        if ui.selectable("Create Thread") {
+                            state.thread_form = Some(crate::app_state::ThreadForm::new(&parent, None));
+                        }
+                        ui.separator();
+                    }
                     draw_channel_notification_menu(ui, state, cmd_tx);
                     draw_channel_admin_menu(ui, state, cmd_tx);
                     let label = if state.show_hidden_channels { "Hide channels you can't access" } else { "Show channels you can't access" };
@@ -3326,13 +3706,33 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         state.show_hidden_channels = !state.show_hidden_channels;
                     }
                 });
+                let sidebar_threads: HashMap<String, Vec<SidebarThread>> = {
+                    let guild_id = state.selected_guild.clone().unwrap_or_default();
+                    groups
+                        .iter()
+                        .flat_map(|(_, channels)| channels.iter())
+                        .filter_map(|(channel_id, ..)| {
+                            let threads: Vec<SidebarThread> = state
+                                .sidebar_threads(&guild_id, channel_id)
+                                .into_iter()
+                                .map(|t| SidebarThread {
+                                    id: t.id.clone(),
+                                    name: t.name.clone().unwrap_or_else(|| t.id.clone()),
+                                    last_message_id: t.last_message_id.clone(),
+                                    joined: t.is_joined_thread(),
+                                })
+                                .collect();
+                            (!threads.is_empty()).then(|| (channel_id.clone(), threads))
+                        })
+                        .collect()
+                };
                 for (category_name, channels) in &groups {
                     if let Some(name) = category_name {
                         ui.dummy([0.0, 8.0]);
                         let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-                        ui.set_window_font_scale(0.8);
+                        let font_scope = ui.push_font(scaled_face(0.8));
                         ui.text(name.to_uppercase());
-                        ui.set_window_font_scale(1.0);
+                        font_scope.pop();
                         token.pop();
                         ui.dummy([0.0, 2.0]);
                     }
@@ -3381,6 +3781,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                         if mentions > 0 {
                             draw_mention_badge(ui, state.theme.mention_badge(), row_start, row_height, mentions);
+                        }
+                        if let Some(threads) = sidebar_threads.get(channel_id) {
+                            for (index, thread) in threads.iter().enumerate() {
+                                draw_sidebar_thread(ui, state, cmd_tx, thread, index == 0);
+                            }
                         }
                     }
                 }
@@ -3677,6 +4082,12 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: msg.guild_id.clone(), channel_id: msg.channel_id.clone(), ring: false });
                                     state.pending_voice_channel = Some((msg.guild_id.clone(), msg.channel_id.clone()));
                                 }
+                                Some(crate::message_rows::SystemAction::OpenThread { thread_id }) => match state.find_guild_channel(&thread_id).cloned() {
+                                    Some(thread) => open_thread(state, cmd_tx, &thread, msg.guild_id.as_deref()),
+                                    None => {
+                                        let _ = cmd_tx.send(UiCommand::OpenChannelById { channel_id: thread_id });
+                                    }
+                                },
                                 Some(crate::message_rows::SystemAction::JumpTo { channel_id, message_id }) => {
                                     let loaded = state.messages.get(&channel_id).is_some_and(|list| list.iter().any(|m| m.id == message_id));
                                     if loaded && state.selected_channel.as_deref() == Some(channel_id.as_str()) {
@@ -3709,14 +4120,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             let preview = if replied.content.chars().count() > 80 { format!("{preview}...") } else { preview };
                             ui.set_cursor_pos([row_start[0] + content_x_offset, row_start[1]]);
                             let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-                            ui.set_window_font_scale(0.85);
+                            let font_scope = ui.push_font(scaled_face(0.85));
                             let label = if preview.is_empty() {
                                 format!("\u{2514} Replying to {replied_author}")
                             } else {
                                 format!("\u{2514} Replying to {replied_author}: {preview}")
                             };
                             ui.text(label);
-                            ui.set_window_font_scale(1.0);
+                            font_scope.pop();
                             token.pop();
                             content_top = ui.cursor_pos()[1];
                         }
@@ -3743,8 +4154,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 let author_color = state.selected_guild.as_deref().and_then(|guild_id| {
                                     msg.member.as_ref().and_then(|member| state.color_for_roles(guild_id, &member.roles))
                                         .or_else(|| state.member_color(guild_id, &msg.author.id))
-                                }).unwrap_or(state.theme.accent);
-                                if clickable_text(ui, &format!("name_{}", msg.id), &author, author_color) {
+                                }).unwrap_or(state.theme.text);
+                                let name_font = ui.push_font(fonts.medium);
+                                let name_clicked = clickable_text(ui, &format!("name_{}", msg.id), &author, author_color);
+                                name_font.pop();
+                                if name_clicked {
                                     state.profile_popout = Some(msg.author.clone());
                                 }
                                 if let Some(tag) = msg.author.server_tag() {
@@ -3769,6 +4183,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
+                                if let Some(thread) = &msg.thread {
+                                    draw_thread_chip(ui, state, textures, cmd_tx, thread, msg.guild_id.as_deref());
+                                }
                             });
 
                             let group_height = AVATAR_SIZE[1].max(ui.item_rect_size()[1]);
@@ -3791,6 +4208,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
+                                if let Some(thread) = &msg.thread {
+                                    draw_thread_chip(ui, state, textures, cmd_tx, thread, msg.guild_id.as_deref());
+                                }
                             });
                             let after_group = [row_start[0], content_top + ui.item_rect_size()[1]];
                             let mouse = ui.io().mouse_pos;
@@ -3821,6 +4241,19 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             }
                             if ui.menu_item("Forward") {
                                 state.forward_dialog = Some(crate::app_state::ForwardDialog::for_message(msg));
+                            }
+                            if let Some(thread) = &msg.thread {
+                                if ui.menu_item("View Thread") {
+                                    open_thread(state, cmd_tx, thread, msg.guild_id.as_deref());
+                                }
+                            } else if let Some(parent) = state
+                                .find_guild_channel(&msg.channel_id)
+                                .filter(|c| matches!(c.kind, rustcord_client::models::ChannelType::GuildText | rustcord_client::models::ChannelType::GuildAnnouncement))
+                                .cloned()
+                            {
+                                if ui.menu_item("Create Thread") {
+                                    state.thread_form = Some(crate::app_state::ThreadForm::new(&parent, Some(msg)));
+                                }
                             }
                             if ui.menu_item("Add Reaction") {
                                 state.emoji_picker_target = Some((msg.channel_id.clone(), msg.id.clone()));
@@ -4199,6 +4632,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_channel_editor(ui, state, cmd_tx, display_w, display_h);
     draw_poll_creator(ui, state, cmd_tx);
     draw_forward_dialog(ui, state, cmd_tx);
+    draw_thread_form(ui, state, cmd_tx);
+    draw_thread_browser(ui, state, cmd_tx);
 }
 
 fn format_bitrate(bps: u32) -> String {
@@ -4374,9 +4809,9 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
     ui.text(truncate_to_width(ui, &display_name, name_room).as_deref().unwrap_or(&display_name));
     ui.set_cursor_pos([bar_start[0] + 42.0, bar_start[1] + 3.0 + ui.text_line_height()]);
     let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-    ui.set_window_font_scale(0.85);
+    let font_scope = ui.push_font(scaled_face(0.85));
     ui.text(truncate_to_width(ui, &status_label, name_room).as_deref().unwrap_or(&status_label));
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     token.pop();
 
     let red = state.theme.mention_badge();
@@ -4519,9 +4954,9 @@ fn draw_conversation_start(
         draw_start_avatar(ui, textures, cmd_tx, icon_url.as_deref(), accent);
         indent(ui);
         let bold = ui.push_font(fonts.bold);
-        ui.set_window_font_scale(1.6);
+        let font_scope = ui.push_font(scaled_face(1.6));
         ui.text_colored(strong, &name);
-        ui.set_window_font_scale(1.0);
+        font_scope.pop();
         bold.pop();
         indent(ui);
         draw_bold_sentence(ui, fonts, muted, strong, "Welcome to the beginning of the ", &name, " group.");
@@ -4536,14 +4971,14 @@ fn draw_conversation_start(
     draw_start_avatar(ui, textures, cmd_tx, Some(&avatar), accent);
     indent(ui);
     let bold = ui.push_font(fonts.bold);
-    ui.set_window_font_scale(1.6);
+    let font_scope = ui.push_font(scaled_face(1.6));
     ui.text_colored(strong, display);
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     bold.pop();
     indent(ui);
-    ui.set_window_font_scale(1.25);
+    let font_scope = ui.push_font(scaled_face(1.25));
     ui.text_colored(strong, &user.username);
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     ui.dummy([0.0, 4.0]);
     indent(ui);
     draw_bold_sentence(ui, fonts, muted, strong, "This is the beginning of your direct message history with ", display, ".");
@@ -4733,12 +5168,12 @@ fn draw_invite_card(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, 
             ui.set_cursor_pos([text_x, text_top]);
             ui.text_colored(muted, if invalid { "Invite invalid" } else { "Couldn't load invite" });
             ui.set_cursor_pos([text_x, text_top + line]);
-            ui.set_window_font_scale(0.85);
+            let font_scope = ui.push_font(scaled_face(0.85));
             ui.text_colored(
                 muted,
                 if invalid { "This invite may be expired, or you might not have permission to join." } else { "Try again in a few minutes." },
             );
-            ui.set_window_font_scale(1.0);
+            font_scope.pop();
         }
         Some(InviteState::Ready(resolved)) => {
             let guild = resolved.invite.guild.as_ref();
@@ -4752,7 +5187,7 @@ fn draw_invite_card(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, 
                     ui.set_cursor_pos([text_x, text_top]);
                     ui.text(&resolved.channel_name);
                     ui.set_cursor_pos([text_x, text_top + line]);
-                    ui.set_window_font_scale(0.85);
+                    let font_scope = ui.push_font(scaled_face(0.85));
                     if member {
                         let occupants = state.members_in_voice_channel(guild_id, &channel.id).len();
                         if occupants == 0 {
@@ -4763,7 +5198,7 @@ fn draw_invite_card(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, 
                     } else {
                         ui.text_colored(muted, "Only server members can see who's in voice");
                     }
-                    ui.set_window_font_scale(1.0);
+                    font_scope.pop();
                     let in_channel = state.connected_voice_channel.as_ref().is_some_and(|(_, id)| *id == channel.id);
                     ui.set_cursor_pos([start[0] + width - 108.0, button_y]);
                     let _green = ui.push_style_color(imgui::StyleColor::Button, call_green);
@@ -4796,9 +5231,9 @@ fn draw_invite_card(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, 
                     let name = guild.map(|g| g.name.as_str()).unwrap_or("Unknown server");
                     ui.text(name);
                     ui.set_cursor_pos([text_x, text_top + line]);
-                    ui.set_window_font_scale(0.85);
+                    let font_scope = ui.push_font(scaled_face(0.85));
                     ui.text_colored(muted, &resolved.counts);
-                    ui.set_window_font_scale(1.0);
+                    font_scope.pop();
                     ui.set_cursor_pos([start[0] + width - 88.0, button_y]);
                     if member {
                         let disabled = ui.begin_disabled(true);
@@ -4862,7 +5297,7 @@ fn draw_system_row(
             ui.same_line_with_spacing(0.0, 0.0);
         }
         if *bold {
-            let font = ui.push_font(fonts.bold);
+            let font = ui.push_font(fonts.medium);
             ui.text_colored(theme.text, text);
             font.pop();
         } else {
@@ -4881,10 +5316,10 @@ fn draw_system_row(
         if let Some(tooltip) = &system.tooltip {
             ui.tooltip_text(tooltip);
         }
-        if let Some(jump @ SystemAction::JumpTo { .. }) = &system.action {
+        if let Some(link @ (SystemAction::JumpTo { .. } | SystemAction::OpenThread { .. })) = &system.action {
             ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
             if ui.is_mouse_clicked(imgui::MouseButton::Left) {
-                action = Some(jump.clone());
+                action = Some(link.clone());
             }
         }
     }
@@ -5283,9 +5718,9 @@ fn draw_embed(
             _ => None,
         };
         if let Some(line) = footer_line {
-            ui.set_window_font_scale(0.85);
+            let font_scope = ui.push_font(scaled_face(0.85));
             ui.text_colored(theme.text_muted, line);
-            ui.set_window_font_scale(1.0);
+            font_scope.pop();
         }
         ui.unindent_by(12.0);
     });
@@ -5719,13 +6154,12 @@ fn draw_switcher_icon(
         }
         Icon::Initials(text) => {
             draw_list.add_circle(centre, radius, state.theme.border).filled(true).build();
+            let font_scope = ui.push_font(faces().xs);
             let size = ui.calc_text_size(text);
-            let scale = 0.8;
-            let origin = [centre[0] - size[0] * scale / 2.0, centre[1] - size[1] * scale / 2.0];
+            let origin = [centre[0] - size[0] / 2.0, centre[1] - size[1] / 2.0];
             ui.set_cursor_screen_pos(origin);
-            ui.set_window_font_scale(scale);
             ui.text_colored(state.theme.text, text);
-            ui.set_window_font_scale(1.0);
+            font_scope.pop();
         }
         Icon::Channel => {
             let size = ui.calc_text_size("#");
@@ -6550,7 +6984,10 @@ fn draw_channel_header(
             (AppState::dm_display_name(dm), None, avatar)
         }
         (None, Some(channel)) => (
-            format!("#{}", channel.name.clone().unwrap_or_default()),
+            match channel.parent_id.as_deref().filter(|_| channel.is_thread()).and_then(|id| state.find_guild_channel(id)) {
+                Some(parent) => format!("#{} \u{203a} {}", parent.name.clone().unwrap_or_default(), channel.name.clone().unwrap_or_default()),
+                None => format!("#{}", channel.name.clone().unwrap_or_default()),
+            },
             channel.topic.clone().filter(|t| !t.trim().is_empty()),
             None,
         ),
@@ -6580,9 +7017,17 @@ fn draw_channel_header(
         }
 
         let is_one_to_one = dm.is_some_and(|d| d.kind == rustcord_client::models::ChannelType::Dm);
+        let threads_parent = guild_channel.as_ref().and_then(|c| {
+            if c.is_thread() {
+                c.parent_id.clone()
+            } else {
+                matches!(c.kind, rustcord_client::models::ChannelType::GuildText | rustcord_client::models::ChannelType::GuildAnnouncement).then(|| c.id.clone())
+            }
+        });
         let icon_count = match (is_dm, is_one_to_one) {
             (true, true) => 6,
             (true, false) => 5,
+            _ if threads_parent.is_some() => 3,
             _ => 2,
         };
         let icons_width = icon_count as f32 * (ICON_SIZE + ICON_GAP) + HEADER_SEARCH_WIDTH;
@@ -6705,6 +7150,17 @@ fn draw_channel_header(
                 ui.same_line_with_spacing(0.0, ICON_GAP);
             }
         } else {
+            if let Some(parent_id) = threads_parent.clone() {
+                let open = state.thread_browser.as_ref().is_some_and(|b| b.channel_id == parent_id);
+                if icon_button(ui, textures, "header_threads", crate::icons::Icon::MessageCircle, "Threads", open.then_some(state.theme.accent)) {
+                    if open {
+                        state.thread_browser = None;
+                    } else {
+                        open_thread_browser(state, cmd_tx, parent_id);
+                    }
+                }
+                ui.same_line_with_spacing(0.0, ICON_GAP);
+            }
             if let Some(channel_id) = channel_id.clone() {
                 draw_pins_button(ui, state, cmd_tx, textures, &channel_id);
                 ui.same_line_with_spacing(0.0, ICON_GAP);
@@ -7264,9 +7720,9 @@ fn draw_group_dm_row(
     ui.text(truncate_to_width(ui, name, room).as_deref().unwrap_or(name));
     ui.set_cursor_pos([text_x, row_start[1] + 3.0 + ui.text_line_height()]);
     let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-    ui.set_window_font_scale(0.8);
+    let font_scope = ui.push_font(scaled_face(0.8));
     ui.text(format!("{member_count} Members"));
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     token.pop();
     ui.set_cursor_pos([row_start[0], row_start[1] + row_height + ui.clone_style().item_spacing[1]]);
     (clicked, false, right_clicked)
@@ -7325,9 +7781,9 @@ fn draw_profile_panel(
 
     ui.dummy([0.0, 6.0]);
     let bold = ui.push_font(fonts.bold);
-    ui.set_window_font_scale(1.3);
+    let font_scope = ui.push_font(scaled_face(1.3));
     ui.text_wrapped(user.display_name());
-    ui.set_window_font_scale(1.0);
+    font_scope.pop();
     bold.pop();
     ui.text(&user.username);
     if let Some(tag) = user.server_tag() {
@@ -7592,9 +8048,9 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
             ui.set_cursor_pos([content_x, CONTENT_PAD]);
             ui.child_window("settings_content").size([content_w, display_h - CONTENT_PAD * 2.0]).build(|| {
                 let heading_w = (content_w - CLOSE_SIZE - 12.0).max(40.0);
-                ui.set_window_font_scale(1.25);
+                let font_scope = ui.push_font(scaled_face(1.25));
                 ui.text(state.settings_category.label());
-                ui.set_window_font_scale(1.0);
+                font_scope.pop();
                 ui.same_line_with_spacing(heading_w, 0.0);
                 if icon_button(ui, textures, "close_settings", CHROME_ICONS[0], "Close settings", None) {
                     state.show_settings = false;
@@ -7708,9 +8164,9 @@ fn draw_server_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unbounded
             ui.set_cursor_pos([content_x, CONTENT_PAD]);
             ui.child_window("server_settings_content").size([content_w, display_h - CONTENT_PAD * 2.0]).build(|| {
                 let heading_w = (content_w - CLOSE_SIZE - 12.0).max(40.0);
-                ui.set_window_font_scale(1.25);
+                let font_scope = ui.push_font(scaled_face(1.25));
                 ui.text(category.label());
-                ui.set_window_font_scale(1.0);
+                font_scope.pop();
                 ui.same_line_with_spacing(heading_w, 0.0);
                 if icon_button(ui, textures, "close_server_settings", CHROME_ICONS[0], "Close server settings", None) {
                     close = true;
@@ -8614,9 +9070,9 @@ fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache) {
     let text_block = ui.text_line_height() * 2.0 + ui.clone_style().item_spacing[1];
     ui.set_cursor_pos([ui.cursor_pos()[0], row_top + (LOGO_SIZE - text_block) / 2.0]);
     ui.group(|| {
-        ui.set_window_font_scale(1.3);
+        let font_scope = ui.push_font(scaled_face(1.3));
         ui.text(build_info::NAME);
-        ui.set_window_font_scale(1.0);
+        font_scope.pop();
         ui.text_disabled(build_info::version_line());
     });
     ui.set_cursor_pos([ui.cursor_pos()[0], row_top + LOGO_SIZE]);
@@ -9335,9 +9791,9 @@ fn draw_search_panel(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiC
                 .unwrap_or_else(|| "direct message".to_string());
 
             let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-            ui.set_window_font_scale(0.85);
+            let font_scope = ui.push_font(scaled_face(0.85));
             ui.text(format!("{channel_label} — {}", format_result_timestamp(&result.timestamp)));
-            ui.set_window_font_scale(1.0);
+            font_scope.pop();
             token.pop();
 
             ui.text_colored(state.theme.accent, &author);

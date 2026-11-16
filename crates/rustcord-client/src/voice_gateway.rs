@@ -293,14 +293,13 @@ impl VoiceGateway {
         let mut video_decoder_drops_total = 0u64;
         let mut decrypt_success_count: u64 = 0;
         let mut decrypt_failure_count: u64 = 0;
-        let mut decode_success_count: u64 = 0;
-        let mut decode_failure_count: u64 = 0;
         let mut speaking_activity: HashMap<String, Instant> = HashMap::new();
         let mut speaking_check = tokio::time::interval(Duration::from_millis(200));
         let mut bytes_sent: u64 = 0;
         let mut bytes_received: u64 = 0;
         let mut stats_check = tokio::time::interval(Duration::from_secs(1));
-        let mut codec = AudioCodec::new()?;
+        let video_target_bps = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut codec = AudioCodec::new(if self.stream_media { crate::voice_audio::AudioProfile::StreamSound } else { crate::voice_audio::AudioProfile::Voice })?;
         let mut mic: Option<MicCapture> = None;
         let mut speaker: Option<SpeakerPlayback> = None;
         let mut screen_share_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -325,7 +324,7 @@ impl VoiceGateway {
         let mut attempted_input_device: Option<Option<String>> = None;
         let mut attempted_output_device: Option<Option<String>> = None;
         let mut device_check = tokio::time::interval(Duration::from_millis(500));
-        let (mic_frame_tx, mut mic_frame_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+        let (mic_frame_tx, mut mic_frame_rx) = mpsc::unbounded_channel::<crate::voice_audio::MicFrame>();
 
         let (heartbeat_tx, mut heartbeat_rx) = mpsc::unbounded_channel::<()>();
         let heartbeat_task = tokio::spawn(async move {
@@ -387,6 +386,9 @@ impl VoiceGateway {
                         }
                         tracing::debug!("voice: pruning orphaned idle SSRC {ssrc}");
                         codec.drop_ssrc(ssrc);
+                        if let Some(speaker) = speaker.as_ref() {
+                            speaker.forget(ssrc);
+                        }
                         if let Some(active_rtc) = rtc.as_mut() {
                             active_rtc.forget_remote_audio(ssrc);
                         }
@@ -396,6 +398,11 @@ impl VoiceGateway {
                     bytes_sent = 0;
                     bytes_received = 0;
                     let rtc_stats = rtc.as_ref().map(|r| r.stats.clone()).unwrap_or_default();
+                    codec.set_measured_loss(rtc_stats.loss_up);
+                    if self.publish_stream {
+                        let target = rtc_stats.egress_estimate_bps.map(video_target_from_estimate).unwrap_or(0);
+                        video_target_bps.store(target, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let dave = dave_session.epoch_info();
                     #[cfg(feature = "screenshare")]
                     let (video_fps, video_bitrate_down_bps, video_width, video_height, video_codec, video_decrypt_failures_total, video_decoder_drops_total,
@@ -508,8 +515,13 @@ impl VoiceGateway {
                             let framerate = self.media_state.screen_share_fps.load(std::sync::atomic::Ordering::Relaxed);
                             #[cfg(feature = "screenshare")]
                             {
+                                let cap = crate::screen_encode::stream_bitrate_cap(max_height, framerate) as u64;
+                                if let Some(active_rtc) = rtc.as_mut() {
+                                    active_rtc.set_desired_bitrate(cap + STREAM_AUDIO_BITRATE_BPS);
+                                }
+                                let target = video_target_bps.clone();
                                 screen_share_task = Some(tokio::spawn(async move {
-                                    if let Err(error) = capture_and_encode_screen(frames, preview, sharing, max_height, framerate, encoder_choice).await {
+                                    if let Err(error) = capture_and_encode_screen(frames, preview, sharing, max_height, framerate, encoder_choice, target).await {
                                         tracing::warn!("screen share stopped: {error}");
                                     }
                                 }));
@@ -628,7 +640,7 @@ impl VoiceGateway {
                             system_audio_announced = true;
                         }
                         bytes_sent = bytes_sent.saturating_add(payload.len() as u64);
-                        if let Err(error) = active_rtc.send_audio_frame(&payload) {
+                        if let Err(error) = active_rtc.send_audio_frame(&payload, Some(1)) {
                             tracing::debug!("screen audio: failed to send Opus frame: {error}");
                         } else {
                             #[cfg(feature = "screenshare")]
@@ -771,7 +783,7 @@ impl VoiceGateway {
                                     break Err(e.into());
                                 }
                             } else if payload.op == 16 {
-                                let (mut new_rtc, params) = match VoiceRtc::new(ready_audio_ssrc, ready_video_ssrcs).await {
+                                let (mut new_rtc, params) = match VoiceRtc::new(ready_audio_ssrc, ready_video_ssrcs, self.publish_stream).await {
                                     Ok(v) => v,
                                     Err(e) => break Err(e),
                                 };
@@ -923,6 +935,9 @@ impl VoiceGateway {
                                     for ssrc in departed {
                                         remote_speakers.remove(&ssrc);
                                         codec.drop_ssrc(ssrc);
+                                        if let Some(speaker) = speaker.as_ref() {
+                                            speaker.forget(ssrc);
+                                        }
                                         if let Some(active_rtc) = rtc.as_mut() {
                                             active_rtc.forget_remote_audio(ssrc);
                                         }
@@ -1244,7 +1259,7 @@ impl VoiceGateway {
                                 tracing::trace!("voice: dropping incoming video frame because decoder queue is full");
                             }
                         }
-                        Ok(Some(RtcEvent::AudioData { ssrc, payload })) => {
+                        Ok(Some(RtcEvent::AudioData { ssrc, timestamp, payload })) => {
                             received_audio_frame_count += 1;
                             bytes_received += payload.len() as u64;
                             if received_audio_frame_count == 1 || received_audio_frame_count % 50 == 0 {
@@ -1285,34 +1300,15 @@ impl VoiceGateway {
                             } else {
                                 payload
                             };
-                            match codec.decode(ssrc, &decoded_payload) {
-                                Ok(mut pcm) => {
-                                    decode_success_count += 1;
-                                    let user_gain = remote_speakers
-                                        .get(&ssrc)
-                                        .and_then(|user| self.media_state.user_volumes.lock().unwrap().get(user).copied())
-                                        .unwrap_or(1.0);
-                                    if user_gain != 1.0 {
-                                        for s in pcm.iter_mut() {
-                                            *s = (*s as f32 * user_gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                                        }
-                                    }
-                                    if decode_success_count == 1 || decode_success_count % 50 == 0 {
-                                        let peak = pcm.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-                                        tracing::trace!("voice: decoded {decode_success_count} audio frames so far, latest peak sample magnitude {peak}");
-                                    }
-                                    if let Some(speaker) = speaker.as_ref() {
-                                        speaker.push_frame(ssrc, pcm);
-                                    } else {
-                                        tracing::debug!("voice: decoded audio but no speaker available");
-                                    }
-                                }
-                                Err(e) => {
-                                    decode_failure_count += 1;
-                                    if decode_failure_count == 1 || decode_failure_count % 20 == 0 {
-                                        tracing::warn!("voice: opus decode failed ({decode_failure_count} total): {e}");
-                                    }
-                                }
+                            codec.note_packet(ssrc);
+                            let user_gain = remote_speakers
+                                .get(&ssrc)
+                                .and_then(|user| self.media_state.user_volumes.lock().unwrap().get(user).copied())
+                                .unwrap_or(1.0);
+                            if let Some(speaker) = speaker.as_ref() {
+                                speaker.push_packet(ssrc, timestamp, decoded_payload, user_gain);
+                            } else {
+                                tracing::debug!("voice: received audio but no speaker available");
                             }
                         }
                         Ok(None) => {}
@@ -1345,7 +1341,7 @@ impl VoiceGateway {
                         }
                     }
                 }
-                Some(pcm_frame) = mic_frame_rx.recv(), if !self.stream_media => {
+                Some(mic_frame) = mic_frame_rx.recv(), if !self.stream_media => {
                     let now = Instant::now();
                     if let Some(prev) = last_select_entry {
                         let gap = now.duration_since(prev);
@@ -1358,13 +1354,13 @@ impl VoiceGateway {
                     if mic_frame_count % 50 == 0 {
                         tracing::trace!("voice: sent {mic_frame_count} mic frames so far");
                     }
-                    if speaking_activity.insert(self.user_id.clone(), Instant::now()).is_none() {
+                    if !mic_frame.audio.is_silence() && speaking_activity.insert(self.user_id.clone(), Instant::now()).is_none() {
                         let local_ssrc = rtc.as_ref().map(|r| r.audio_ssrc()).unwrap_or_default();
                         let _ = tx.send(VoiceGatewayEvent::Speaking { ssrc: local_ssrc, user_id: Some(self.user_id.clone()), speaking: true });
                     }
-                    match codec.encode(&pcm_frame) {
+                    match mic_frame.audio.opus(&codec) {
                         Ok(opus_payload) => {
-                            let outgoing_payload = if dave_enabled {
+                            let outgoing_payload = if dave_enabled && !mic_frame.audio.is_silence() {
                                 match frame_crypto.encrypt(&opus_payload) {
                                     Some(encrypted) => encrypted,
                                     None => {
@@ -1380,7 +1376,7 @@ impl VoiceGateway {
                                     tracing::trace!("voice: submitting {} byte Opus frame to RTC, DAVE enabled={dave_enabled}", outgoing_payload.len());
                                 }
                                 bytes_sent += outgoing_payload.len() as u64;
-                                if let Err(e) = active_rtc.send_audio_frame(&outgoing_payload) {
+                                if let Err(e) = active_rtc.send_audio_frame(&outgoing_payload, mic_frame.frames_since_last) {
                                     tracing::debug!("voice: failed to send audio frame: {e}");
                                 }
                             } else {
@@ -1417,13 +1413,14 @@ async fn capture_and_encode_screen(
     max_height: u32,
     framerate: u32,
     #[cfg(feature = "screenshare")] encoder_choice: crate::screen_encode::EncoderChoice,
+    #[cfg(feature = "screenshare")] target_bps: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
     #[cfg(feature = "screenshare")]
     {
         let capture = crate::screen_capture::ScreenCapture::start(framerate)
             .await
             .map_err(|error| error.to_string())?;
-        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, preview, sharing, max_height, framerate, encoder_choice))
+        tokio::task::spawn_blocking(move || encode_screen_frames(capture, frames, preview, sharing, max_height, framerate, encoder_choice, target_bps))
             .await
             .map_err(|error| format!("screen encoder worker failed: {error}"))?
     }
@@ -1470,7 +1467,7 @@ fn capture_and_encode_camera(
             None
         }
     };
-    encode_video_frames(next_frame, frames, enabled, settings.height, settings.frame_rate, choice, "camera")?;
+    encode_video_frames(next_frame, frames, enabled, settings.height, settings.frame_rate, choice, None, "camera")?;
     failure.map_or(Ok(()), Err)
 }
 
@@ -1580,6 +1577,7 @@ fn encode_screen_frames(
     max_height: u32,
     framerate: u32,
     encoder_choice: crate::screen_encode::EncoderChoice,
+    target_bps: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
     let mut captured = 0u64;
     let next_frame = || {
@@ -1590,7 +1588,13 @@ fn encode_screen_frames(
         }
         Some(frame)
     };
-    encode_video_frames(next_frame, frames, sharing, max_height, framerate, encoder_choice, "screen share")
+    encode_video_frames(next_frame, frames, sharing, max_height, framerate, encoder_choice, Some(target_bps), "screen share")
+}
+
+const STREAM_AUDIO_BITRATE_BPS: u64 = 64_000;
+
+fn video_target_from_estimate(estimate_bps: u64) -> u64 {
+    (estimate_bps / 10 * 9).saturating_sub(STREAM_AUDIO_BITRATE_BPS)
 }
 
 #[cfg(feature = "screenshare")]
@@ -1601,23 +1605,41 @@ fn encode_video_frames(
     max_height: u32,
     framerate: u32,
     encoder_choice: crate::screen_encode::EncoderChoice,
+    target_bps: Option<Arc<std::sync::atomic::AtomicU64>>,
     source: &'static str,
 ) -> Result<(), String> {
-    use crate::screen_encode::{EncodeTimingSample, EncoderSettings, ScreenEncoder};
+    use crate::screen_encode::{bitrate_change, desired_bitrate, stream_bitrate_cap, BitrateChange, EncodeTimingSample, EncoderSettings, ScreenEncoder};
 
+    let cap = stream_bitrate_cap(max_height, framerate);
+    let target = || target_bps.as_ref().map_or(0, |target| target.load(std::sync::atomic::Ordering::Relaxed));
     let mut encoder: Option<ScreenEncoder> = None;
+    let mut configured_bps = cap;
+    let mut built_at = Instant::now();
     let mut timing_started = Instant::now();
     let mut timing = EncodeTimingSample::default();
     let mut queue_drops = 0u64;
     while sharing.load(std::sync::atomic::Ordering::Relaxed) {
         let Some(frame) = next_frame() else { break };
+        let wanted_bps = desired_bitrate(cap, target());
+        if let Some(current) = encoder.as_mut() {
+            match bitrate_change(configured_bps, wanted_bps, current.supports_live_bitrate(), built_at.elapsed()) {
+                BitrateChange::Keep => {}
+                BitrateChange::Live => {
+                    if current.set_live_bitrate(wanted_bps) {
+                        tracing::info!(from_bps = configured_bps, to_bps = wanted_bps, source, "video encoder follows the send rate estimate");
+                        configured_bps = wanted_bps;
+                    }
+                }
+                BitrateChange::Rebuild => {
+                    tracing::info!(from_bps = configured_bps, to_bps = wanted_bps, source, "rebuilding the video encoder for the send rate estimate");
+                    encoder = None;
+                }
+            }
+        }
         if encoder.as_ref().is_none_or(|current| !current.matches_source(frame.width, frame.height, frame.layout)) {
-            let bitrate_bps = match (max_height >= 1080, framerate >= 60) {
-                (true, true) => 4_000_000,
-                (true, false) => 2_500_000,
-                (false, true) => 2_500_000,
-                (false, false) => 1_500_000,
-            };
+            let bitrate_bps = wanted_bps;
+            configured_bps = bitrate_bps;
+            built_at = Instant::now();
             let settings = EncoderSettings {
                 max_height,
                 bitrate_bps,
@@ -1972,7 +1994,13 @@ mod camera_tests {
 
 #[cfg(test)]
 mod drive_tests {
-    use super::rtc_needs_drive;
+    use super::{rtc_needs_drive, video_target_from_estimate};
+
+    #[test]
+    fn the_video_target_leaves_headroom_and_room_for_the_streams_sound() {
+        assert_eq!(video_target_from_estimate(2_000_000), 1_736_000);
+        assert_eq!(video_target_from_estimate(50_000), 0);
+    }
 
     #[test]
     fn an_idle_rtc_is_only_driven_again_after_another_branch_has_run() {

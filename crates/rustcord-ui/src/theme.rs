@@ -35,6 +35,18 @@ pub struct Theme {
     pub call_missed: Option<[f32; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fonts: Option<ThemeFonts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floating: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danger: Option<[f32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_faint: Option<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -154,19 +166,34 @@ fn darken(color: [f32; 4], factor: f32) -> [f32; 4] {
     [color[0] * factor, color[1] * factor, color[2] * factor, color[3]]
 }
 
+fn blend(base: [f32; 4], over: [f32; 4], amount: f32) -> [f32; 4] {
+    std::array::from_fn(|i| if i == 3 { base[3] } else { base[i] + (over[i] - base[i]) * amount })
+}
+
+fn with_alpha(color: [f32; 4], alpha: f32) -> [f32; 4] {
+    [color[0], color[1], color[2], alpha]
+}
+
+fn luma(color: [f32; 4]) -> f32 {
+    0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2]
+}
+
+const CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+const RETIRED_DISCORD_DARK: &str = "name = \"discord-dark\"\nbackground = [0.13, 0.14, 0.16, 1.0]\npanel = [0.17, 0.18, 0.20, 1.0]\ntext = [0.90, 0.90, 0.92, 1.0]\ntext_muted = [0.60, 0.62, 0.66, 1.0]\naccent = [0.35, 0.40, 0.95, 1.0]\naccent_hover = [0.45, 0.50, 1.0, 1.0]\nborder = [0.08, 0.09, 0.10, 1.0]";
+
 impl Default for Theme {
     fn default() -> Self {
         Self {
             name: "discord-dark".into(),
-            background: [0.212, 0.224, 0.247, 1.0],
-            panel: [0.184, 0.192, 0.212, 1.0],
-            servers_bg: None,
-            user_bar_bg: None,
-            text: [0.863, 0.867, 0.871, 1.0],
-            text_muted: [0.584, 0.612, 0.639, 1.0],  
-            accent: [0.345, 0.396, 0.949, 1.0],      
+            background: [0.192, 0.200, 0.220, 1.0],
+            panel: [0.169, 0.176, 0.192, 1.0],
+            servers_bg: Some([0.118, 0.122, 0.133, 1.0]),
+            user_bar_bg: Some([0.137, 0.141, 0.157, 1.0]),
+            text: [0.859, 0.871, 0.882, 1.0],
+            text_muted: [0.580, 0.608, 0.643, 1.0],
+            accent: [0.345, 0.396, 0.949, 1.0],
             accent_hover: [0.278, 0.322, 0.816, 1.0],
-            border: [0.133, 0.141, 0.153, 1.0],  
+            border: [0.118, 0.122, 0.133, 1.0],
             mention_badge: None,
             gradient: None,
             use_global_gradient: false,
@@ -177,6 +204,12 @@ impl Default for Theme {
             call_active: None,
             call_missed: None,
             fonts: None,
+            field: Some([0.220, 0.227, 0.251, 1.0]),
+            floating: Some([0.067, 0.071, 0.078, 1.0]),
+            line: Some([0.247, 0.255, 0.278, 1.0]),
+            link: None,
+            danger: None,
+            text_faint: None,
         }
     }
 }
@@ -221,6 +254,86 @@ impl Theme {
         self.user_bar_bg.unwrap_or_else(|| darken(self.panel, 0.92))
     }
 
+    pub fn is_light(&self) -> bool {
+        luma(self.background) > 0.5
+    }
+
+    pub fn field(&self) -> [f32; 4] {
+        self.field.unwrap_or_else(|| blend(self.background, self.text, 0.05))
+    }
+
+    pub fn floating(&self) -> [f32; 4] {
+        self.floating.unwrap_or_else(|| if self.is_light() { blend(self.panel, [1.0; 4], 0.6) } else { darken(self.panel, 0.45) })
+    }
+
+    pub fn line(&self) -> [f32; 4] {
+        self.line.unwrap_or_else(|| blend(self.panel, self.text, 0.10))
+    }
+
+    pub fn link(&self) -> [f32; 4] {
+        self.link.unwrap_or([0.0, 0.659, 0.988, 1.0])
+    }
+
+    pub fn danger(&self) -> [f32; 4] {
+        self.danger.unwrap_or_else(|| self.mention_badge())
+    }
+
+    pub fn text_faint(&self) -> [f32; 4] {
+        self.text_faint.unwrap_or_else(|| blend(self.text_muted, self.background, 0.35))
+    }
+
+    pub fn overlay(&self, alpha: f32) -> [f32; 4] {
+        with_alpha(self.text, alpha)
+    }
+
+    pub fn hover(&self) -> [f32; 4] {
+        self.overlay(0.06)
+    }
+
+    pub fn selected(&self) -> [f32; 4] {
+        self.overlay(0.12)
+    }
+
+    pub fn style_color(&self, slot: imgui::StyleColor) -> [f32; 4] {
+        use imgui::StyleColor::*;
+        let solid_field = |amount: f32| blend(self.field(), self.text, amount);
+        match slot {
+            Text => self.text,
+            TextDisabled => self.text_muted,
+            WindowBg => if self.use_global_gradient { with_alpha(self.background, 0.84) } else { self.background },
+            ChildBg => if self.use_global_gradient { with_alpha(self.panel, 0.86) } else { self.panel },
+            PopupBg => self.floating(),
+            Border => self.border,
+            BorderShadow => CLEAR,
+            FrameBg => self.field(),
+            FrameBgHovered => solid_field(0.04),
+            FrameBgActive => solid_field(0.07),
+            TitleBg | TitleBgActive | TitleBgCollapsed | MenuBarBg => self.panel,
+            ScrollbarBg => CLEAR,
+            ScrollbarGrab => self.overlay(0.12),
+            ScrollbarGrabHovered => self.overlay(0.20),
+            ScrollbarGrabActive => self.overlay(0.28),
+            CheckMark | SliderGrab | PlotLines | PlotHistogram | DragDropTarget | NavHighlight => self.accent,
+            SliderGrabActive | PlotLinesHovered | PlotHistogramHovered => self.accent_hover,
+            Button => self.accent,
+            ButtonHovered => self.accent_hover,
+            ButtonActive => darken(self.accent_hover, 0.9),
+            Header | TabActive => self.selected(),
+            HeaderHovered | TabHovered => self.hover(),
+            HeaderActive => self.overlay(0.16),
+            Separator | TableBorderStrong | TableBorderLight => self.line(),
+            SeparatorHovered | SeparatorActive => self.accent,
+            ResizeGrip | ResizeGripHovered | ResizeGripActive | Tab | TabUnfocused | TableRowBg => CLEAR,
+            TabUnfocusedActive => self.overlay(0.08),
+            TableHeaderBg => blend(self.panel, self.text, 0.04),
+            TableRowBgAlt => self.overlay(0.02),
+            TextSelectedBg => with_alpha(self.accent, 0.35),
+            NavWindowingHighlight => self.overlay(0.7),
+            NavWindowingDimBg | ModalWindowDimBg => [0.0, 0.0, 0.0, 0.6],
+            _ => self.panel,
+        }
+    }
+
     const BUNDLED: [(&'static str, &'static str); 7] = [
         ("discord-dark.toml", include_str!("../../../themes/discord-dark.toml")),
         ("nord.toml", include_str!("../../../themes/nord.toml")),
@@ -245,41 +358,27 @@ impl Theme {
     }
 
     pub fn apply(&self, style: &mut imgui::Style) {
-        use imgui::StyleColor::*;
-        style[WindowBg] = if self.use_global_gradient { [self.background[0], self.background[1], self.background[2], 0.84] } else { self.background };
-        style[ChildBg] = if self.use_global_gradient { [self.panel[0], self.panel[1], self.panel[2], 0.86] } else { self.panel };
-        style[PopupBg] = self.panel;
-        style[Text] = self.text;
-        style[TextDisabled] = self.text_muted;
-        style[Button] = self.accent;
-        style[ButtonHovered] = self.accent_hover;
-        style[ButtonActive] = self.accent_hover;
-        style[Header] = [self.accent[0], self.accent[1], self.accent[2], 0.22];
-        style[HeaderHovered] = [self.accent_hover[0], self.accent_hover[1], self.accent_hover[2], 0.30];
-        style[HeaderActive] = [self.accent_hover[0], self.accent_hover[1], self.accent_hover[2], 0.38];
-        style[Border] = self.border;
-        style[FrameBg] = self.panel;
-        style[FrameBgHovered] = [self.accent[0], self.accent[1], self.accent[2], 0.22];
-        style[FrameBgActive] = [self.accent_hover[0], self.accent_hover[1], self.accent_hover[2], 0.30];
-
-        style[ScrollbarGrabHovered] = self.border;
-        style[ScrollbarGrabActive] = self.panel;
+        for slot in imgui::StyleColor::VARIANTS {
+            style[slot] = self.style_color(slot);
+        }
 
         style.window_border_size = 0.0;
         style.child_border_size = 0.0;
         style.popup_border_size = 1.0;
         style.frame_border_size = 0.0;
 
-        style.frame_rounding = 5.0;
+        style.frame_rounding = 4.0;
         style.popup_rounding = 8.0;
         style.child_rounding = 4.0;
-        style.scrollbar_rounding = 4.0;
+        style.scrollbar_rounding = 8.0;
         style.grab_rounding = 4.0;
+        style.tab_rounding = 4.0;
 
         style.window_padding = [12.0, 12.0];
         style.frame_padding = [9.0, 6.0];
         style.item_spacing = [8.0, 6.0];
-        style.scrollbar_size = 10.0;
+        style.scrollbar_size = 8.0;
+        style.selectable_text_align = [0.0, 0.5];
     }
 
     pub fn themes_dir() -> Option<PathBuf> {
@@ -295,7 +394,9 @@ impl Theme {
         }
         for (name, contents) in Self::BUNDLED {
             let path = dir.join(name);
-            if !path.exists() {
+            let retired = name == "discord-dark.toml"
+                && std::fs::read_to_string(&path).is_ok_and(|current| current.trim() == RETIRED_DISCORD_DARK);
+            if !path.exists() || retired {
                 if let Err(error) = std::fs::write(&path, contents) {
                     tracing::warn!("could not install bundled theme {}: {error}", path.display());
                 }
@@ -320,6 +421,43 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_palette_layers_rail_sidebar_chat_from_dark_to_light() {
+        let (_, text) = Theme::BUNDLED.iter().find(|(name, _)| *name == "discord-dark.toml").expect("bundled");
+        for theme in [toml::from_str::<Theme>(text).unwrap(), Theme::default()] {
+            assert!(luma(theme.servers_bg()) < luma(theme.panel), "{}", theme.name);
+            assert!(luma(theme.panel) < luma(theme.background), "{}", theme.name);
+            assert!(luma(theme.floating()) < luma(theme.servers_bg()));
+        }
+    }
+
+    #[test]
+    fn the_retired_default_is_recognised_for_upgrade() {
+        let retired: Theme = toml::from_str(RETIRED_DISCORD_DARK).unwrap();
+        assert!(luma(retired.background) < luma(retired.panel));
+    }
+
+    #[test]
+    fn hovers_are_neutral_and_every_slot_is_themed() {
+        let theme = Theme::default();
+        for slot in [imgui::StyleColor::Header, imgui::StyleColor::HeaderHovered, imgui::StyleColor::FrameBgHovered, imgui::StyleColor::TabHovered] {
+            let color = theme.style_color(slot);
+            assert!((color[0] - color[2]).abs() < 0.05, "{slot:?} is tinted: {color:?}");
+        }
+        assert_eq!(theme.style_color(imgui::StyleColor::PlotHistogram), theme.accent);
+        assert_eq!(theme.style_color(imgui::StyleColor::ScrollbarBg)[3], 0.0);
+    }
+
+    #[test]
+    fn themes_without_the_new_tokens_still_derive_them() {
+        for (name, text) in Theme::BUNDLED {
+            let theme: Theme = toml::from_str(text).unwrap();
+            let light = theme.is_light();
+            let floating = theme.floating();
+            assert_eq!(light, luma(floating) > 0.5, "{name}: popups should match the theme's lightness");
+        }
+    }
 
     #[test]
     fn every_bundled_theme_parses() {
