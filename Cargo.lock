@@ -6759,7 +6759,7 @@ dependencies = [
 
 [[package]]
 name = "rustcord-client"
-version = "0.1.0"
+version = "0.2.94"
 dependencies = [
  "aes 0.8.4",
  "ashpd 0.13.13",
@@ -6806,7 +6806,7 @@ dependencies = [
 
 [[package]]
 name = "rustcord-ui"
-version = "0.1.0"
+version = "0.2.94"
 dependencies = [
  "arboard",
  "chrono",

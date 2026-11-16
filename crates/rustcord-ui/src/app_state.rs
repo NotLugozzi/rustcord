@@ -611,6 +611,8 @@ pub struct AppState {
     pub emoji_autocomplete_selected: usize,
     pub mention_autocomplete_selected: usize,
     pub gateway_connected: bool,
+    pub restored_from_cache: bool,
+    pub session_retry_at: Option<std::time::Instant>,
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
     pub active_streams: HashMap<String, String>,
     pub watching_stream: Option<String>,

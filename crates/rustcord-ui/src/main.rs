@@ -1,3 +1,4 @@
+mod anim;
 mod app_state;
 mod build_info;
 mod backend;
@@ -16,6 +17,7 @@ mod message_rows;
 mod presence;
 mod renderer;
 mod session_store;
+mod startup_cache;
 mod settings;
 mod switcher;
 mod theme;
@@ -107,7 +109,16 @@ fn main() {
     match session_store::load_token() {
         Ok(Some(token)) => {
             state.login_status = Some("Resuming saved session...".into());
+            if let Some(snapshot) = startup_cache::load() {
+                snapshot.apply(&mut state);
+            }
             let _ = cmd_tx.send(UiCommand::LoginWithToken { token });
+            if let Some(guild_id) = state.selected_guild.clone() {
+                let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id });
+            }
+            if let Some(channel_id) = state.selected_channel.clone() {
+                let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id });
+            }
         }
         Ok(None) => {}
         Err(_) => tracing::warn!("failed to read saved credentials"),
@@ -137,11 +148,17 @@ fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Messa
     let _ = cmd_tx.send(UiCommand::ShowNotification { title, body, avatar_url });
 }
 
+const SESSION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn drain_backend_events(
     state: &mut AppState,
     event_rx: &mut mpsc::UnboundedReceiver<BackendEvent>,
     cmd_tx: &mpsc::UnboundedSender<UiCommand>,
 ) -> DrainedMedia {
+    if state.session_retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
+        state.session_retry_at = None;
+        let _ = cmd_tx.send(UiCommand::ResumeSavedSession);
+    }
     let mut media = DrainedMedia::default();
     while let Ok(event) = event_rx.try_recv() {
         match event {
@@ -149,10 +166,27 @@ pub fn drain_backend_events(
                 state.logged_in = true;
                 state.login_error = None;
                 state.login_status = None;
+                state.session_retry_at = None;
             }
             BackendEvent::LoginFailed(err) => {
+                if state.restored_from_cache {
+                    startup_cache::forget_cached_account(state);
+                    startup_cache::clear();
+                    state.current_user = None;
+                    state.guilds.clear();
+                    state.logged_in = false;
+                }
                 state.login_error = Some(err);
                 state.login_status = None;
+            }
+            BackendEvent::SessionUnreachable(err) => {
+                if state.restored_from_cache {
+                    tracing::info!("discord is unreachable, keeping the cached session and retrying: {err}");
+                    state.session_retry_at = Some(std::time::Instant::now() + SESSION_RETRY_DELAY);
+                } else {
+                    state.login_error = Some(err);
+                    state.login_status = None;
+                }
             }
             BackendEvent::MfaRequired { ticket } => {
                 state.mfa_ticket = Some(ticket);
@@ -187,6 +221,15 @@ pub fn drain_backend_events(
                 state.gateway_connected = false;
             }
             BackendEvent::Gateway(GatewayEvent::Ready { user, guilds, friend_presences }) => {
+                if state.restored_from_cache {
+                    let same_account = state.current_user.as_ref().is_some_and(|cached| cached.id == user.id);
+                    if !same_account {
+                        let fresh_channels = std::mem::take(&mut state.guild_channels);
+                        startup_cache::forget_cached_account(state);
+                        state.guild_channels = fresh_channels;
+                    }
+                    state.restored_from_cache = false;
+                }
                 state.gateway_connected = true;
                 state.current_user = Some(user);
                 let guild_ids = guilds.iter().map(|g| g.id.clone()).collect();
@@ -227,6 +270,12 @@ pub fn drain_backend_events(
                 state.reached_start.remove(&channel_id);
                 state.scroll_to_message = Some(message_id);
                 state.viewing_jumped_history = true;
+            }
+            BackendEvent::Gateway(GatewayEvent::InitialGuildChannels(guilds)) if state.restored_from_cache => {
+                tracing::info!("replacing cached channels for {} guilds from READY", guilds.len());
+                for (guild_id, channels) in guilds {
+                    state.guild_channels.insert(guild_id, channels);
+                }
             }
             BackendEvent::Gateway(GatewayEvent::InitialGuildChannels(guilds)) => {
                 let count = state.seed_guild_channels(guilds);

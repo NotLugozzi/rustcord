@@ -250,6 +250,7 @@ impl AppWindow {
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
         let media = drain_backend_events(state, event_rx, cmd_tx);
+        crate::startup_cache::autosave(state);
         self.textures.sync_icons(self.window.scale_factor() as f32, &self.device, &self.queue, &mut self.imgui.renderer);
         for (url, image) in media.images {
             self.textures.ingest(url, image, &self.device, &self.queue, &mut self.imgui.renderer);
@@ -567,7 +568,10 @@ impl ApplicationHandler for App {
                 window.resize(size.width, size.height);
                 self.needs_redraw = true;
             }
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                crate::startup_cache::save_now(&self.state);
+                event_loop.exit();
+            }
             WindowEvent::RedrawRequested => self.needs_redraw = false,
             WindowEvent::Focused(focused) => {
                 self.state.window_focused = *focused;
@@ -642,7 +646,7 @@ impl ApplicationHandler for App {
                 dev.window.request_redraw();
             }
         }
-        let active = self.last_input.elapsed() < Duration::from_millis(400);
+        let active = self.last_input.elapsed() < Duration::from_millis(400) || crate::anim::is_moving();
         let animating = window.textures.animating || window.textures.has_wanted_icons() || self.state.voice_audio_active();
         let typing = self.state.selected_channel.as_deref().is_some_and(|channel| {
             self.state.typing_users_for(channel).iter().any(|id| self.state.current_user.as_ref().is_none_or(|me| me.id != *id))

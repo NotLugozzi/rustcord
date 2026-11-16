@@ -50,3 +50,5 @@ x.svg                close settings
 
 The artwork uses stroke="currentColor"; the renderer rasterizes it as a white
 alpha mask (resvg) and tints it from theme colors at draw time.
+hash.svg             text channels (channel list)
+megaphone.svg        announcement channels (channel list)

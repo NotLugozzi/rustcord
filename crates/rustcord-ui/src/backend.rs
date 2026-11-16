@@ -468,6 +468,7 @@ pub enum UiCommand {
     LoadVoiceDevices,
     RunMicTest { input_device: Option<String>, output_device: Option<String> },
     Logout,
+    ResumeSavedSession,
 }
 
 pub const HISTORY_PAGE_SIZE: u32 = 50;
@@ -494,6 +495,7 @@ pub enum BackendEvent {
     MfaRequired { ticket: String },
     CaptchaInProgress,
     LoginFailed(String),
+    SessionUnreachable(String),
     LoggedIn,
     Error(String),
     RpcApps(Vec<crate::presence::RpcAppInfo>),
@@ -1824,6 +1826,11 @@ pub fn spawn(
                         let _ = event_tx.send(BackendEvent::MicTestFinished);
                     });
                 }
+                UiCommand::ResumeSavedSession => {
+                    if let Ok(Ok(Some(token))) = serialized_credential_op(session_store::load_token).await {
+                        start_session(token, &mut rest, &event_tx).await;
+                    }
+                }
                 UiCommand::Logout => {
                     stop_gateway().await;
                     match serialized_credential_op(session_store::clear_token).await {
@@ -2199,6 +2206,10 @@ async fn start_session(
 
     match client.current_user().await {
         Ok(me) => presence::set_me(serde_json::to_value(me).unwrap_or_default()),
+        Err(e @ rustcord_client::error::ClientError::Http(_)) => {
+            let _ = event_tx.send(BackendEvent::SessionUnreachable(e.to_string()));
+            return;
+        }
         Err(e) => {
             let _ = event_tx.send(BackendEvent::LoginFailed(e.to_string()));
             return;
