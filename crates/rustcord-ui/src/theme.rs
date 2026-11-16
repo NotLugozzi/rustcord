@@ -179,6 +179,23 @@ fn luma(color: [f32; 4]) -> f32 {
 }
 
 const CLEAR: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+const BUNDLED_MANIFEST: &str = ".bundled";
+
+fn content_hash(text: &str) -> String {
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016x}")
+}
+
+fn parse_manifest(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines().filter_map(|line| line.split_once(' ')).map(|(name, hash)| (name.to_string(), hash.trim().to_string())).collect()
+}
+
+fn bundled_copy_is_pristine(name: &str, current: Option<&str>, recorded_hash: Option<&str>) -> bool {
+    let Some(current) = current else { return true };
+    let untouched = recorded_hash.is_some_and(|hash| hash == content_hash(current));
+    let retired_default = name == "discord-dark.toml" && current.trim() == RETIRED_DISCORD_DARK;
+    untouched || retired_default
+}
 const RETIRED_DISCORD_DARK: &str = "name = \"discord-dark\"\nbackground = [0.13, 0.14, 0.16, 1.0]\npanel = [0.17, 0.18, 0.20, 1.0]\ntext = [0.90, 0.90, 0.92, 1.0]\ntext_muted = [0.60, 0.62, 0.66, 1.0]\naccent = [0.35, 0.40, 0.95, 1.0]\naccent_hover = [0.45, 0.50, 1.0, 1.0]\nborder = [0.08, 0.09, 0.10, 1.0]";
 
 impl Default for Theme {
@@ -334,7 +351,7 @@ impl Theme {
         }
     }
 
-    const BUNDLED: [(&'static str, &'static str); 7] = [
+    const BUNDLED: [(&'static str, &'static str); 9] = [
         ("discord-dark.toml", include_str!("../../../themes/discord-dark.toml")),
         ("nord.toml", include_str!("../../../themes/nord.toml")),
         ("solarized-light.toml", include_str!("../../../themes/solarized-light.toml")),
@@ -342,6 +359,8 @@ impl Theme {
         ("sunset-gradient.toml", include_str!("../../../themes/sunset-gradient.toml")),
         ("cosmic-gradient.toml", include_str!("../../../themes/cosmic-gradient.toml")),
         ("cyberpunk.toml", include_str!("../../../themes/cyberpunk.toml")),
+        ("gruvbox-dark.toml", include_str!("../../../themes/gruvbox-dark.toml")),
+        ("gruvbox-light.toml", include_str!("../../../themes/gruvbox-light.toml")),
     ];
 
     pub fn load_from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
@@ -392,15 +411,28 @@ impl Theme {
             tracing::warn!("could not create themes directory {}: {error}", dir.display());
             return;
         }
+        let manifest_path = dir.join(BUNDLED_MANIFEST);
+        let mut manifest = parse_manifest(&std::fs::read_to_string(&manifest_path).unwrap_or_default());
         for (name, contents) in Self::BUNDLED {
             let path = dir.join(name);
-            let retired = name == "discord-dark.toml"
-                && std::fs::read_to_string(&path).is_ok_and(|current| current.trim() == RETIRED_DISCORD_DARK);
-            if !path.exists() || retired {
-                if let Err(error) = std::fs::write(&path, contents) {
-                    tracing::warn!("could not install bundled theme {}: {error}", path.display());
-                }
+            let current = std::fs::read_to_string(&path).ok();
+            if current.as_deref() == Some(contents) {
+                manifest.insert(name.to_string(), content_hash(contents));
+                continue;
             }
+            if !bundled_copy_is_pristine(name, current.as_deref(), manifest.get(name).map(String::as_str)) {
+                continue;
+            }
+            match std::fs::write(&path, contents) {
+                Ok(()) => {
+                    manifest.insert(name.to_string(), content_hash(contents));
+                }
+                Err(error) => tracing::warn!("could not install bundled theme {}: {error}", path.display()),
+            }
+        }
+        let text: String = manifest.iter().map(|(name, hash)| format!("{name} {hash}\n")).collect();
+        if let Err(error) = std::fs::write(&manifest_path, text) {
+            tracing::warn!("could not record bundled themes: {error}");
         }
     }
 
@@ -429,6 +461,37 @@ mod tests {
             assert!(luma(theme.servers_bg()) < luma(theme.panel), "{}", theme.name);
             assert!(luma(theme.panel) < luma(theme.background), "{}", theme.name);
             assert!(luma(theme.floating()) < luma(theme.servers_bg()));
+        }
+    }
+
+    #[test]
+    fn bundled_themes_update_only_when_the_user_has_not_edited_them() {
+        let old = "name = \"nord\"";
+        let recorded = content_hash(old);
+        assert!(bundled_copy_is_pristine("nord.toml", None, None));
+        assert!(bundled_copy_is_pristine("nord.toml", Some(old), Some(&recorded)));
+        assert!(!bundled_copy_is_pristine("nord.toml", Some("name = \"mine\""), Some(&recorded)));
+        assert!(!bundled_copy_is_pristine("nord.toml", Some(old), None));
+        assert!(bundled_copy_is_pristine("discord-dark.toml", Some(RETIRED_DISCORD_DARK), None));
+        let manifest = parse_manifest(&format!("nord.toml {recorded}\ncyberpunk.toml abc\n"));
+        assert_eq!(manifest.get("nord.toml"), Some(&recorded));
+        assert_eq!(content_hash("x"), content_hash("x"));
+        assert_ne!(content_hash("x"), content_hash("y"));
+    }
+
+    #[test]
+    fn every_bundled_theme_sets_the_new_roles() {
+        for (name, text) in Theme::BUNDLED {
+            let theme: Theme = toml::from_str(text).unwrap();
+            assert!(theme.field.is_some() && theme.floating.is_some() && theme.line.is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn solid_themes_layer_rail_sidebar_chat_by_lightness() {
+        for (name, text) in Theme::BUNDLED.iter().filter(|(name, _)| !name.contains("gradient") && *name != "cyberpunk.toml") {
+            let theme: Theme = toml::from_str(text).unwrap();
+            assert!(luma(theme.servers_bg()) < luma(theme.panel) && luma(theme.panel) < luma(theme.background), "{name}");
         }
     }
 

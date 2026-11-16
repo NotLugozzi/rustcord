@@ -633,32 +633,114 @@ const MEMBERS_PANEL_WIDTH: f32 = 240.0;
 const PROFILE_PANEL_WIDTH: f32 = 300.0;
 const SEARCH_PANEL_WIDTH: f32 = 340.0;
 
-fn draw_rail_circle(ui: &Ui, color: [f32; 4], size: [f32; 2]) {
-    let p_min = ui.cursor_screen_pos();
-    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
-    let center = [(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0];
-    ui.get_window_draw_list()
-        .add_circle(center, size[0].min(size[1]) / 2.0, color)
-        .filled(true)
-        .build();
+const RAIL_TILE_SQUARE_RATIO: f32 = 16.0 / 48.0;
+const RAIL_PILL_WIDTH: f32 = 4.0;
+const RAIL_MORPH_TAU: f32 = 0.05;
+const RAIL_PILL_TAU: f32 = 0.06;
+
+fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
 
-fn draw_circular_image_button_placeholder(ui: &Ui, id: &str, label: &str, size: [f32; 2]) -> bool {
-    let p_min = ui.cursor_screen_pos();
-    let p_max = [p_min[0] + size[0], p_min[1] + size[1]];
-    let center = [(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0];
-    let text_size = ui.calc_text_size(label);
-    ui.set_cursor_screen_pos([center[0] - text_size[0] / 2.0, center[1] - text_size[1] / 2.0]);
-    ui.text(label);
-    ui.set_cursor_screen_pos(p_min);
+fn guild_acronym(name: &str) -> String {
+    let acronym: String = name.split_whitespace().filter_map(|word| word.chars().next()).take(4).collect();
+    if acronym.is_empty() { "?".into() } else { acronym }
+}
+
+struct RailTileLook<'a> {
+    image: Option<imgui::TextureId>,
+    label: Option<&'a str>,
+    icon: Option<crate::icons::Icon>,
+    rest_fill: [f32; 4],
+    lit_fill: [f32; 4],
+    ink: [f32; 4],
+    lit_ink: [f32; 4],
+    pill: bool,
+}
+
+fn draw_rail_pill(ui: &Ui, theme: &crate::theme::Theme, id: &str, center_y: f32, selected: bool, hovered: bool, unread: bool) {
+    let target = if selected {
+        40.0
+    } else if hovered {
+        20.0
+    } else if unread {
+        8.0
+    } else {
+        0.0
+    };
+    let height = crate::anim::toward(ui, (id, "pill"), target, RAIL_PILL_TAU);
+    if height < 0.5 {
+        return;
+    }
+    let left = ui.window_pos()[0];
+    let min = [left, center_y - height / 2.0];
+    let max = [left + RAIL_PILL_WIDTH, center_y + height / 2.0];
+    let window_top = ui.window_pos()[1];
+    let window_bottom = window_top + ui.window_size()[1];
+    let draw_list = ui.get_window_draw_list();
+    draw_list.with_clip_rect([left, window_top], [left + RAIL_PILL_WIDTH, window_bottom], || {
+        draw_list.add_rect(min, max, theme.text).filled(true).rounding(RAIL_PILL_WIDTH).round_top_left(false).round_bot_left(false).build();
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rail_tile(
+    ui: &Ui,
+    textures: &TextureCache,
+    theme: &crate::theme::Theme,
+    id: &str,
+    size: [f32; 2],
+    look: RailTileLook<'_>,
+    selected: bool,
+    unread: bool,
+) -> bool {
+    let min = ui.cursor_screen_pos();
+    let max = [min[0] + size[0], min[1] + size[1]];
     let clicked = ui.invisible_button(id, size);
-    if ui.is_item_hovered() {
-        ui.get_window_draw_list()
-            .add_circle(center, size[0].min(size[1]) / 2.0 + 2.0, [1.0, 1.0, 1.0, 0.5])
-            .thickness(2.0)
-            .build();
+    let hovered = ui.is_item_hovered();
+    if hovered {
+        ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+    }
+    let lit = selected || hovered;
+    let round = size[0].min(size[1]) / 2.0;
+    let radius = crate::anim::toward(ui, (id, "radius"), if lit { size[0] * RAIL_TILE_SQUARE_RATIO } else { round }, RAIL_MORPH_TAU);
+    let glow = crate::anim::toward(ui, (id, "fill"), if lit { 1.0 } else { 0.0 }, RAIL_MORPH_TAU);
+    let ink = mix(look.ink, look.lit_ink, glow);
+    match look.image {
+        Some(texture) => {
+            ui.get_window_draw_list().add_image_rounded(texture, min, max, radius).build();
+        }
+        None => {
+            ui.get_window_draw_list().add_rect(min, max, mix(look.rest_fill, look.lit_fill, glow)).filled(true).rounding(radius).build();
+            if let Some(icon) = look.icon {
+                let icon_size = size[0] * 0.5;
+                draw_icon_at(ui, textures, icon, [min[0] + (size[0] - icon_size) / 2.0, min[1] + (size[1] - icon_size) / 2.0], icon_size, ink);
+            } else if let Some(label) = look.label {
+                let font = ui.push_font(faces().sm_semibold);
+                let text = truncate_to_width(ui, label, size[0] - 8.0).unwrap_or_else(|| label.to_string());
+                let text_size = ui.calc_text_size(&text);
+                ui.get_window_draw_list().add_text(
+                    [min[0] + (size[0] - text_size[0]) / 2.0, min[1] + (size[1] - text_size[1]) / 2.0],
+                    ink,
+                    &text,
+                );
+                font.pop();
+            }
+        }
+    }
+    if look.pill {
+        draw_rail_pill(ui, theme, id, min[1] + size[1] / 2.0, selected, hovered, unread);
     }
     clicked
+}
+
+fn draw_rail_separator(ui: &Ui, theme: &crate::theme::Theme) {
+    const WIDTH: f32 = 32.0;
+    let window_x = ui.window_pos()[0];
+    let y = ui.cursor_screen_pos()[1] + 4.0;
+    let x = window_x + (RAIL_WIDTH - WIDTH) / 2.0;
+    ui.get_window_draw_list().add_rect([x, y], [x + WIDTH, y + 2.0], theme.line()).filled(true).rounding(1.0).build();
+    ui.dummy([0.0, 10.0]);
 }
 
 fn truncate_measured(text: &str, max_width: f32, measure: impl Fn(&str) -> f32) -> Option<String> {
@@ -979,25 +1061,17 @@ fn draw_circular_image_button(ui: &Ui, id: &str, texture_id: imgui::TextureId, s
 
 const VOICE_ACTIVE_COLOR: [f32; 4] = [0.23, 0.79, 0.35, 1.0];
 
-fn draw_voice_active_dot(ui: &Ui, icon_min: [f32; 2], size: [f32; 2]) {
+fn draw_voice_active_dot(ui: &Ui, ring: [f32; 4], icon_min: [f32; 2], size: [f32; 2]) {
     let radius = 7.0;
     let center = [icon_min[0] + size[0] - radius + 1.0, icon_min[1] + size[1] - radius + 1.0];
     let draw_list = ui.get_window_draw_list();
-    draw_list.add_circle(center, radius + 2.0, [0.0, 0.0, 0.0, 0.0]).filled(true).build();
-    draw_list.add_circle(center, radius + 2.0, [0.13, 0.14, 0.17, 1.0]).filled(true).build();
+    draw_list.add_circle(center, radius + 3.0, ring).filled(true).build();
     draw_list.add_circle(center, radius, VOICE_ACTIVE_COLOR).filled(true).build();
 }
 
-fn draw_unread_badge(ui: &Ui, icon_min: [f32; 2]) {
-    let radius = 6.0;
-    let center = [icon_min[0] + radius - 1.0, icon_min[1] + radius - 1.0];
-    let draw_list = ui.get_window_draw_list();
-    draw_list.add_circle(center, radius + 2.0, [0.13, 0.14, 0.17, 1.0]).filled(true).build();
-    draw_list.add_circle(center, radius, [1.0, 1.0, 1.0, 0.95]).filled(true).build();
-}
-
-fn draw_rail_mention_badge(ui: &Ui, color: [f32; 4], icon_min: [f32; 2], icon_size: [f32; 2], count: u32) {
+fn draw_rail_mention_badge(ui: &Ui, color: [f32; 4], ring: [f32; 4], icon_min: [f32; 2], icon_size: [f32; 2], count: u32) {
     let text = if count > 99 { "99+".to_string() } else { count.to_string() };
+    let font = ui.push_font(faces().xs);
     let text_size = ui.calc_text_size(&text);
     let height = 16.0;
     let width = (text_size[0] + 8.0).max(height);
@@ -1005,9 +1079,9 @@ fn draw_rail_mention_badge(ui: &Ui, color: [f32; 4], icon_min: [f32; 2], icon_si
     let max = [min[0] + width, min[1] + height];
     let draw_list = ui.get_window_draw_list();
     draw_list
-        .add_rect([min[0] - 2.0, min[1] - 2.0], [max[0] + 2.0, max[1] + 2.0], [0.13, 0.14, 0.17, 1.0])
+        .add_rect([min[0] - 3.0, min[1] - 3.0], [max[0] + 3.0, max[1] + 3.0], ring)
         .filled(true)
-        .rounding(height / 2.0 + 2.0)
+        .rounding(height / 2.0 + 3.0)
         .build();
     draw_list.add_rect(min, max, color).filled(true).rounding(height / 2.0).build();
     draw_list.add_text(
@@ -1015,6 +1089,8 @@ fn draw_rail_mention_badge(ui: &Ui, color: [f32; 4], icon_min: [f32; 2], icon_si
         [1.0, 1.0, 1.0, 1.0],
         &text,
     );
+    drop(draw_list);
+    font.pop();
 }
 
 fn draw_mention_badge(ui: &Ui, color: [f32; 4], row_screen_pos: [f32; 2], row_height: f32, count: u32) {
@@ -1042,22 +1118,37 @@ fn draw_unread_dot(ui: &Ui, row_screen_pos: [f32; 2], row_height: f32) {
     ui.get_window_draw_list().add_circle(center, 3.0, [1.0, 1.0, 1.0, 0.9]).filled(true).build();
 }
 
-fn draw_guild_icon(ui: &Ui, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild: &rustcord_client::models::Guild, size: [f32; 2]) -> bool {
-    let icon_url = rustcord_client::cdn::guild_icon_url(guild, 64);
-    if let Some(url) = &icon_url {
-        if let Some((texture_id, _)) = textures.get_still(url) {
-            draw_circular_image_button(ui, &format!("guild_icon_{}", guild.id), texture_id, size)
-        } else {
-            textures.request(url, cmd_tx);
-            let label = guild.name.chars().take(2).collect::<String>();
-            draw_rail_circle(ui, [0.23, 0.24, 0.27, 1.0], size);
-            draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, size)
+#[allow(clippy::too_many_arguments)]
+fn draw_guild_icon(
+    ui: &Ui,
+    theme: &crate::theme::Theme,
+    textures: &mut TextureCache,
+    cmd_tx: &UnboundedSender<UiCommand>,
+    guild: &rustcord_client::models::Guild,
+    size: [f32; 2],
+    selected: bool,
+    unread: bool,
+) -> bool {
+    let image = rustcord_client::cdn::guild_icon_url(guild, 64).and_then(|url| match textures.get_still(&url) {
+        Some((texture, _)) => Some(texture),
+        None => {
+            textures.request(&url, cmd_tx);
+            None
         }
-    } else {
-        let label = guild.name.chars().take(2).collect::<String>();
-        draw_rail_circle(ui, [0.23, 0.24, 0.27, 1.0], size);
-        draw_circular_image_button_placeholder(ui, &format!("guild_{}", guild.id), &label, size)
-    }
+    });
+    let label = guild_acronym(&guild.name);
+    let pill = size == RAIL_ICON_SIZE || size == FOLDER_ITEM_SIZE;
+    let look = RailTileLook {
+        image,
+        label: Some(&label),
+        icon: None,
+        rest_fill: theme.background,
+        lit_fill: theme.accent,
+        ink: theme.text,
+        lit_ink: [1.0, 1.0, 1.0, 1.0],
+        pill,
+    };
+    rail_tile(ui, textures, theme, &format!("guild_{}", guild.id), size, look, selected, unread)
 }
 
 const RAIL_DRAG_GUILD: &str = "RAIL_DRAG_GUILD";
@@ -1093,14 +1184,16 @@ fn draw_folder_icon(ui: &Ui, state: &AppState, textures: &mut TextureCache, cmd_
         }
     }
 
+    drop(draw_list);
     ui.set_cursor_screen_pos(p_min);
-    let clicked = ui.invisible_button(format!("folder_toggle_{}", folder_idx), size);
-    if ui.is_item_hovered() {
-        draw_list
-            .add_circle([(p_min[0] + p_max[0]) / 2.0, (p_min[1] + p_max[1]) / 2.0], size[0].min(size[1]) / 2.0 + 2.0, [1.0, 1.0, 1.0, 0.5])
-            .thickness(2.0)
-            .build();
+    let id = format!("folder_toggle_{}", folder_idx);
+    let clicked = ui.invisible_button(&id, size);
+    let hovered = ui.is_item_hovered();
+    if hovered {
+        ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
     }
+    let unread = !folder.expanded && state.folder_has_unread(folder);
+    draw_rail_pill(ui, &state.theme, &id, (p_min[1] + p_max[1]) / 2.0, false, hovered, unread);
     clicked
 }
 
@@ -1146,10 +1239,7 @@ fn draw_expanded_folder(
     let icon_min = ui.cursor_screen_pos();
     let header_clicked = draw_folder_icon(ui, state, textures, cmd_tx, folder, folder_idx, RAIL_ICON_SIZE);
     if state.folder_has_active_voice(folder) {
-        draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
-    }
-    if state.folder_has_unread(folder) {
-        draw_unread_badge(ui, icon_min);
+        draw_voice_active_dot(ui, state.theme.servers_bg(), icon_min, RAIL_ICON_SIZE);
     }
     if header_clicked {
         *toggle_folder = Some(folder_idx);
@@ -1177,15 +1267,15 @@ fn draw_expanded_folder(
         let item_y = pill_top_y + FOLDER_PILL_PAD + header_step + member_step * i as f32;
         ui.set_cursor_pos([item_center_x, item_y]);
         let icon_min = ui.cursor_screen_pos();
-        let clicked = draw_guild_icon(ui, textures, cmd_tx, &guild, FOLDER_ITEM_SIZE);
-        if state.guild_has_active_voice(guild_id) {
-            draw_voice_active_dot(ui, icon_min, FOLDER_ITEM_SIZE);
-        }
         let mentions = state.guild_mention_count(guild_id);
+        let selected = state.selected_guild.as_deref() == Some(guild_id.as_str());
+        let unread = mentions == 0 && state.guild_has_unread(guild_id);
+        let clicked = draw_guild_icon(ui, &state.theme, textures, cmd_tx, &guild, FOLDER_ITEM_SIZE, selected, unread);
+        if state.guild_has_active_voice(guild_id) {
+            draw_voice_active_dot(ui, state.theme.servers_bg(), icon_min, FOLDER_ITEM_SIZE);
+        }
         if mentions > 0 {
-            draw_rail_mention_badge(ui, state.theme.mention_badge(), icon_min, FOLDER_ITEM_SIZE, mentions);
-        } else if state.guild_has_unread(guild_id) {
-            draw_unread_badge(ui, icon_min);
+            draw_rail_mention_badge(ui, state.theme.mention_badge(), state.theme.servers_bg(), icon_min, FOLDER_ITEM_SIZE, mentions);
         }
         if clicked {
             *select_guild = Some(guild_id.clone());
@@ -1260,15 +1350,15 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             RailItem::Guild(guild_id) => {
                 let Some(guild) = state.guilds.iter().find(|g| g.id == guild_id).cloned() else { continue };
                 let icon_min = ui.cursor_screen_pos();
-                let clicked = draw_guild_icon(ui, textures, cmd_tx, &guild, RAIL_ICON_SIZE);
-                if state.guild_has_active_voice(&guild.id) {
-                    draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
-                }
                 let mentions = state.guild_mention_count(&guild.id);
+                let selected = state.selected_guild.as_deref() == Some(guild.id.as_str());
+                let unread = mentions == 0 && state.guild_has_unread(&guild.id);
+                let clicked = draw_guild_icon(ui, &state.theme, textures, cmd_tx, &guild, RAIL_ICON_SIZE, selected, unread);
+                if state.guild_has_active_voice(&guild.id) {
+                    draw_voice_active_dot(ui, state.theme.servers_bg(), icon_min, RAIL_ICON_SIZE);
+                }
                 if mentions > 0 {
-                    draw_rail_mention_badge(ui, state.theme.mention_badge(), icon_min, RAIL_ICON_SIZE, mentions);
-                } else if state.guild_has_unread(&guild.id) {
-                    draw_unread_badge(ui, icon_min);
+                    draw_rail_mention_badge(ui, state.theme.mention_badge(), state.theme.servers_bg(), icon_min, RAIL_ICON_SIZE, mentions);
                 }
                 if clicked {
                     select_guild = Some(guild.id.clone());
@@ -1322,10 +1412,7 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
                     let icon_min = ui.cursor_screen_pos();
                     let clicked = draw_folder_icon(ui, state, textures, cmd_tx, &folder, folder_idx, RAIL_ICON_SIZE);
                     if state.folder_has_active_voice(&folder) {
-                        draw_voice_active_dot(ui, icon_min, RAIL_ICON_SIZE);
-                    }
-                    if state.folder_has_unread(&folder) {
-                        draw_unread_badge(ui, icon_min);
+                        draw_voice_active_dot(ui, state.theme.servers_bg(), icon_min, RAIL_ICON_SIZE);
                     }
                     if clicked {
                         toggle_folder = Some(folder_idx);
@@ -1403,8 +1490,17 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         ui.set_cursor_pos([rail_center_x, next_y]);
     }
 
-    draw_rail_circle(ui, [0.17, 0.52, 0.27, 1.0], RAIL_ICON_SIZE);
-    if draw_circular_image_button_placeholder(ui, "add_server_button", "+", RAIL_ICON_SIZE) {
+    let add_look = RailTileLook {
+        image: None,
+        label: None,
+        icon: Some(crate::icons::Icon::CirclePlus),
+        rest_fill: state.theme.background,
+        lit_fill: state.theme.call_active(),
+        ink: state.theme.call_active(),
+        lit_ink: [1.0, 1.0, 1.0, 1.0],
+        pill: false,
+    };
+    if rail_tile(ui, textures, &state.theme, "add_server_button", RAIL_ICON_SIZE, add_look, false, false) {
         ui.open_popup("add_server_popup");
     }
     if ui.is_item_hovered() {
@@ -3579,6 +3675,7 @@ fn draw_attachment(
 }
 
 pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, fonts: &Fonts) {
+    crate::anim::begin_frame();
     if let Some(gradient) = state.theme.global_gradient() {
         gradient.draw(&ui.get_background_draw_list(), [0.0, 0.0], ui.io().display_size);
     }
@@ -3628,15 +3725,27 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             let rail_center_x = (RAIL_WIDTH - RAIL_ICON_SIZE[0]) / 2.0;
 
             ui.set_cursor_pos([rail_center_x, RAIL_PADDING_TOP]);
-            let dm_color = if state.selected_guild.is_none() { state.theme.accent_hover } else { state.theme.accent };
-            draw_rail_circle(ui, dm_color, RAIL_ICON_SIZE);
-            if draw_circular_image_button_placeholder(ui, "dm_button", "DM", RAIL_ICON_SIZE) {
+            let home_look = RailTileLook {
+                image: None,
+                label: None,
+                icon: Some(crate::icons::Icon::MessageCircle),
+                rest_fill: state.theme.background,
+                lit_fill: state.theme.accent,
+                ink: state.theme.text,
+                lit_ink: [1.0, 1.0, 1.0, 1.0],
+                pill: true,
+            };
+            let home_selected = state.selected_guild.is_none();
+            if rail_tile(ui, textures, &state.theme, "dm_button", RAIL_ICON_SIZE, home_look, home_selected, false) {
                 state.selected_guild = None;
                 state.selected_channel = None;
             }
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Direct Messages");
+            }
 
-            ui.set_cursor_pos([8.0, RAIL_PADDING_TOP + RAIL_ICON_SIZE[1] + 8.0]);
-            ui.separator();
+            ui.set_cursor_pos([0.0, RAIL_PADDING_TOP + RAIL_ICON_SIZE[1] + 4.0]);
+            draw_rail_separator(ui, &state.theme);
             let after_separator_y = ui.cursor_pos()[1];
             ui.set_cursor_pos([0.0, after_separator_y]);
 
@@ -8215,7 +8324,8 @@ fn draw_server_profile(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
     ui.spacing();
     ui.text("Icon");
     ui.text_colored(muted, "Images are cropped to a 512x512 square.");
-    draw_guild_icon(ui, textures, cmd_tx, guild, [96.0, 96.0]);
+    let theme = state.theme.clone();
+    draw_guild_icon(ui, &theme, textures, cmd_tx, guild, [96.0, 96.0], false, false);
     if ui.button("Change Server Icon") {
         if let Some(path) = rfd::FileDialog::new().add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp"]).pick_file() {
             let _ = cmd_tx.send(UiCommand::SetGuildIcon { guild_id: guild.id.clone(), path: Some(path) });
@@ -8847,6 +8957,7 @@ fn draw_settings_account(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender
     ui.text(format!("User ID: {}", user.id));
     ui.spacing();
     if ui.button("Log out") {
+        crate::startup_cache::clear();
         let _ = cmd_tx.send(UiCommand::Logout);
         return true;
     }
@@ -9351,6 +9462,15 @@ fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>
 #[cfg(test)]
 mod link_tests {
     use super::*;
+
+    #[test]
+    fn guild_acronyms_take_each_words_first_letter() {
+        assert_eq!(guild_acronym("My Cool Server"), "MCS");
+        assert_eq!(guild_acronym("rustcord"), "r");
+        assert_eq!(guild_acronym("a b c d e f"), "abcd");
+        assert_eq!(guild_acronym("   "), "?");
+    }
+
 
     fn people() -> Vec<(String, String)> {
         vec![
