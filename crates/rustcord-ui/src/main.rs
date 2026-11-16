@@ -54,7 +54,7 @@ fn main() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::{EnvFilter, Layer};
-        let console = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let console = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,arboard=error"));
         let captured = EnvFilter::new("info,rustcord=debug,rustcord_client=debug");
         tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_filter(console))
@@ -158,6 +158,9 @@ pub fn drain_backend_events(
     if state.session_retry_at.is_some_and(|at| std::time::Instant::now() >= at) {
         state.session_retry_at = None;
         let _ = cmd_tx.send(UiCommand::ResumeSavedSession);
+    }
+    if !state.pending_interactions.is_empty() {
+        state.expire_interactions(std::time::Instant::now());
     }
     let mut media = DrainedMedia::default();
     while let Ok(event) = event_rx.try_recv() {
@@ -586,6 +589,19 @@ pub fn drain_backend_events(
                 state.upsert_channel(channel);
                 state.open_channel(&channel_id, cmd_tx);
             }
+            BackendEvent::InteractionError { nonce, message } => {
+                state.finish_interaction(&nonce, Some(message));
+            }
+            BackendEvent::Gateway(GatewayEvent::InteractionSucceeded { nonce }) => {
+                state.finish_interaction(&nonce, None);
+            }
+            BackendEvent::Gateway(GatewayEvent::InteractionFailed { nonce }) => {
+                state.finish_interaction(&nonce, Some("This interaction failed".into()));
+            }
+            BackendEvent::Gateway(GatewayEvent::InteractionModal(modal)) => {
+                state.open_modal(modal);
+            }
+            BackendEvent::Gateway(GatewayEvent::SessionStarted { .. } | GatewayEvent::InteractionCreated { .. }) => {}
             BackendEvent::ThreadMembershipChanged { thread_id, joined } => {
                 state.set_thread_membership(&thread_id, joined.then(Default::default));
             }

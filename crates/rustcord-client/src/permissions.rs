@@ -2,6 +2,7 @@ use crate::models::{OverwriteKind, PermissionOverwrite, Role, Snowflake};
 
 pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const MANAGE_THREADS: u64 = 1 << 34;
+pub const MOVE_MEMBERS: u64 = 1 << 24;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;

@@ -180,6 +180,7 @@ async fn create_attachment_file(dir: &std::path::Path, name: &str) -> Result<(st
 }
 
 pub(crate) static GATEWAY_TX: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>> = std::sync::Mutex::new(None);
+static GATEWAY_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static ACTIVE_GATEWAY: std::sync::Mutex<Option<(tokio::sync::watch::Sender<bool>, tokio::task::JoinHandle<()>)>> = std::sync::Mutex::new(None);
 static CREDENTIAL_OPS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -194,6 +195,7 @@ where
 
 async fn stop_gateway() {
     *GATEWAY_TX.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *GATEWAY_SESSION.lock().unwrap_or_else(|p| p.into_inner()) = None;
     let active = ACTIVE_GATEWAY.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some((cancel, mut task)) = active {
         let _ = cancel.send(true);
@@ -428,6 +430,7 @@ pub enum UiCommand {
         starter: Option<String>,
     },
     JoinThread { thread_id: String },
+    SendInteraction { nonce: String, body: serde_json::Value },
     OpenChannelById { channel_id: String },
     LoadArchivedThreads { channel_id: String, guild_id: String, offset: u32 },
     SetThreadArchived { thread_id: String, archived: bool },
@@ -511,6 +514,7 @@ pub enum BackendEvent {
     MemberRoleChanged { guild_id: String, user_id: String, role_id: String, add: bool },
     ChannelSaved(rustcord_client::models::Channel),
     ThreadCreated(rustcord_client::models::Channel),
+    InteractionError { nonce: String, message: String },
     ChannelFetchedToOpen(rustcord_client::models::Channel),
     ThreadMembershipChanged { thread_id: String, joined: bool },
     ArchivedThreadsLoaded { channel_id: String, offset: u32, page: rustcord_client::rest::ThreadSearchPage },
@@ -772,6 +776,22 @@ pub fn spawn(
                             Err(e) => {
                                 let _ = event_tx.send(BackendEvent::Error(format!("couldn't open that channel: {e}")));
                             }
+                        }
+                    }
+                }
+                UiCommand::SendInteraction { nonce, mut body } => {
+                    let session = GATEWAY_SESSION.lock().unwrap().clone();
+                    match (&rest, session) {
+                        (Some(client), Some(session_id)) => {
+                            body["session_id"] = serde_json::Value::String(session_id);
+                            if let Err(e) = client.create_interaction(&body).await {
+                                let message = rustcord_client::interactions::failure_text(&e);
+                                tracing::warn!("interaction refused: {e}");
+                                let _ = event_tx.send(BackendEvent::InteractionError { nonce, message });
+                            }
+                        }
+                        _ => {
+                            let _ = event_tx.send(BackendEvent::InteractionError { nonce, message: "Not connected to Discord yet".into() });
                         }
                     }
                 }
@@ -2240,6 +2260,9 @@ async fn start_session(
             match &ev {
                 GatewayEvent::Ready { user, .. } => {
                     my_user_id = Some(user.id.clone());
+                }
+                GatewayEvent::SessionStarted { session_id } => {
+                    *GATEWAY_SESSION.lock().unwrap() = Some(session_id.clone());
                 }
                 GatewayEvent::VoiceStateUpdate(vs) if my_user_id.as_deref() == Some(vs.user_id.as_str()) => {
                     if vs.channel_id.is_some() {

@@ -530,6 +530,10 @@ impl RestClient {
         }
     }
 
+    pub async fn create_interaction(&self, body: &serde_json::Value) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.post(format!("{API_BASE}/interactions")).json(body)).await
+    }
+
     pub async fn channel(&self, channel_id: &str) -> Result<Channel, ClientError> {
         self.get(&format!("/channels/{channel_id}")).await
     }

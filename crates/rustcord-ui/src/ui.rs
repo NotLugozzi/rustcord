@@ -6,6 +6,8 @@ use imgui::Ui;
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 
+mod components;
+
 #[derive(Clone, Copy)]
 pub struct Fonts {
     pub regular: imgui::FontId,
@@ -1468,7 +1470,8 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         let gap_width = ui.content_region_avail()[0];
         let gap_min = ui.cursor_screen_pos();
         ui.invisible_button(&format!("rail_gap_{}", index), [gap_width, 8.0]);
-        if ui.is_item_hovered() {
+        let dragging = unsafe { !imgui::sys::igGetDragDropPayload().is_null() };
+        if dragging && ui.is_item_hovered() {
             ui.get_window_draw_list()
                 .add_line([gap_min[0] + 8.0, gap_min[1] + 4.0], [gap_min[0] + gap_width - 8.0, gap_min[1] + 4.0], state.theme.accent)
                 .thickness(2.0)
@@ -3900,25 +3903,57 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 }
 
                 let guild_id = state.selected_guild.clone().unwrap_or_default();
-                let voice_channels: Vec<(String, String)> = state
+                let voice_channels: Vec<(String, String, Option<(usize, u32)>, bool)> = state
                     .voice_channels_for_selected_guild()
                     .into_iter()
-                    .map(|c| (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone())))
+                    .map(|c| {
+                        let occupancy = state.voice_occupancy(&guild_id, c);
+                        let blocked = state.voice_channel_blocks_join(&guild_id, c);
+                        (c.id.clone(), c.name.clone().unwrap_or_else(|| c.id.clone()), occupancy, blocked)
+                    })
                     .collect();
                 if !voice_channels.is_empty() {
                     ui.spacing();
                     let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
                     ui.text("VOICE CHANNELS");
                     token.pop();
-                    for (channel_id, name) in &voice_channels {
+                    for (channel_id, name, occupancy, blocked) in &voice_channels {
                         let is_connected = state.connected_voice_channel.as_ref() == Some(&(Some(guild_id.clone()), channel_id.clone()));
                         let label = if is_connected { format!("[voice] {name} (connected)") } else { format!("[voice] {name}") };
-                        let shown = truncate_to_width(ui, &label, ui.content_region_avail()[0]);
+                        let capacity = occupancy.map(|(count, limit)| format!("{count:02}/{limit:02}"));
+                        let capacity_w = capacity.as_ref().map_or(0.0, |text| {
+                            let font = ui.push_font(faces().xs);
+                            let width = ui.calc_text_size(text)[0] + 12.0;
+                            font.pop();
+                            width
+                        });
+                        let row_min = ui.cursor_screen_pos();
+                        let row_w = ui.content_region_avail()[0];
+                        let shown = truncate_to_width(ui, &label, row_w - capacity_w);
                         let clicked = ui.selectable(shown.as_deref().unwrap_or(&label));
-                        if shown.is_some() && ui.is_item_hovered() {
-                            ui.tooltip_text(&label);
+                        let row_h = ui.item_rect_size()[1];
+                        if ui.is_item_hovered() {
+                            if *blocked && !is_connected {
+                                ui.tooltip_text("This voice channel is full");
+                            } else if shown.is_some() {
+                                ui.tooltip_text(&label);
+                            }
                         }
-                        if clicked {
+                        if let Some(text) = &capacity {
+                            let font = ui.push_font(faces().xs);
+                            let size = ui.calc_text_size(text);
+                            let pill_min = [row_min[0] + row_w - size[0] - 10.0, row_min[1] + (row_h - size[1] - 4.0) / 2.0];
+                            let pill_max = [row_min[0] + row_w - 2.0, pill_min[1] + size[1] + 4.0];
+                            let ink = if *blocked { state.theme.danger() } else { state.theme.text_muted };
+                            let draw_list = ui.get_window_draw_list();
+                            draw_list.add_rect(pill_min, pill_max, state.theme.field()).filled(true).rounding(4.0).build();
+                            draw_list.add_text([pill_min[0] + 4.0, pill_min[1] + 2.0], ink, text);
+                            drop(draw_list);
+                            font.pop();
+                        }
+                        if clicked && *blocked && !is_connected {
+                            state.status_message = Some(format!("{name} is full."));
+                        } else if clicked {
                             if is_connected {
                                 state.server_call_minimized = false;
                             } else if !state.voice_connecting {
@@ -4292,6 +4327,23 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
+                                let component_busy = state.message_awaits_interaction(&msg.id);
+                                let component_error = state.interaction_errors.get(&msg.id).cloned();
+                                if !msg.components.is_empty() || component_busy || component_error.is_some() || msg.flags & (rustcord_client::models::MESSAGE_FLAG_EPHEMERAL | rustcord_client::models::MESSAGE_FLAG_LOADING) != 0 {
+                                    let mut component_ctx = components::ComponentCtx {
+                                        fonts,
+                                        theme: &state.theme,
+                                        textures,
+                                        cmd_tx,
+                                        busy: component_busy,
+                                        drafts: &mut state.select_drafts,
+                                        revealed_spoilers: &mut state.revealed_spoilers,
+                                        mentions: &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names },
+                                    };
+                                    if let Some(action) = components::draw_message_components(ui, &mut component_ctx, msg, component_error.as_deref()) {
+                                        components::dispatch(state, cmd_tx, msg, action);
+                                    }
+                                }
                                 if let Some(thread) = &msg.thread {
                                     draw_thread_chip(ui, state, textures, cmd_tx, thread, msg.guild_id.as_deref());
                                 }
@@ -4317,6 +4369,23 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                     draw_invite_card(ui, state, textures, cmd_tx, code);
                                 }
                                 draw_reaction_row(ui, &state.theme, textures, cmd_tx, msg);
+                                let component_busy = state.message_awaits_interaction(&msg.id);
+                                let component_error = state.interaction_errors.get(&msg.id).cloned();
+                                if !msg.components.is_empty() || component_busy || component_error.is_some() || msg.flags & (rustcord_client::models::MESSAGE_FLAG_EPHEMERAL | rustcord_client::models::MESSAGE_FLAG_LOADING) != 0 {
+                                    let mut component_ctx = components::ComponentCtx {
+                                        fonts,
+                                        theme: &state.theme,
+                                        textures,
+                                        cmd_tx,
+                                        busy: component_busy,
+                                        drafts: &mut state.select_drafts,
+                                        revealed_spoilers: &mut state.revealed_spoilers,
+                                        mentions: &mut MentionCtx { known_users: &state.known_users, profiles_requested: &mut state.profiles_requested, channel_names: &channel_names, role_names: &role_names },
+                                    };
+                                    if let Some(action) = components::draw_message_components(ui, &mut component_ctx, msg, component_error.as_deref()) {
+                                        components::dispatch(state, cmd_tx, msg, action);
+                                    }
+                                }
                                 if let Some(thread) = &msg.thread {
                                     draw_thread_chip(ui, state, textures, cmd_tx, thread, msg.guild_id.as_deref());
                                 }
@@ -4743,6 +4812,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     draw_forward_dialog(ui, state, cmd_tx);
     draw_thread_form(ui, state, cmd_tx);
     draw_thread_browser(ui, state, cmd_tx);
+    components::draw_modal_form(ui, state, cmd_tx);
 }
 
 fn format_bitrate(bps: u32) -> String {

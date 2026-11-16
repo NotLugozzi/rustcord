@@ -691,6 +691,10 @@ pub struct AppState {
     pub forward_dialog: Option<ForwardDialog>,
     pub thread_form: Option<ThreadForm>,
     pub thread_browser: Option<ThreadBrowser>,
+    pub pending_interactions: HashMap<String, PendingInteraction>,
+    pub interaction_errors: HashMap<String, String>,
+    pub modal_form: Option<ModalForm>,
+    pub select_drafts: HashMap<(String, String), Vec<String>>,
 }
 
 pub enum VoiceClip {
@@ -727,6 +731,26 @@ impl VoiceRecording {
 
 const RECORDING_LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 const RECORDING_LEVEL_HISTORY: usize = 160;
+
+pub const INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+pub struct PendingInteraction {
+    pub message_id: Option<String>,
+    pub started: std::time::Instant,
+}
+
+pub struct ModalForm {
+    pub modal: rustcord_client::interactions::Modal,
+    pub answers: HashMap<String, rustcord_client::interactions::ModalAnswer>,
+    pub error: Option<String>,
+    pub sending: Option<String>,
+}
+
+impl ModalForm {
+    pub fn new(modal: rustcord_client::interactions::Modal) -> Self {
+        Self { modal, answers: HashMap::new(), error: None, sending: None }
+    }
+}
 
 pub struct ThreadBrowser {
     pub channel_id: String,
@@ -1745,6 +1769,53 @@ impl AppState {
         owns || self.can_manage_threads(guild_id, thread)
     }
 
+    pub fn start_interaction(&mut self, nonce: String, message_id: Option<String>, body: serde_json::Value, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        if let Some(message_id) = &message_id {
+            self.interaction_errors.remove(message_id);
+        }
+        self.pending_interactions.insert(nonce.clone(), PendingInteraction { message_id, started: std::time::Instant::now() });
+        let _ = cmd_tx.send(crate::backend::UiCommand::SendInteraction { nonce, body });
+    }
+
+    pub fn message_awaits_interaction(&self, message_id: &str) -> bool {
+        self.pending_interactions.values().any(|p| p.message_id.as_deref() == Some(message_id))
+    }
+
+    pub fn finish_interaction(&mut self, nonce: &str, failure: Option<String>) {
+        if let Some(form) = self.modal_form.as_mut().filter(|f| f.sending.as_deref() == Some(nonce)) {
+            match &failure {
+                Some(reason) => {
+                    form.sending = None;
+                    form.error = Some(reason.clone());
+                }
+                None => self.modal_form = None,
+            }
+        }
+        let Some(pending) = self.pending_interactions.remove(nonce) else { return };
+        if let (Some(message_id), Some(reason)) = (pending.message_id, failure) {
+            self.interaction_errors.insert(message_id, reason);
+        }
+    }
+
+    pub fn open_modal(&mut self, modal: rustcord_client::interactions::Modal) {
+        if let Some(nonce) = &modal.nonce {
+            self.pending_interactions.remove(nonce);
+        }
+        self.modal_form = Some(ModalForm::new(modal));
+    }
+
+    pub fn expire_interactions(&mut self, now: std::time::Instant) {
+        let expired: Vec<String> = self
+            .pending_interactions
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.started) >= INTERACTION_TIMEOUT)
+            .map(|(nonce, _)| nonce.clone())
+            .collect();
+        for nonce in expired {
+            self.finish_interaction(&nonce, Some("The application did not respond".into()));
+        }
+    }
+
     pub fn find_guild_channel(&self, channel_id: &str) -> Option<&Channel> {
         self.guild_channels.values().flatten().find(|c| c.id == channel_id)
     }
@@ -2502,6 +2573,18 @@ impl AppState {
             }
         }
         Some(channel_id.clone())
+    }
+
+    pub fn voice_occupancy(&self, guild_id: &str, channel: &Channel) -> Option<(usize, u32)> {
+        let limit = channel.voice_capacity()?;
+        Some((self.members_in_voice_channel(guild_id, &channel.id).len(), limit))
+    }
+
+    pub fn voice_channel_blocks_join(&self, guild_id: &str, channel: &Channel) -> bool {
+        let Some((occupants, limit)) = self.voice_occupancy(guild_id, channel) else { return false };
+        let full = occupants >= limit as usize;
+        let bypass = self.current_user.is_none() || self.has_channel_permission(guild_id, channel, rustcord_client::permissions::MOVE_MEMBERS);
+        full && !bypass
     }
 
     pub fn members_in_voice_channel(&self, guild_id: &str, channel_id: &str) -> Vec<&rustcord_client::models::VoiceState> {
@@ -3429,6 +3512,7 @@ mod tests {
             icon: None,
             permission_overwrites: Vec::new(),
             thread: Default::default(),
+            user_limit: None,
         }
     }
 
@@ -3450,6 +3534,7 @@ mod tests {
             icon: None,
             permission_overwrites: Vec::new(),
             thread: Default::default(),
+            user_limit: None,
         }
     }
 
@@ -3742,6 +3827,7 @@ mod tests {
             icon: None,
             permission_overwrites: Vec::new(),
             thread: Default::default(),
+            user_limit: None,
         });
 
         let entries = state.switcher_entries();
@@ -3988,6 +4074,70 @@ mod thread_tests {
         assert!(!state.channel_is_unread("t", Some(&(at_join - 1).to_string())));
         assert!(state.channel_is_unread("t", Some(&(at_join + (1 << 22)).to_string())));
         assert!(state.channel_is_unread("other", Some("5")));
+    }
+
+    #[test]
+    fn voice_capacity_counts_occupants_and_blocks_a_full_channel() {
+        let mut state = AppState::default();
+        let voice: Channel = serde_json::from_value(serde_json::json!({ "id": "v", "type": 2, "guild_id": "g", "name": "talk", "user_limit": 2 })).unwrap();
+        let open: Channel = serde_json::from_value(serde_json::json!({ "id": "o", "type": 2, "guild_id": "g", "name": "open", "user_limit": 0 })).unwrap();
+        let in_voice = |user: &str| -> rustcord_client::models::VoiceState {
+            serde_json::from_value(serde_json::json!({ "guild_id": "g", "channel_id": "v", "user_id": user, "session_id": "s" })).unwrap()
+        };
+        state.voice_channel_states.insert("g".into(), vec![in_voice("a")]);
+        assert_eq!(state.voice_occupancy("g", &voice), Some((1, 2)));
+        assert_eq!(state.voice_occupancy("g", &open), None);
+        assert!(!state.voice_channel_blocks_join("g", &voice));
+        state.voice_channel_states.get_mut("g").unwrap().push(in_voice("b"));
+        state.current_user = Some(serde_json::from_value(serde_json::json!({ "id": "me", "username": "me", "discriminator": "0" })).unwrap());
+        state.guild_roles.insert("g".into(), Vec::new());
+        state.guilds.push(serde_json::from_value(serde_json::json!({ "id": "g", "name": "G", "icon": null, "owner_id": "someone" })).unwrap());
+        assert!(state.voice_channel_blocks_join("g", &voice));
+        state.guilds[0].owner_id = Some("me".into());
+        assert!(!state.voice_channel_blocks_join("g", &voice), "owners can always join");
+    }
+
+    #[test]
+    fn an_interaction_waits_then_succeeds_fails_or_times_out() {
+        let mut state = AppState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.start_interaction("n1".into(), Some("m".into()), serde_json::json!({}), &tx);
+        assert!(matches!(rx.try_recv(), Ok(crate::backend::UiCommand::SendInteraction { .. })));
+        assert!(state.message_awaits_interaction("m"));
+        state.finish_interaction("n1", None);
+        assert!(!state.message_awaits_interaction("m") && state.interaction_errors.is_empty());
+        state.start_interaction("n2".into(), Some("m".into()), serde_json::json!({}), &tx);
+        state.finish_interaction("n2", Some("This interaction failed".into()));
+        assert_eq!(state.interaction_errors.get("m").map(String::as_str), Some("This interaction failed"));
+        state.start_interaction("n3".into(), Some("m".into()), serde_json::json!({}), &tx);
+        assert!(state.interaction_errors.is_empty(), "a new click clears the old failure");
+        state.expire_interactions(std::time::Instant::now() + INTERACTION_TIMEOUT);
+        assert_eq!(state.interaction_errors.get("m").map(String::as_str), Some("The application did not respond"));
+    }
+
+    #[test]
+    fn a_form_closes_on_success_and_keeps_its_answers_on_failure() {
+        let modal = rustcord_client::interactions::Modal::parse(&serde_json::json!({
+            "id": "i", "nonce": "click", "custom_id": "f", "title": "T", "application": { "id": "app" },
+            "components": [ { "type": 1, "components": [ { "type": 4, "custom_id": "x", "label": "X" } ] } ]
+        }))
+        .unwrap();
+        let mut state = AppState::default();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.start_interaction("click".into(), Some("m".into()), serde_json::json!({}), &tx);
+        state.open_modal(modal);
+        assert!(!state.message_awaits_interaction("m"), "a form ends the click's wait");
+        let form = state.modal_form.as_mut().unwrap();
+        form.answers.insert("x".into(), rustcord_client::interactions::ModalAnswer::Text("hi".into()));
+        form.sending = Some("submit".into());
+        state.pending_interactions.insert("submit".into(), PendingInteraction { message_id: None, started: std::time::Instant::now() });
+        state.finish_interaction("submit", Some("This interaction failed".into()));
+        let form = state.modal_form.as_ref().expect("still open");
+        assert_eq!(form.error.as_deref(), Some("This interaction failed"));
+        assert!(form.answers.contains_key("x"));
+        state.modal_form.as_mut().unwrap().sending = Some("again".into());
+        state.finish_interaction("again", None);
+        assert!(state.modal_form.is_none());
     }
 
     #[test]

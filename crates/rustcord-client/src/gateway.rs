@@ -53,6 +53,11 @@ pub enum GatewayEvent {
     GuildStickersUpdate { guild_id: String, stickers: Vec<Sticker> },
     GuildSettings(Vec<GuildSettings>),
     ThreadListSync { guild_id: String, channel_ids: Option<Vec<String>>, threads: Vec<Channel> },
+    SessionStarted { session_id: String },
+    InteractionCreated { id: String, nonce: String },
+    InteractionSucceeded { nonce: String },
+    InteractionFailed { nonce: String },
+    InteractionModal(crate::interactions::Modal),
     ThreadMemberUpdate { thread_id: String, member: crate::models::ThreadMember },
     ThreadMembersUpdate { thread_id: String, guild_id: String, member_count: Option<u32>, added: Vec<String>, removed: Vec<String> },
     RelationshipAdd(Relationship),
@@ -381,6 +386,9 @@ impl Gateway {
         let Some(data) = payload.d else { return Ok(()) };
         let event = match payload.t.as_deref() {
             Some("READY") => {
+                if let Some(session_id) = data["session_id"].as_str() {
+                    let _ = tx.send(GatewayEvent::SessionStarted { session_id: session_id.to_string() });
+                }
                 let user: User = serde_json::from_value(data["user"].clone())?;
                 let guilds: Vec<Guild> = serde_json::from_value(data["guilds"].clone())?;
                 let voice_states = parse_initial_voice_states(data.get("guilds"));
@@ -529,6 +537,20 @@ impl Gateway {
                 let _ = tx.send(GatewayEvent::ThreadListSync { guild_id: guild_id.clone(), channel_ids: None, threads });
                 GatewayEvent::GuildCreate { guild_id, roles, member_roles }
             }
+            Some("INTERACTION_CREATE") => {
+                let id = data["id"].as_str().unwrap_or_default().to_string();
+                let nonce = data["nonce"].as_str().unwrap_or_default().to_string();
+                GatewayEvent::InteractionCreated { id, nonce }
+            }
+            Some("INTERACTION_SUCCESS") => GatewayEvent::InteractionSucceeded { nonce: data["nonce"].as_str().unwrap_or_default().to_string() },
+            Some("INTERACTION_FAILURE") => GatewayEvent::InteractionFailed { nonce: data["nonce"].as_str().unwrap_or_default().to_string() },
+            Some("INTERACTION_MODAL_CREATE") => match crate::interactions::Modal::parse(&data) {
+                Some(modal) => GatewayEvent::InteractionModal(modal),
+                None => {
+                    tracing::warn!("couldn't read a bot's form");
+                    return Ok(());
+                }
+            },
             Some("THREAD_CREATE") | Some("THREAD_UPDATE") => {
                 let channel: Channel = serde_json::from_value(data)?;
                 GatewayEvent::ChannelUpsert(channel)

@@ -461,6 +461,8 @@ pub struct Channel {
     pub permission_overwrites: Vec<PermissionOverwrite>,
     #[serde(flatten)]
     pub thread: ThreadFields,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_limit: Option<u32>,
 }
 
 impl Channel {
@@ -470,6 +472,10 @@ impl Channel {
 
     pub fn is_joined_thread(&self) -> bool {
         self.is_thread() && self.thread.member.is_some()
+    }
+
+    pub fn voice_capacity(&self) -> Option<u32> {
+        self.user_limit.filter(|&limit| limit > 0)
     }
 
     pub fn is_archived_thread(&self) -> bool {
@@ -693,6 +699,158 @@ pub struct Message {
     pub message_snapshots: Vec<MessageSnapshot>,
     #[serde(default)]
     pub thread: Option<Box<Channel>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_id: Option<Snowflake>,
+    #[serde(default, deserialize_with = "lenient_components", skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
+}
+
+pub const MESSAGE_FLAG_EPHEMERAL: u64 = 1 << 6;
+pub const MESSAGE_FLAG_LOADING: u64 = 1 << 7;
+
+pub mod component_kind {
+    pub const ACTION_ROW: u8 = 1;
+    pub const BUTTON: u8 = 2;
+    pub const STRING_SELECT: u8 = 3;
+    pub const TEXT_INPUT: u8 = 4;
+    pub const USER_SELECT: u8 = 5;
+    pub const ROLE_SELECT: u8 = 6;
+    pub const MENTIONABLE_SELECT: u8 = 7;
+    pub const CHANNEL_SELECT: u8 = 8;
+    pub const SECTION: u8 = 9;
+    pub const TEXT_DISPLAY: u8 = 10;
+    pub const THUMBNAIL: u8 = 11;
+    pub const MEDIA_GALLERY: u8 = 12;
+    pub const FILE: u8 = 13;
+    pub const SEPARATOR: u8 = 14;
+    pub const CONTAINER: u8 = 17;
+    pub const LABEL: u8 = 18;
+}
+
+pub mod button_style {
+    pub const PRIMARY: u8 = 1;
+    pub const SECONDARY: u8 = 2;
+    pub const SUCCESS: u8 = 3;
+    pub const DANGER: u8 = 4;
+    pub const LINK: u8 = 5;
+    pub const PREMIUM: u8 = 6;
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ComponentEmoji {
+    #[serde(default)]
+    pub id: Option<Snowflake>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub animated: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct SelectOption {
+    pub label: String,
+    pub value: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<ComponentEmoji>,
+    #[serde(default)]
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct UnfurledMedia {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct GalleryItem {
+    pub media: UnfurledMedia,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub spoiler: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct Component {
+    #[serde(rename = "type")]
+    pub kind: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<ComponentEmoji>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku_id: Option<Snowflake>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<SelectOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_values: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_values: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent_color: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divider: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spacing: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<UnfurledMedia>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<UnfurledMedia>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<GalleryItem>,
+    #[serde(default, deserialize_with = "lenient_components", skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessory: Option<Box<Component>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component: Option<Box<Component>>,
+}
+
+impl Component {
+    pub fn is_interactive(&self) -> bool {
+        use component_kind::*;
+        match self.kind {
+            BUTTON => self.style != Some(button_style::LINK) && self.style != Some(button_style::PREMIUM),
+            STRING_SELECT | USER_SELECT | ROLE_SELECT | MENTIONABLE_SELECT | CHANNEL_SELECT => true,
+            _ => false,
+        }
+    }
+}
+
+fn lenient_components<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Component>, D::Error> {
+    let raw = Option::<Vec<serde_json::Value>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(raw.into_iter().filter_map(|value| serde_json::from_value(value).ok()).collect())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1438,6 +1596,63 @@ mod thread_tests {
         }))
         .unwrap();
         assert_eq!(message.thread.as_ref().map(|t| t.id.as_str()), Some("t1"));
+    }
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+
+    #[test]
+    fn a_bot_message_parses_its_rows_buttons_and_selects() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "m", "channel_id": "c", "content": "", "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null,
+            "author": { "id": "b", "username": "bot", "discriminator": "0", "bot": true },
+            "application_id": "app",
+            "components": [
+                { "type": 1, "components": [
+                    { "type": 2, "style": 1, "label": "Yes", "custom_id": "yes" },
+                    { "type": 2, "style": 5, "label": "Docs", "url": "https://example.com" },
+                    { "type": 99, "weird": true }
+                ]},
+                { "type": 1, "components": [
+                    { "type": 3, "custom_id": "pick", "placeholder": "Choose", "options": [ { "label": "A", "value": "a" }, { "label": "B", "value": "b", "default": true } ] }
+                ]},
+                "not even an object"
+            ]
+        }))
+        .unwrap();
+        assert_eq!(message.application_id.as_deref(), Some("app"));
+        assert_eq!(message.components.len(), 2);
+        let row = &message.components[0].components;
+        assert_eq!(row.len(), 3);
+        assert!(row[0].is_interactive() && !row[1].is_interactive());
+        assert_eq!(message.components[1].components[0].options[1].default, true);
+    }
+
+    #[test]
+    fn components_v2_nest_sections_and_containers() {
+        let container: Component = serde_json::from_value(serde_json::json!({
+            "type": 17, "accent_color": 16711680, "components": [
+                { "type": 9, "components": [ { "type": 10, "content": "**Hello**" } ], "accessory": { "type": 2, "style": 2, "label": "Go", "custom_id": "go" } },
+                { "type": 14, "divider": true, "spacing": 1 },
+                { "type": 12, "items": [ { "media": { "url": "https://cdn/a.png" } } ] }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(container.components[0].accessory.as_ref().unwrap().custom_id.as_deref(), Some("go"));
+        assert_eq!(container.components[2].items[0].media.url, "https://cdn/a.png");
+    }
+
+    #[test]
+    fn messages_without_components_serialize_without_them() {
+        let message: Message = serde_json::from_value(serde_json::json!({
+            "id": "m", "channel_id": "c", "content": "hi", "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null,
+            "author": { "id": "a", "username": "a", "discriminator": "0" }, "components": null
+        }))
+        .unwrap();
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("components").is_none() && json.get("application_id").is_none());
     }
 }
 
