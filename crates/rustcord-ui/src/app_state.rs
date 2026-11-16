@@ -264,9 +264,130 @@ impl ChannelEditor {
     }
 }
 
-pub struct InviteManager {
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSettingsCategory {
+    #[default]
+    Profile,
+    Roles,
+    Emoji,
+    Stickers,
+    Members,
+    Invites,
+    Bans,
+    AuditLog,
+    Delete,
+}
+
+impl ServerSettingsCategory {
+    pub const ALL: [ServerSettingsCategory; 9] = [
+        ServerSettingsCategory::Profile,
+        ServerSettingsCategory::Roles,
+        ServerSettingsCategory::Emoji,
+        ServerSettingsCategory::Stickers,
+        ServerSettingsCategory::Members,
+        ServerSettingsCategory::Invites,
+        ServerSettingsCategory::Bans,
+        ServerSettingsCategory::AuditLog,
+        ServerSettingsCategory::Delete,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerSettingsCategory::Profile => "Server Profile",
+            ServerSettingsCategory::Roles => "Roles",
+            ServerSettingsCategory::Emoji => "Emoji",
+            ServerSettingsCategory::Stickers => "Stickers",
+            ServerSettingsCategory::Members => "Members",
+            ServerSettingsCategory::Invites => "Invites",
+            ServerSettingsCategory::Bans => "Bans",
+            ServerSettingsCategory::AuditLog => "Audit Log",
+            ServerSettingsCategory::Delete => "Delete Server",
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ServerSettings {
     pub guild_id: String,
+    pub category: ServerSettingsCategory,
+    pub name: String,
+    pub member_filter: String,
+    pub delete_confirm: String,
+    pub delete_mfa_ticket: Option<String>,
+    pub mfa_code: String,
     pub invites: Option<Result<Vec<rustcord_client::models::Invite>, String>>,
+    pub bans: Option<Result<Vec<rustcord_client::models::Ban>, String>>,
+    pub role_draft: Option<RoleDraft>,
+    pub role_member_filter: String,
+    pub emoji_rename: Option<(String, String)>,
+    pub sticker_form: Option<StickerForm>,
+    pub audit_log: Option<Result<Vec<rustcord_client::models::AuditLogEntry>, String>>,
+    pub audit_log_users: HashMap<String, User>,
+    pub audit_log_complete: bool,
+}
+
+impl ServerSettings {
+    pub fn new(guild_id: String, name: String, category: ServerSettingsCategory) -> Self {
+        Self { guild_id, name, category, ..Default::default() }
+    }
+}
+
+pub enum StickerTarget {
+    Upload(std::path::PathBuf),
+    Edit(String),
+}
+
+pub struct StickerForm {
+    pub target: StickerTarget,
+    pub details: rustcord_client::rest::StickerDetails,
+}
+
+pub struct MemberAction {
+    pub guild_id: String,
+    pub user_id: String,
+    pub name: String,
+    pub ban: bool,
+    pub reason: String,
+    pub delete_message_seconds: u32,
+}
+
+impl MemberAction {
+    pub fn new(guild_id: String, user_id: String, name: String, ban: bool) -> Self {
+        Self { guild_id, user_id, name, ban, reason: String::new(), delete_message_seconds: 0 }
+    }
+}
+
+pub const BAN_DELETE_CHOICES: &[(&str, u32)] = &[
+    ("Don't delete any", 0),
+    ("Previous hour", 60 * 60),
+    ("Previous 6 hours", 6 * 60 * 60),
+    ("Previous 12 hours", 12 * 60 * 60),
+    ("Previous 24 hours", 24 * 60 * 60),
+    ("Previous 3 days", 3 * 24 * 60 * 60),
+    ("Previous 7 days", 7 * 24 * 60 * 60),
+];
+
+#[derive(Clone, PartialEq)]
+pub struct RoleDraft {
+    pub role_id: String,
+    pub name: String,
+    pub color: u32,
+    pub hoist: bool,
+    pub mentionable: bool,
+    pub permissions: u64,
+}
+
+impl From<&rustcord_client::models::Role> for RoleDraft {
+    fn from(role: &rustcord_client::models::Role) -> Self {
+        Self {
+            role_id: role.id.clone(),
+            name: role.name.clone(),
+            color: role.color,
+            hoist: role.hoist,
+            mentionable: role.mentionable,
+            permissions: role.permissions,
+        }
+    }
 }
 
 pub const MUTE_CHOICES: &[(&str, i64)] = &[
@@ -535,7 +656,8 @@ pub struct AppState {
     pub show_hidden_channels: bool,
     pub channel_context: Option<String>,
     pub channel_editor: Option<ChannelEditor>,
-    pub invite_manager: Option<InviteManager>,
+    pub server_settings: Option<ServerSettings>,
+    pub member_action: Option<MemberAction>,
     pub guild_settings: HashMap<String, rustcord_client::models::GuildSettings>,
     pub guild_context: Option<(String, Option<usize>)>,
     pub keybinds: crate::keybinds::Keybinds,
@@ -1232,6 +1354,9 @@ impl AppState {
         self.guild_emojis.remove(guild_id);
         self.guild_stickers.remove(guild_id);
         self.guild_members.remove(guild_id);
+        if self.server_settings.as_ref().is_some_and(|s| s.guild_id == guild_id) {
+            self.server_settings = None;
+        }
         if self.selected_guild.as_deref() == Some(guild_id) {
             self.selected_guild = None;
             self.selected_channel = None;
@@ -1669,6 +1794,11 @@ impl AppState {
         if let Some(members) = self.guild_members.get_mut(guild_id) {
             for member in members {
                 member.roles.retain(|r| r != role_id);
+            }
+        }
+        if let Some(settings) = self.server_settings.as_mut().filter(|s| s.guild_id == guild_id) {
+            if settings.role_draft.as_ref().is_some_and(|d| d.role_id == role_id) {
+                settings.role_draft = None;
             }
         }
     }
@@ -2131,6 +2261,21 @@ impl AppState {
         self.guilds.iter().any(|g| g.id == guild_id && g.owner_id.as_deref() == Some(me.id.as_str()))
     }
 
+    pub fn server_settings_allowed(&self, guild_id: &str, category: ServerSettingsCategory) -> bool {
+        use rustcord_client::permissions::{BAN_MEMBERS, CREATE_EXPRESSIONS, KICK_MEMBERS, MANAGE_EXPRESSIONS, MANAGE_GUILD, MANAGE_ROLES, VIEW_AUDIT_LOG};
+        match category {
+            ServerSettingsCategory::Profile | ServerSettingsCategory::Invites => self.has_guild_permission(guild_id, MANAGE_GUILD),
+            ServerSettingsCategory::Roles => self.has_guild_permission(guild_id, MANAGE_ROLES),
+            ServerSettingsCategory::Emoji | ServerSettingsCategory::Stickers => {
+                self.has_guild_permission(guild_id, MANAGE_EXPRESSIONS) || self.has_guild_permission(guild_id, CREATE_EXPRESSIONS)
+            }
+            ServerSettingsCategory::AuditLog => self.has_guild_permission(guild_id, VIEW_AUDIT_LOG),
+            ServerSettingsCategory::Members => self.has_guild_permission(guild_id, KICK_MEMBERS) || self.has_guild_permission(guild_id, BAN_MEMBERS),
+            ServerSettingsCategory::Bans => self.has_guild_permission(guild_id, BAN_MEMBERS),
+            ServerSettingsCategory::Delete => self.is_guild_owner(guild_id),
+        }
+    }
+
     pub fn has_guild_permission(&self, guild_id: &str, bit: u64) -> bool {
         self.is_guild_owner(guild_id) || rustcord_client::permissions::has_permission(self.my_base_permissions(guild_id), bit)
     }
@@ -2151,11 +2296,21 @@ impl AppState {
         rustcord_client::permissions::has_permission(permissions, bit)
     }
 
+    fn my_top_role_position(&self, guild_id: &str) -> i32 {
+        let Some(roles) = self.guild_roles.get(guild_id) else { return 0 };
+        let mine = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
+        roles.iter().filter(|r| mine.contains(&r.id)).map(|r| r.position).max().unwrap_or(0)
+    }
+
+    pub fn can_edit_role(&self, guild_id: &str, role: &rustcord_client::models::Role) -> bool {
+        self.is_guild_owner(guild_id)
+            || (self.has_guild_permission(guild_id, rustcord_client::permissions::MANAGE_ROLES) && role.position < self.my_top_role_position(guild_id))
+    }
+
     pub fn assignable_roles(&self, guild_id: &str) -> Vec<&rustcord_client::models::Role> {
         let Some(roles) = self.guild_roles.get(guild_id) else { return Vec::new() };
         let owner = self.is_guild_owner(guild_id);
-        let mine = self.my_guild_roles.get(guild_id).map(Vec::as_slice).unwrap_or(&[]);
-        let my_top = roles.iter().filter(|r| mine.contains(&r.id)).map(|r| r.position).max().unwrap_or(0);
+        let my_top = self.my_top_role_position(guild_id);
         let mut assignable: Vec<_> = roles
             .iter()
             .filter(|r| r.id != guild_id && !r.managed && (owner || r.position < my_top))
@@ -2333,7 +2488,7 @@ mod tests {
     }
 
     fn test_role(id: &str, permissions: u64) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions, position: 1, color: 0, managed: false }
+        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions, position: 1, color: 0, managed: false, hoist: false, mentionable: false }
     }
 
     #[test]
@@ -2498,7 +2653,7 @@ mod tests {
     }
 
     fn ranked_role(id: &str, position: i32, managed: bool) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions: 0, position, color: 0, managed }
+        rustcord_client::models::Role { id: id.into(), name: id.into(), permissions: 0, position, color: 0, managed, hoist: false, mentionable: false }
     }
 
     fn moderator_state(owner: bool) -> AppState {
@@ -3110,7 +3265,7 @@ mod tests {
     }
 
     fn role(id: &str, name: &str, position: i32, color: u32) -> rustcord_client::models::Role {
-        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color, managed: false }
+        rustcord_client::models::Role { id: id.into(), name: name.into(), permissions: 0, position, color, managed: false, hoist: false, mentionable: false }
     }
 
     #[test]
