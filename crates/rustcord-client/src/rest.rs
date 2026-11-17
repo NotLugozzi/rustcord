@@ -540,6 +540,29 @@ impl RestClient {
         Ok(crate::commands::CommandIndex::from_response(&value))
     }
 
+    pub async fn forum_post_data(&self, forum_id: &str, thread_ids: &[String]) -> Result<Vec<(String, Message)>, ClientError> {
+        let body = serde_json::json!({ "thread_ids": thread_ids });
+        let value: serde_json::Value = self.post(&format!("/channels/{forum_id}/post-data"), &body).await?;
+        Ok(parse_post_data(&value))
+    }
+
+    pub async fn create_forum_post(
+        &self,
+        forum_id: &str,
+        name: &str,
+        applied_tags: &[String],
+        content: &str,
+        auto_archive_minutes: u32,
+    ) -> Result<Channel, ClientError> {
+        let body = serde_json::json!({
+            "name": name,
+            "auto_archive_duration": auto_archive_minutes,
+            "applied_tags": applied_tags,
+            "message": { "content": content },
+        });
+        self.post(&format!("/channels/{forum_id}/threads?use_nested_fields=true"), &body).await
+    }
+
     pub async fn create_interaction(&self, body: &serde_json::Value) -> Result<(), ClientError> {
         self.send_empty(|| self.http.post(format!("{API_BASE}/interactions")).json(body)).await
     }
@@ -1184,11 +1207,22 @@ pub enum CommandScope {
     User,
 }
 
+fn parse_post_data(value: &serde_json::Value) -> Vec<(String, Message)> {
+    value
+        .get("threads")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(id, post)| Some((id.clone(), serde_json::from_value(post.get("first_message")?.clone()).ok()?)))
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ThreadSearchPage {
     pub threads: Vec<Channel>,
     pub has_more: bool,
     pub indexing: bool,
+    pub first_messages: Vec<Message>,
 }
 
 impl ThreadSearchPage {
@@ -1200,6 +1234,13 @@ impl ThreadSearchPage {
             threads: crate::gateway::parse_guild_threads(value, guild_id, value.get("members")),
             has_more: value.get("has_more").and_then(serde_json::Value::as_bool).unwrap_or(false),
             indexing: false,
+            first_messages: value
+                .get("first_messages")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|m| serde_json::from_value(m.clone()).ok())
+                .collect(),
         }
     }
 }
@@ -1222,6 +1263,35 @@ mod thread_search_tests {
         assert!(page.threads[0].is_joined_thread() && page.threads[0].is_archived_thread());
         assert_eq!(page.threads[0].guild_id.as_deref(), Some("g"));
         assert!(page.has_more && !page.indexing);
+    }
+
+    #[test]
+    fn post_data_maps_each_post_to_its_first_message() {
+        let posts = parse_post_data(&serde_json::json!({
+            "threads": {
+                "t1": { "first_message": { "id": "t1", "channel_id": "t1", "content": "Hello", "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null, "author": { "id": "a", "username": "a", "discriminator": "0" } }, "owner": {} },
+                "t2": { "first_message": null }
+            }
+        }));
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].0, "t1");
+        assert_eq!(posts[0].1.content, "Hello");
+    }
+
+    #[test]
+    fn a_forum_parses_its_tags_and_a_post_its_pin() {
+        let forum: Channel = serde_json::from_value(serde_json::json!({
+            "id": "f", "type": 15, "name": "ideas", "flags": 16, "default_sort_order": 1,
+            "available_tags": [ { "id": "1", "name": "Bug", "moderated": true, "emoji_name": "🐛" } ],
+            "default_reaction_emoji": { "emoji_name": "👍" }
+        }))
+        .unwrap();
+        assert!(forum.is_forum());
+        assert_eq!(forum.forum.flags & crate::models::CHANNEL_FLAG_REQUIRE_TAG, crate::models::CHANNEL_FLAG_REQUIRE_TAG);
+        assert_eq!(forum.forum.available_tags[0].name, "Bug");
+        let post: Channel = serde_json::from_value(serde_json::json!({ "id": "p", "type": 11, "parent_id": "f", "name": "Idea", "flags": 2, "applied_tags": ["1"] })).unwrap();
+        assert!(post.is_pinned_post());
+        assert_eq!(post.forum.applied_tags, ["1"]);
     }
 
     #[test]

@@ -463,6 +463,50 @@ pub struct Channel {
     pub thread: ThreadFields,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_limit: Option<u32>,
+    #[serde(flatten)]
+    pub forum: ForumFields,
+}
+
+pub const CHANNEL_FLAG_PINNED: u64 = 1 << 1;
+pub const CHANNEL_FLAG_REQUIRE_TAG: u64 = 1 << 4;
+pub const FORUM_SORT_CREATION_DATE: u8 = 1;
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ForumTag {
+    pub id: Snowflake,
+    pub name: String,
+    #[serde(default)]
+    pub moderated: bool,
+    #[serde(default)]
+    pub emoji_id: Option<Snowflake>,
+    #[serde(default)]
+    pub emoji_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct DefaultReaction {
+    #[serde(default)]
+    pub emoji_id: Option<Snowflake>,
+    #[serde(default)]
+    pub emoji_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ForumFields {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_tags: Vec<ForumTag>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_tags: Vec<Snowflake>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flags: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sort_order: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reaction_emoji: Option<DefaultReaction>,
 }
 
 impl Channel {
@@ -472,6 +516,14 @@ impl Channel {
 
     pub fn is_joined_thread(&self) -> bool {
         self.is_thread() && self.thread.member.is_some()
+    }
+
+    pub fn is_forum(&self) -> bool {
+        matches!(self.kind, ChannelType::GuildForum | ChannelType::GuildMedia)
+    }
+
+    pub fn is_pinned_post(&self) -> bool {
+        self.forum.flags & CHANNEL_FLAG_PINNED != 0
     }
 
     pub fn voice_capacity(&self) -> Option<u32> {

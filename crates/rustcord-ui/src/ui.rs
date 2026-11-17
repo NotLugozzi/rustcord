@@ -8,6 +8,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 mod commands;
 mod components;
+mod forum;
 
 #[derive(Clone, Copy)]
 pub struct Fonts {
@@ -3891,14 +3892,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 state.channel_context = Some(channel_id.clone());
                             }
                             if clicked {
-                                let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
-                                state.selected_channel = Some(channel_id.clone());
-                                state.server_call_minimized = true;
-                                if let Some(last_id) = last_message_id {
-                                    if state.mark_channel_read(channel_id, last_id) {
-                                        let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
-                                    }
-                                }
+                                state.open_channel(channel_id, cmd_tx);
                             }
                         } else {
                             ui.text(shown.as_deref().unwrap_or(&label));
@@ -4188,6 +4182,11 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             #[cfg(feature = "screenshare")]
             if dm_channel.is_none() && state.watching_stream.is_some() {
                 header_height += draw_watched_stream_panel(ui, state, textures, cmd_tx);
+            }
+            if let Some(forum) = state.selected_channel.as_deref().and_then(|id| state.find_guild_channel(id)).filter(|c| c.is_forum()).cloned() {
+                let _forum_bg = ui.push_style_color(imgui::StyleColor::ChildBg, [0.0; 4]);
+                forum::draw_forum(ui, state, cmd_tx, textures, &forum);
+                return;
             }
 
             let line_height = ui.text_line_height_with_spacing();
@@ -7524,8 +7523,55 @@ fn draw_add_people_popup(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender
 }
 
 
+fn member_list_heading(state: &AppState, guild_id: &str, group_id: &str) -> String {
+    match group_id {
+        "online" => "Online".into(),
+        "offline" => "Offline".into(),
+        role_id => state
+            .guild_roles
+            .get(guild_id)
+            .and_then(|roles| roles.iter().find(|r| r.id == role_id))
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "Members".into()),
+    }
+}
+
+fn draw_listed_members(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache, guild_id: &str, list: &rustcord_client::member_list::MemberList) {
+    use rustcord_client::member_list::Row;
+    let mut shown_members = 0u64;
+    for row in &list.rows {
+        match row {
+            Row::Group { id } => {
+                let heading = member_list_heading(state, guild_id, id).to_uppercase();
+                let count = list.group_count(id).map(|n| format!(" \u{2014} {n}")).unwrap_or_default();
+                ui.dummy([0.0, 6.0]);
+                let font = ui.push_font(faces().xs);
+                ui.text_colored(state.theme.text_muted, format!("{heading}{count}"));
+                font.pop();
+            }
+            Row::Member { user_id } => {
+                let member = state.guild_members.get(guild_id).and_then(|members| members.iter().find(|m| &m.user.id == user_id)).cloned();
+                if let Some(member) = member {
+                    draw_member_row(ui, state, cmd_tx, textures, &member);
+                    shown_members += 1;
+                }
+            }
+            Row::Unknown => {}
+        }
+    }
+    let total: u64 = list.group_counts.iter().map(|(_, n)| n).sum();
+    if total > shown_members {
+        ui.dummy([0.0, 6.0]);
+        ui.text_disabled(format!("\u{2026}and {} more", total - shown_members));
+    }
+}
+
 fn draw_members_panel(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let Some(guild_id) = state.selected_guild.clone() else { return };
+    if let Some(list) = state.member_lists.get(&guild_id).filter(|list| list.synced && !list.rows.is_empty()).cloned() {
+        draw_listed_members(ui, state, cmd_tx, textures, &guild_id, &list);
+        return;
+    }
     let Some(members) = state.guild_members.get(&guild_id).cloned() else {
         ui.text_disabled("Loading members...");
         return;

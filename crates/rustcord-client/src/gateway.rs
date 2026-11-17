@@ -54,6 +54,7 @@ pub enum GatewayEvent {
     GuildSettings(Vec<GuildSettings>),
     ThreadListSync { guild_id: String, channel_ids: Option<Vec<String>>, threads: Vec<Channel> },
     SessionStarted { session_id: String },
+    MemberListUpdate(crate::member_list::MemberListUpdate),
     CommandIndexStale { guild_id: Option<String> },
     InteractionCreated { id: String, nonce: String },
     InteractionSucceeded { nonce: String },
@@ -114,12 +115,6 @@ pub fn voice_state_update_frame(guild_id: Option<&str>, channel_id: Option<&str>
         }
     })
     .to_string()
-}
-
-pub fn guild_subscription_frame(guild_id: &str) -> String {
-    let mut subscriptions = serde_json::Map::new();
-    subscriptions.insert(guild_id.to_string(), json!({ "typing": true, "threads": true, "activities": true }));
-    json!({ "op": 37, "d": { "subscriptions": subscriptions } }).to_string()
 }
 
 pub fn request_guild_members_frame(guild_id: &str) -> String {
@@ -538,6 +533,10 @@ impl Gateway {
                 let _ = tx.send(GatewayEvent::ThreadListSync { guild_id: guild_id.clone(), channel_ids: None, threads });
                 GatewayEvent::GuildCreate { guild_id, roles, member_roles }
             }
+            Some("GUILD_MEMBER_LIST_UPDATE") => match crate::member_list::MemberListUpdate::parse(&data) {
+                Some(update) => GatewayEvent::MemberListUpdate(update),
+                None => return Ok(()),
+            },
             Some("GUILD_APPLICATION_COMMAND_INDEX_UPDATE") => GatewayEvent::CommandIndexStale { guild_id: data["guild_id"].as_str().map(str::to_string) },
             Some("USER_APPLICATION_UPDATE") | Some("USER_APPLICATION_REMOVE") => GatewayEvent::CommandIndexStale { guild_id: None },
             Some("INTERACTION_CREATE") => {

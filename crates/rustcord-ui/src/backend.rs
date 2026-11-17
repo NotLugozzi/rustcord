@@ -432,6 +432,9 @@ pub enum UiCommand {
     JoinThread { thread_id: String },
     SendInteraction { nonce: String, body: serde_json::Value },
     LoadCommandIndex { scope: rustcord_client::rest::CommandScope },
+    SubscribeMemberList { guild_id: String, channel_id: String },
+    LoadForumPostData { forum_id: String, thread_ids: Vec<String> },
+    CreateForumPost { forum_id: String, name: String, tags: Vec<String>, content: String, auto_archive_minutes: u32 },
     OpenChannelById { channel_id: String },
     LoadArchivedThreads { channel_id: String, guild_id: String, offset: u32 },
     SetThreadArchived { thread_id: String, archived: bool },
@@ -517,6 +520,7 @@ pub enum BackendEvent {
     ThreadCreated(rustcord_client::models::Channel),
     InteractionError { nonce: String, message: String },
     CommandIndexLoaded { scope: rustcord_client::rest::CommandScope, index: Option<rustcord_client::commands::CommandIndex> },
+    ForumPostDataLoaded { forum_id: String, posts: Vec<(String, rustcord_client::models::Message)> },
     ChannelFetchedToOpen(rustcord_client::models::Channel),
     ThreadMembershipChanged { thread_id: String, joined: bool },
     ArchivedThreadsLoaded { channel_id: String, offset: u32, page: rustcord_client::rest::ThreadSearchPage },
@@ -627,7 +631,7 @@ pub fn spawn(
                             Ok(channels) => {
                                 let _ = event_tx.send(BackendEvent::GuildChannelsLoaded { guild_id: guild_id.clone(), channels });
                                 if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                                    let _ = tx.send(rustcord_client::gateway::guild_subscription_frame(&guild_id));
+                                    let _ = tx.send(rustcord_client::member_list::subscription_frame(&guild_id, None));
                                 }
                             }
                             Err(e) => {
@@ -779,6 +783,36 @@ pub fn spawn(
                                 let _ = event_tx.send(BackendEvent::Error(format!("couldn't open that channel: {e}")));
                             }
                         }
+                    }
+                }
+                UiCommand::LoadForumPostData { forum_id, thread_ids } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            match client.forum_post_data(&forum_id, &thread_ids).await {
+                                Ok(posts) => {
+                                    let _ = event_tx.send(BackendEvent::ForumPostDataLoaded { forum_id, posts });
+                                }
+                                Err(e) => tracing::warn!("couldn't load forum post previews: {e}"),
+                            }
+                        });
+                    }
+                }
+                UiCommand::CreateForumPost { forum_id, name, tags, content, auto_archive_minutes } => {
+                    if let Some(client) = &rest {
+                        match client.create_forum_post(&forum_id, &name, &tags, &content, auto_archive_minutes).await {
+                            Ok(thread) => {
+                                let _ = event_tx.send(BackendEvent::ThreadCreated(thread));
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(BackendEvent::Error(format!("failed to create post: {e}")));
+                            }
+                        }
+                    }
+                }
+                UiCommand::SubscribeMemberList { guild_id, channel_id } => {
+                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+                        let _ = tx.send(rustcord_client::member_list::subscription_frame(&guild_id, Some(&channel_id)));
                     }
                 }
                 UiCommand::LoadCommandIndex { scope } => {

@@ -142,9 +142,7 @@ fn add_fonts(context: &mut imgui::Context, hidpi_factor: f64, custom: &crate::fo
     let sm_semibold = add(custom.bold.as_ref(), INTER_SEMIBOLD, at(crate::ui::SM_RATIO), COMPACT_GLYPH_RANGES);
     let title = add(custom.bold.as_ref(), INTER_BOLD, at(crate::ui::TITLE_RATIO), TEXT_GLYPH_RANGES);
     let display = add(custom.bold.as_ref(), INTER_BOLD, at(crate::ui::DISPLAY_RATIO), COMPACT_GLYPH_RANGES);
-    let fonts = crate::ui::Fonts { regular, bold, italic, bold_italic, mono, medium, semibold, xs, sm, sm_semibold, title, display };
-    crate::ui::set_faces(fonts);
-    fonts
+    crate::ui::Fonts { regular, bold, italic, bold_italic, mono, medium, semibold, xs, sm, sm_semibold, title, display }
 }
 
 fn build_imgui(mut context: imgui::Context, window: &Window, device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> ImguiState {
@@ -381,6 +379,7 @@ fn render_frame(
     let clear = theme.map_or([0.06, 0.06, 0.07, 1.0], |t| t.background);
 
     let fonts = imgui.fonts;
+    crate::ui::set_faces(fonts);
     let frame_ui = imgui.context.as_mut().expect(ACTIVE_CONTEXT).frame();
     draw(frame_ui, fonts);
     let built = Instant::now();

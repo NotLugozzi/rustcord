@@ -701,6 +701,8 @@ pub struct AppState {
     pub command_picker_dismissed: bool,
     pub active_command: Option<ActiveCommand>,
     pub pending_commands: Vec<PendingCommand>,
+    pub forum_view: Option<ForumView>,
+    pub member_lists: HashMap<String, rustcord_client::member_list::MemberList>,
 }
 
 pub enum VoiceClip {
@@ -795,6 +797,62 @@ pub struct PendingCommand {
     pub channel_id: String,
     pub label: String,
     pub error: Option<String>,
+}
+
+pub const FORUM_CARDS_PER_FETCH: usize = 25;
+pub const POST_DATA_BATCH: usize = 10;
+pub const MAX_POST_TAGS: usize = 5;
+
+pub struct ForumView {
+    pub channel_id: String,
+    pub archived: Vec<Channel>,
+    pub loading_archived: bool,
+    pub has_more: bool,
+    pub first_messages: HashMap<String, Message>,
+    pub requested: std::collections::HashSet<String>,
+    pub search: String,
+    pub new_post: Option<NewPost>,
+}
+
+impl ForumView {
+    pub fn new(channel_id: String) -> Self {
+        Self {
+            channel_id,
+            archived: Vec::new(),
+            loading_archived: true,
+            has_more: false,
+            first_messages: HashMap::new(),
+            requested: std::collections::HashSet::new(),
+            search: String::new(),
+            new_post: None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct NewPost {
+    pub title: String,
+    pub tags: Vec<String>,
+    pub body: String,
+    pub error: Option<String>,
+}
+
+impl NewPost {
+    pub fn validate(&self, forum: &Channel) -> Result<(), &'static str> {
+        if self.title.trim().is_empty() {
+            return Err("Your post needs a title");
+        }
+        if self.body.trim().is_empty() {
+            return Err("Your post needs a message");
+        }
+        if forum.forum.flags & rustcord_client::models::CHANNEL_FLAG_REQUIRE_TAG != 0 && self.tags.is_empty() {
+            return Err("This forum requires a tag");
+        }
+        if self.tags.len() > MAX_POST_TAGS {
+            return Err("A post can have at most 5 tags");
+        }
+        Ok(())
+    }
 }
 
 pub struct ThreadBrowser {
@@ -1748,8 +1806,60 @@ impl AppState {
         threads
     }
 
+    pub fn subscribe_member_list(&mut self, channel_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let Some(channel) = self.find_guild_channel(channel_id) else { return };
+        if channel.is_forum() {
+            return;
+        }
+        let Some(guild_id) = channel.guild_id.clone() else { return };
+        let list_channel = match channel.parent_id.clone().filter(|_| channel.is_thread()) {
+            Some(parent) => parent,
+            None => channel.id.clone(),
+        };
+        if self.member_lists.get(&guild_id).is_some_and(|list| list.channel_id.as_deref() == Some(list_channel.as_str())) {
+            return;
+        }
+        self.member_lists.insert(guild_id.clone(), rustcord_client::member_list::MemberList::for_channel(&list_channel));
+        let _ = cmd_tx.send(crate::backend::UiCommand::SubscribeMemberList { guild_id, channel_id: list_channel });
+    }
+
+    pub fn resubscribe_member_list(&mut self, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        self.member_lists.clear();
+        if let Some(channel_id) = self.selected_channel.clone() {
+            self.subscribe_member_list(&channel_id, cmd_tx);
+        }
+    }
+
+    pub fn apply_member_list_update(&mut self, update: rustcord_client::member_list::MemberListUpdate) {
+        self.guild_members.entry(update.guild_id.clone()).or_default();
+        for listed in update.members() {
+            if let Some(member) = &listed.member {
+                self.known_users.entry(member.user.id.clone()).or_insert_with(|| member.user.clone());
+                self.upsert_guild_member(&update.guild_id, member.clone());
+            }
+            if let Some(presence) = &listed.presence {
+                self.presences.insert(listed.user_id.clone(), presence.clone());
+            }
+        }
+        if let Some(list) = self.member_lists.get_mut(&update.guild_id) {
+            list.apply(&update);
+        }
+    }
+
     pub fn open_channel(&mut self, channel_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
-        let _ = cmd_tx.send(crate::backend::UiCommand::SelectChannel { channel_id: channel_id.to_string() });
+        self.subscribe_member_list(channel_id, cmd_tx);
+        let forum = self.find_guild_channel(channel_id).filter(|c| c.is_forum()).map(|c| c.guild_id.clone().unwrap_or_default());
+        match forum {
+            Some(guild_id) => {
+                if self.forum_view.as_ref().is_none_or(|view| view.channel_id != channel_id) {
+                    self.forum_view = Some(ForumView::new(channel_id.to_string()));
+                    let _ = cmd_tx.send(crate::backend::UiCommand::LoadArchivedThreads { channel_id: channel_id.to_string(), guild_id, offset: 0 });
+                }
+            }
+            None => {
+                let _ = cmd_tx.send(crate::backend::UiCommand::SelectChannel { channel_id: channel_id.to_string() });
+            }
+        }
         self.selected_channel = Some(channel_id.to_string());
         self.server_call_minimized = true;
         let last_id = self.find_guild_channel(channel_id).and_then(|c| c.last_message_id.clone());
@@ -1760,7 +1870,82 @@ impl AppState {
         }
     }
 
+    pub fn forum_posts(&self, forum_id: &str) -> (Vec<Channel>, Vec<Channel>) {
+        let Some(forum) = self.find_guild_channel(forum_id) else { return (Vec::new(), Vec::new()) };
+        let by_creation = forum.forum.default_sort_order == Some(rustcord_client::models::FORUM_SORT_CREATION_DATE);
+        let query = self.forum_view.as_ref().filter(|v| v.channel_id == forum_id).map(|v| v.search.trim().to_lowercase()).unwrap_or_default();
+        let matches = |post: &Channel| query.is_empty() || post.name.as_deref().unwrap_or("").to_lowercase().contains(&query);
+        let activity = |post: &Channel| {
+            let id = if by_creation { post.id.clone() } else { post.last_message_id.clone().unwrap_or_else(|| post.id.clone()) };
+            snowflake_value(&id)
+        };
+        let guild_id = forum.guild_id.clone().unwrap_or_default();
+        let mut active: Vec<Channel> = self
+            .guild_channels
+            .get(&guild_id)
+            .into_iter()
+            .flatten()
+            .filter(|c| c.is_thread() && c.parent_id.as_deref() == Some(forum_id) && !c.is_archived_thread() && matches(c))
+            .cloned()
+            .collect();
+        active.sort_by(|a, b| b.is_pinned_post().cmp(&a.is_pinned_post()).then_with(|| activity(b).cmp(&activity(a))));
+        let listed: std::collections::HashSet<String> = active.iter().map(|c| c.id.clone()).collect();
+        let mut archived: Vec<Channel> = self
+            .forum_view
+            .as_ref()
+            .filter(|v| v.channel_id == forum_id)
+            .map(|v| v.archived.iter().filter(|c| !listed.contains(&c.id) && matches(c)).cloned().collect())
+            .unwrap_or_default();
+        archived.sort_by_key(|c| std::cmp::Reverse(snowflake_value(c.last_message_id.as_deref().unwrap_or(&c.id))));
+        (active, archived)
+    }
+
+    pub fn forum_posts_missing_first_message(&self, forum_id: &str) -> Vec<String> {
+        let Some(view) = self.forum_view.as_ref().filter(|v| v.channel_id == forum_id) else { return Vec::new() };
+        let (active, _) = self.forum_posts(forum_id);
+        active
+            .iter()
+            .take(FORUM_CARDS_PER_FETCH)
+            .map(|post| post.id.clone())
+            .filter(|id| !view.first_messages.contains_key(id) && !view.requested.contains(id))
+            .collect()
+    }
+
+    pub fn request_forum_post_data(&mut self, forum_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let missing = self.forum_posts_missing_first_message(forum_id);
+        let Some(view) = self.forum_view.as_mut() else { return };
+        for batch in missing.chunks(POST_DATA_BATCH) {
+            view.requested.extend(batch.iter().cloned());
+            let _ = cmd_tx.send(crate::backend::UiCommand::LoadForumPostData { forum_id: forum_id.to_string(), thread_ids: batch.to_vec() });
+        }
+    }
+
+    pub fn apply_forum_post_data(&mut self, forum_id: &str, posts: Vec<(String, Message)>) {
+        let Some(view) = self.forum_view.as_mut().filter(|v| v.channel_id == forum_id) else { return };
+        for (post_id, message) in posts {
+            view.first_messages.insert(post_id, message);
+        }
+    }
+
+    fn apply_forum_page(&mut self, channel_id: &str, offset: u32, page: &rustcord_client::rest::ThreadSearchPage) {
+        let Some(view) = self.forum_view.as_mut().filter(|v| v.channel_id == channel_id) else { return };
+        view.loading_archived = false;
+        view.has_more = page.has_more;
+        if offset == 0 {
+            view.archived.clear();
+        }
+        for thread in &page.threads {
+            if !view.archived.iter().any(|t| t.id == thread.id) {
+                view.archived.push(thread.clone());
+            }
+        }
+        for message in &page.first_messages {
+            view.first_messages.insert(message.channel_id.clone(), message.clone());
+        }
+    }
+
     pub fn apply_archived_threads(&mut self, channel_id: &str, offset: u32, page: rustcord_client::rest::ThreadSearchPage) {
+        self.apply_forum_page(channel_id, offset, &page);
         let Some(browser) = self.thread_browser.as_mut().filter(|b| b.channel_id == channel_id) else { return };
         browser.loading = false;
         browser.indexing = page.indexing;
@@ -2856,7 +3041,7 @@ impl AppState {
         let text_channels = |parent_id: Option<&str>| -> Vec<(&Channel, bool)> {
             let mut matching: Vec<(&Channel, bool)> = channels
                 .iter()
-                .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement))
+                .filter(|c| matches!(c.kind, ChannelType::GuildText | ChannelType::GuildAnnouncement | ChannelType::GuildForum | ChannelType::GuildMedia))
                 .filter(|c| c.parent_id.as_deref() == parent_id)
                 .map(|c| (c, self.can_view_channel(guild_id, c)))
                 .filter(|(_, visible)| include_hidden || *visible)
@@ -3650,6 +3835,7 @@ mod tests {
             permission_overwrites: Vec::new(),
             thread: Default::default(),
             user_limit: None,
+            forum: Default::default(),
         }
     }
 
@@ -3672,6 +3858,7 @@ mod tests {
             permission_overwrites: Vec::new(),
             thread: Default::default(),
             user_limit: None,
+            forum: Default::default(),
         }
     }
 
@@ -3965,6 +4152,7 @@ mod tests {
             permission_overwrites: Vec::new(),
             thread: Default::default(),
             user_limit: None,
+            forum: Default::default(),
         });
 
         let entries = state.switcher_entries();
@@ -4180,6 +4368,7 @@ mod thread_tests {
             threads: vec![thread("12", "c", true, true), thread("13", "c", false, true), thread("10", "c", true, false)],
             has_more: true,
             indexing: false,
+            first_messages: Vec::new(),
         });
         let lists = state.thread_browser_lists("g", "c");
         let ids = |list: &[Channel]| list.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
@@ -4193,7 +4382,7 @@ mod thread_tests {
     fn a_later_archived_page_appends_without_duplicates() {
         let mut state = AppState::default();
         state.thread_browser = Some(ThreadBrowser::new("c".into()));
-        let page = |ids: &[&str]| rustcord_client::rest::ThreadSearchPage { threads: ids.iter().map(|id| thread(id, "c", false, true)).collect(), has_more: false, indexing: false };
+        let page = |ids: &[&str]| rustcord_client::rest::ThreadSearchPage { threads: ids.iter().map(|id| thread(id, "c", false, true)).collect(), has_more: false, indexing: false, first_messages: Vec::new() };
         state.apply_archived_threads("c", 0, page(&["1", "2"]));
         state.apply_archived_threads("c", 25, page(&["2", "3"]));
         state.apply_archived_threads("other", 0, page(&["9"]));
@@ -4338,6 +4527,119 @@ mod thread_tests {
         state.finish_interaction(&nonce, Some("This interaction failed".into()));
         assert_eq!(state.pending_commands[0].error.as_deref(), Some("This interaction failed"));
         state.pending_commands.clear();
+    }
+
+    fn forum() -> Channel {
+        serde_json::from_value(serde_json::json!({ "id": "f", "type": 15, "guild_id": "g", "name": "ideas", "last_message_id": "300" })).unwrap()
+    }
+
+    fn post(id: &str, last: &str, pinned: bool) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "type": 11, "guild_id": "g", "parent_id": "f", "name": format!("post {id}"), "last_message_id": last,
+            "flags": if pinned { 2 } else { 0 }, "thread_metadata": { "archived": false }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn opening_a_forum_asks_for_older_posts_not_messages() {
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), vec![forum()]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.open_channel("f", &tx);
+        let mut sent = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            sent.push(command);
+        }
+        assert!(sent.iter().any(|c| matches!(c, crate::backend::UiCommand::LoadArchivedThreads { channel_id, .. } if channel_id == "f")));
+        assert!(!sent.iter().any(|c| matches!(c, crate::backend::UiCommand::SelectChannel { .. })));
+        assert!(state.forum_view.is_some());
+    }
+
+    #[test]
+    fn forum_posts_list_pinned_first_then_by_activity_and_filter_by_search() {
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), vec![forum(), post("101", "150", false), post("102", "250", false), post("103", "120", true)]);
+        state.forum_view = Some(ForumView::new("f".into()));
+        let (active, _) = state.forum_posts("f");
+        let ids: Vec<&str> = active.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["103", "102", "101"]);
+        state.forum_view.as_mut().unwrap().search = "101".into();
+        assert_eq!(state.forum_posts("f").0.len(), 1);
+    }
+
+    #[test]
+    fn first_messages_are_fetched_in_batches_once() {
+        let mut state = AppState::default();
+        let mut channels = vec![forum()];
+        channels.extend((0..23).map(|i| post(&format!("{}", 200 + i), &format!("{}", 400 + i), false)));
+        state.guild_channels.insert("g".into(), channels);
+        state.forum_view = Some(ForumView::new("f".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.request_forum_post_data("f", &tx);
+        let mut batches = Vec::new();
+        while let Ok(crate::backend::UiCommand::LoadForumPostData { thread_ids, .. }) = rx.try_recv() {
+            batches.push(thread_ids.len());
+        }
+        assert_eq!(batches, [10, 10, 3]);
+        state.request_forum_post_data("f", &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_new_post_needs_a_title_a_message_and_a_required_tag() {
+        let mut forum = forum();
+        forum.forum.flags = rustcord_client::models::CHANNEL_FLAG_REQUIRE_TAG;
+        let mut draft = NewPost::default();
+        assert_eq!(draft.validate(&forum), Err("Your post needs a title"));
+        draft.title = "Idea".into();
+        assert_eq!(draft.validate(&forum), Err("Your post needs a message"));
+        draft.body = "Details".into();
+        assert_eq!(draft.validate(&forum), Err("This forum requires a tag"));
+        draft.tags.push("1".into());
+        assert_eq!(draft.validate(&forum), Ok(()));
+    }
+
+    #[test]
+    fn opening_channels_subscribes_each_member_list_once() {
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), vec![text("c"), thread("t", "c", true, false), forum()]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriptions = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::backend::UiCommand>| {
+            let mut out = Vec::new();
+            while let Ok(command) = rx.try_recv() {
+                if let crate::backend::UiCommand::SubscribeMemberList { channel_id, .. } = command {
+                    out.push(channel_id);
+                }
+            }
+            out
+        };
+        state.open_channel("c", &tx);
+        state.open_channel("t", &tx);
+        state.open_channel("f", &tx);
+        assert_eq!(subscriptions(&mut rx), ["c"], "a thread shares its channel's list and a forum has none");
+        state.resubscribe_member_list(&tx);
+        assert!(subscriptions(&mut rx).is_empty(), "the forum is open, so nothing to resubscribe");
+    }
+
+    #[test]
+    fn a_member_list_update_fills_members_presences_and_rows() {
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), vec![text("c")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.open_channel("c", &tx);
+        let update = rustcord_client::member_list::MemberListUpdate::parse(&serde_json::json!({
+            "guild_id": "g", "id": "everyone", "groups": [ { "id": "online", "count": 1 } ],
+            "ops": [ { "op": "SYNC", "range": [0, 99], "items": [
+                { "group": { "id": "online", "count": 1 } },
+                { "member": { "user": { "id": "u", "username": "ann", "discriminator": "0" }, "roles": [], "joined_at": "2026-01-01T00:00:00+00:00", "nick": "Annie", "presence": { "status": "dnd", "activities": [] } } }
+            ] } ]
+        }))
+        .unwrap();
+        state.apply_member_list_update(update);
+        assert_eq!(state.member_lists["g"].rows.len(), 2);
+        assert!(state.guild_members["g"].iter().any(|m| m.nick.as_deref() == Some("Annie")));
+        assert_eq!(state.presence_for("u"), rustcord_client::models::PresenceStatus::Dnd);
     }
 
     #[test]

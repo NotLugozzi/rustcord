@@ -117,7 +117,7 @@ fn main() {
                 let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id });
             }
             if let Some(channel_id) = state.selected_channel.clone() {
-                let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id });
+                state.open_channel(&channel_id, &cmd_tx);
             }
         }
         Ok(None) => {}
@@ -235,6 +235,7 @@ pub fn drain_backend_events(
                 }
                 state.gateway_connected = true;
                 state.mark_command_indexes_stale(None);
+                state.resubscribe_member_list(cmd_tx);
                 state.current_user = Some(user);
                 let guild_ids = guilds.iter().map(|g| g.id.clone()).collect();
                 state.guilds = guilds;
@@ -590,8 +591,14 @@ pub fn drain_backend_events(
                 state.upsert_channel(channel);
                 state.open_channel(&channel_id, cmd_tx);
             }
+            BackendEvent::ForumPostDataLoaded { forum_id, posts } => {
+                state.apply_forum_post_data(&forum_id, posts);
+            }
             BackendEvent::CommandIndexLoaded { scope, index } => {
                 state.apply_command_index(scope, index);
+            }
+            BackendEvent::Gateway(GatewayEvent::MemberListUpdate(update)) => {
+                state.apply_member_list_update(update);
             }
             BackendEvent::Gateway(GatewayEvent::CommandIndexStale { guild_id }) => {
                 state.mark_command_indexes_stale(guild_id.as_deref());

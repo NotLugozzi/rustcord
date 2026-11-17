@@ -9,6 +9,7 @@ pub mod devtools;
 pub mod error;
 pub mod identity;
 pub mod interactions;
+pub mod member_list;
 pub mod models;
 pub mod permissions;
 pub mod rest;
