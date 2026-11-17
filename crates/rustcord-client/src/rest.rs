@@ -530,6 +530,16 @@ impl RestClient {
         }
     }
 
+    pub async fn command_index(&self, scope: &CommandScope) -> Result<Option<crate::commands::CommandIndex>, ClientError> {
+        let path = match scope {
+            CommandScope::Guild(id) => format!("/guilds/{id}/application-command-index"),
+            CommandScope::Channel(id) => format!("/channels/{id}/application-command-index"),
+            CommandScope::User => "/users/@me/application-command-index".to_string(),
+        };
+        let value: serde_json::Value = self.get(&path).await?;
+        Ok(crate::commands::CommandIndex::from_response(&value))
+    }
+
     pub async fn create_interaction(&self, body: &serde_json::Value) -> Result<(), ClientError> {
         self.send_empty(|| self.http.post(format!("{API_BASE}/interactions")).json(body)).await
     }
@@ -1166,6 +1176,13 @@ mod tests {
 }
 
 pub const ARCHIVED_THREAD_PAGE: u32 = 25;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CommandScope {
+    Guild(String),
+    Channel(String),
+    User,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ThreadSearchPage {

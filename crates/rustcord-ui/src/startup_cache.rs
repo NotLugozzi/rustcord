@@ -27,6 +27,8 @@ pub struct Snapshot {
     pub messages: HashMap<String, Vec<Message>>,
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
+    #[serde(default)]
+    pub command_indexes: Vec<(rustcord_client::rest::CommandScope, rustcord_client::commands::CommandIndex)>,
 }
 
 fn snowflake(id: &str) -> u64 {
@@ -70,6 +72,7 @@ impl Snapshot {
             messages,
             selected_guild: state.selected_guild.clone(),
             selected_channel: state.selected_channel.clone(),
+            command_indexes: state.command_indexes.iter().map(|(scope, cached)| (scope.clone(), cached.index.clone())).collect(),
         })
     }
 
@@ -92,6 +95,9 @@ impl Snapshot {
             }
             state.set_message_history(channel_id, messages);
         }
+        for (scope, index) in self.command_indexes {
+            state.command_indexes.insert(scope, crate::app_state::CachedCommandIndex { index, stale: true });
+        }
         state.selected_guild = self.selected_guild;
         state.selected_channel = self.selected_channel;
         state.logged_in = true;
@@ -110,6 +116,7 @@ pub fn forget_cached_account(state: &mut AppState) {
     state.my_guild_roles.clear();
     state.guild_settings.clear();
     state.mention_counts.clear();
+    state.command_indexes.clear();
     state.selected_guild = None;
     state.selected_channel = None;
     state.restored_from_cache = false;
@@ -242,6 +249,31 @@ mod tests {
         assert_eq!(messages[0].embeds.len(), 1);
         assert_eq!(restored.mention_count("dm"), 2);
         assert!(restored.known_users.contains_key("a"));
+    }
+
+    #[test]
+    fn command_indexes_come_back_stale_so_they_show_and_refresh() {
+        let mut state = logged_in_state();
+        let index = rustcord_client::commands::CommandIndex::from_response(&serde_json::json!({
+            "applications": [ { "id": "app", "name": "Helper" } ],
+            "application_commands": [ { "id": "1", "application_id": "app", "version": "1", "type": 1, "name": "ping", "description": "Pong" } ]
+        }))
+        .unwrap();
+        state.command_indexes.insert(rustcord_client::rest::CommandScope::Guild("g".into()), crate::app_state::CachedCommandIndex { index, stale: false });
+        let bytes = serde_json::to_vec(&Snapshot::capture(&state).unwrap()).unwrap();
+        let mut restored = AppState::default();
+        decode(&bytes).unwrap().apply(&mut restored);
+        let cached = &restored.command_indexes[&rustcord_client::rest::CommandScope::Guild("g".into())];
+        assert!(cached.stale);
+        assert_eq!(cached.index.commands[0].name, "ping");
+        assert_eq!(cached.index.commands[0].raw["description"], "Pong");
+    }
+
+    #[test]
+    fn a_snapshot_from_before_commands_were_cached_still_loads() {
+        let mut value = serde_json::to_value(Snapshot::capture(&logged_in_state()).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("command_indexes");
+        assert!(decode(&serde_json::to_vec(&value).unwrap()).is_some());
     }
 
     #[test]

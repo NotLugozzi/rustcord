@@ -6,6 +6,7 @@ use imgui::Ui;
 use std::collections::HashMap;
 use tokio::sync::mpsc::UnboundedSender;
 
+mod commands;
 mod components;
 
 #[derive(Clone, Copy)]
@@ -639,6 +640,22 @@ const RAIL_TILE_SQUARE_RATIO: f32 = 16.0 / 48.0;
 const RAIL_PILL_WIDTH: f32 = 4.0;
 const RAIL_MORPH_TAU: f32 = 0.05;
 const RAIL_PILL_TAU: f32 = 0.06;
+
+pub(super) struct FloatingStyle<'ui> {
+    _colors: [imgui::ColorStackToken<'ui>; 2],
+    _vars: [imgui::StyleStackToken<'ui>; 3],
+}
+
+fn floating_style<'ui>(ui: &'ui Ui, theme: &crate::theme::Theme) -> FloatingStyle<'ui> {
+    FloatingStyle {
+        _colors: [ui.push_style_color(imgui::StyleColor::WindowBg, theme.floating()), ui.push_style_color(imgui::StyleColor::Border, theme.line())],
+        _vars: [
+            ui.push_style_var(imgui::StyleVar::WindowBorderSize(1.0)),
+            ui.push_style_var(imgui::StyleVar::WindowRounding(8.0)),
+            ui.push_style_var(imgui::StyleVar::WindowPadding([8.0, 8.0])),
+        ],
+    }
+}
 
 fn mix(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
@@ -1726,6 +1743,7 @@ fn draw_emoji_autocomplete(
 
     let mut picked = None;
     let popup_pos = [bar_start[0], bar_start[1] - matches.len().min(AUTOCOMPLETE_MAX_RESULTS) as f32 * 28.0 - 8.0];
+    let _floating = floating_style(ui, &state.theme);
     ui.window("##emoji_autocomplete")
         .position(popup_pos, imgui::Condition::Always)
         .size([260.0, matches.len() as f32 * 28.0 + 12.0], imgui::Condition::Always)
@@ -1815,6 +1833,7 @@ fn draw_mention_autocomplete(
 
     let mut picked = None;
     let popup_pos = [bar_start[0], bar_start[1] - matches.len() as f32 * 28.0 - 8.0];
+    let _floating = floating_style(ui, &state.theme);
     ui.window("##mention_autocomplete")
         .position(popup_pos, imgui::Condition::Always)
         .size([260.0, matches.len() as f32 * 28.0 + 12.0], imgui::Condition::Always)
@@ -4659,10 +4678,22 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 .enter_returns_true(true)
                 .build();
             let input_focused = ui.is_item_focused();
-            let emoji_autocomplete_active = trailing_emoji_token(&state.compose_buf).is_some();
-            let mention_autocomplete_active = !emoji_autocomplete_active && trailing_mention_token(&state.compose_buf).is_some();
-
             let mut enter_pressed = enter_pressed_raw;
+            let command_form_open = commands::draw_active_command(ui, state, cmd_tx, bar_start, enter_pressed_raw && state.compose_buf.trim().is_empty());
+            let picker = if input_focused && !command_form_open {
+                commands::draw_picker(ui, state, cmd_tx, bar_start)
+            } else {
+                commands::PickerOutcome { shown: false, suppress_enter: false }
+            };
+            if command_form_open || picker.suppress_enter {
+                enter_pressed = false;
+            }
+            if !command_form_open && !picker.shown {
+                commands::draw_pending_commands(ui, state, bar_start);
+            }
+            let emoji_autocomplete_active = !picker.shown && trailing_emoji_token(&state.compose_buf).is_some();
+            let mention_autocomplete_active = !picker.shown && !emoji_autocomplete_active && trailing_mention_token(&state.compose_buf).is_some();
+
             if input_focused && emoji_autocomplete_active {
                 enter_pressed = false;
                 if let Some((token_start, insert_text)) = draw_emoji_autocomplete(ui, state, textures, cmd_tx, bar_start) {

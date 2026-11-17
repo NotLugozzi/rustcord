@@ -1,4 +1,5 @@
 pub mod captcha;
+pub mod commands;
 #[cfg(feature = "screenshare")]
 pub mod camera_capture;
 pub mod cdn;

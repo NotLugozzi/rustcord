@@ -234,6 +234,7 @@ pub fn drain_backend_events(
                     state.restored_from_cache = false;
                 }
                 state.gateway_connected = true;
+                state.mark_command_indexes_stale(None);
                 state.current_user = Some(user);
                 let guild_ids = guilds.iter().map(|g| g.id.clone()).collect();
                 state.guilds = guilds;
@@ -588,6 +589,12 @@ pub fn drain_backend_events(
                 let channel_id = channel.id.clone();
                 state.upsert_channel(channel);
                 state.open_channel(&channel_id, cmd_tx);
+            }
+            BackendEvent::CommandIndexLoaded { scope, index } => {
+                state.apply_command_index(scope, index);
+            }
+            BackendEvent::Gateway(GatewayEvent::CommandIndexStale { guild_id }) => {
+                state.mark_command_indexes_stale(guild_id.as_deref());
             }
             BackendEvent::InteractionError { nonce, message } => {
                 state.finish_interaction(&nonce, Some(message));

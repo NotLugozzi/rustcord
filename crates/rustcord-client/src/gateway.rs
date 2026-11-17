@@ -54,6 +54,7 @@ pub enum GatewayEvent {
     GuildSettings(Vec<GuildSettings>),
     ThreadListSync { guild_id: String, channel_ids: Option<Vec<String>>, threads: Vec<Channel> },
     SessionStarted { session_id: String },
+    CommandIndexStale { guild_id: Option<String> },
     InteractionCreated { id: String, nonce: String },
     InteractionSucceeded { nonce: String },
     InteractionFailed { nonce: String },
@@ -537,6 +538,8 @@ impl Gateway {
                 let _ = tx.send(GatewayEvent::ThreadListSync { guild_id: guild_id.clone(), channel_ids: None, threads });
                 GatewayEvent::GuildCreate { guild_id, roles, member_roles }
             }
+            Some("GUILD_APPLICATION_COMMAND_INDEX_UPDATE") => GatewayEvent::CommandIndexStale { guild_id: data["guild_id"].as_str().map(str::to_string) },
+            Some("USER_APPLICATION_UPDATE") | Some("USER_APPLICATION_REMOVE") => GatewayEvent::CommandIndexStale { guild_id: None },
             Some("INTERACTION_CREATE") => {
                 let id = data["id"].as_str().unwrap_or_default().to_string();
                 let nonce = data["nonce"].as_str().unwrap_or_default().to_string();

@@ -431,6 +431,7 @@ pub enum UiCommand {
     },
     JoinThread { thread_id: String },
     SendInteraction { nonce: String, body: serde_json::Value },
+    LoadCommandIndex { scope: rustcord_client::rest::CommandScope },
     OpenChannelById { channel_id: String },
     LoadArchivedThreads { channel_id: String, guild_id: String, offset: u32 },
     SetThreadArchived { thread_id: String, archived: bool },
@@ -515,6 +516,7 @@ pub enum BackendEvent {
     ChannelSaved(rustcord_client::models::Channel),
     ThreadCreated(rustcord_client::models::Channel),
     InteractionError { nonce: String, message: String },
+    CommandIndexLoaded { scope: rustcord_client::rest::CommandScope, index: Option<rustcord_client::commands::CommandIndex> },
     ChannelFetchedToOpen(rustcord_client::models::Channel),
     ThreadMembershipChanged { thread_id: String, joined: bool },
     ArchivedThreadsLoaded { channel_id: String, offset: u32, page: rustcord_client::rest::ThreadSearchPage },
@@ -777,6 +779,21 @@ pub fn spawn(
                                 let _ = event_tx.send(BackendEvent::Error(format!("couldn't open that channel: {e}")));
                             }
                         }
+                    }
+                }
+                UiCommand::LoadCommandIndex { scope } => {
+                    if let Some(client) = rest.clone() {
+                        let event_tx = event_tx.clone();
+                        tokio::spawn(async move {
+                            let index = match client.command_index(&scope).await {
+                                Ok(index) => index,
+                                Err(e) => {
+                                    tracing::warn!("couldn't load commands for {scope:?}: {e}");
+                                    None
+                                }
+                            };
+                            let _ = event_tx.send(BackendEvent::CommandIndexLoaded { scope, index });
+                        });
                     }
                 }
                 UiCommand::SendInteraction { nonce, mut body } => {

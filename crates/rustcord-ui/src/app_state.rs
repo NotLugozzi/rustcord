@@ -695,6 +695,12 @@ pub struct AppState {
     pub interaction_errors: HashMap<String, String>,
     pub modal_form: Option<ModalForm>,
     pub select_drafts: HashMap<(String, String), Vec<String>>,
+    pub command_indexes: HashMap<rustcord_client::rest::CommandScope, CachedCommandIndex>,
+    pub command_index_loading: std::collections::HashSet<rustcord_client::rest::CommandScope>,
+    pub command_picker_selected: usize,
+    pub command_picker_dismissed: bool,
+    pub active_command: Option<ActiveCommand>,
+    pub pending_commands: Vec<PendingCommand>,
 }
 
 pub enum VoiceClip {
@@ -750,6 +756,45 @@ impl ModalForm {
     pub fn new(modal: rustcord_client::interactions::Modal) -> Self {
         Self { modal, answers: HashMap::new(), error: None, sending: None }
     }
+}
+
+#[derive(Clone)]
+pub struct CachedCommandIndex {
+    pub index: rustcord_client::commands::CommandIndex,
+    pub stale: bool,
+}
+
+pub struct ActiveCommand {
+    pub channel_id: String,
+    pub entry: rustcord_client::commands::CommandEntry,
+    pub app_name: Option<String>,
+    pub values: Vec<String>,
+    pub error: Option<String>,
+    pub focus_first: bool,
+}
+
+impl ActiveCommand {
+    pub fn new(channel_id: String, entry: rustcord_client::commands::CommandEntry, app_name: Option<String>) -> Self {
+        let values = vec![String::new(); entry.options.len()];
+        Self { channel_id, entry, app_name, values, error: None, focus_first: true }
+    }
+
+    pub fn parsed(&self) -> Result<Vec<(rustcord_client::commands::CommandOption, serde_json::Value)>, String> {
+        let mut out = Vec::new();
+        for (option, text) in self.entry.options.iter().zip(&self.values) {
+            if let Some(value) = rustcord_client::commands::parse_option(option, text)? {
+                out.push((option.clone(), value));
+            }
+        }
+        Ok(out)
+    }
+}
+
+pub struct PendingCommand {
+    pub nonce: String,
+    pub channel_id: String,
+    pub label: String,
+    pub error: Option<String>,
 }
 
 pub struct ThreadBrowser {
@@ -1781,7 +1826,99 @@ impl AppState {
         self.pending_interactions.values().any(|p| p.message_id.as_deref() == Some(message_id))
     }
 
+    pub fn command_scopes_for(&self, channel_id: &str) -> Vec<rustcord_client::rest::CommandScope> {
+        use rustcord_client::rest::CommandScope;
+        if let Some(guild_id) = self.find_guild_channel(channel_id).and_then(|c| c.guild_id.clone()) {
+            return vec![CommandScope::Guild(guild_id), CommandScope::User];
+        }
+        let bot_dm = self
+            .dm_channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .is_some_and(|c| c.recipients.len() == 1 && c.recipients[0].bot);
+        if bot_dm {
+            vec![CommandScope::Channel(channel_id.to_string()), CommandScope::User]
+        } else {
+            vec![CommandScope::User]
+        }
+    }
+
+    pub fn request_command_indexes(&mut self, channel_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        for scope in self.command_scopes_for(channel_id) {
+            let wanted = self.command_indexes.get(&scope).is_none_or(|cached| cached.stale);
+            if wanted && self.command_index_loading.insert(scope.clone()) {
+                let _ = cmd_tx.send(crate::backend::UiCommand::LoadCommandIndex { scope });
+            }
+        }
+    }
+
+    pub fn apply_command_index(&mut self, scope: rustcord_client::rest::CommandScope, index: Option<rustcord_client::commands::CommandIndex>) {
+        self.command_index_loading.remove(&scope);
+        match index {
+            Some(index) => {
+                self.command_indexes.insert(scope, CachedCommandIndex { index, stale: false });
+            }
+            None => {
+                if let Some(cached) = self.command_indexes.get_mut(&scope) {
+                    cached.stale = false;
+                }
+            }
+        }
+    }
+
+    pub fn mark_command_indexes_stale(&mut self, guild_id: Option<&str>) {
+        use rustcord_client::rest::CommandScope;
+        for (scope, cached) in self.command_indexes.iter_mut() {
+            let affected = match (guild_id, scope) {
+                (None, _) => true,
+                (Some(id), CommandScope::Guild(guild)) => guild == id,
+                (Some(_), CommandScope::Channel(_)) => true,
+                (Some(_), CommandScope::User) => false,
+            };
+            if affected {
+                cached.stale = true;
+            }
+        }
+    }
+
+    pub fn commands_for_channel(&self, channel_id: &str) -> (rustcord_client::commands::CommandIndex, bool) {
+        let mut merged = rustcord_client::commands::CommandIndex::default();
+        let mut loading = false;
+        for scope in self.command_scopes_for(channel_id) {
+            match self.command_indexes.get(&scope) {
+                Some(cached) => merged = merged.merged(&cached.index),
+                None => loading |= self.command_index_loading.contains(&scope),
+            }
+        }
+        (merged, loading)
+    }
+
+    pub fn submit_active_command(&mut self, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let Some(active) = self.active_command.as_mut() else { return };
+        let values = match active.parsed() {
+            Ok(values) => values,
+            Err(reason) => {
+                active.error = Some(reason);
+                return;
+            }
+        };
+        let active = self.active_command.take().expect("active command");
+        let guild_id = self.find_guild_channel(&active.channel_id).and_then(|c| c.guild_id.clone());
+        let nonce = rustcord_client::interactions::nonce();
+        let body = rustcord_client::commands::invoke(&active.entry, &values, guild_id.as_deref(), &active.channel_id, &nonce);
+        self.pending_commands.push(PendingCommand { nonce: nonce.clone(), channel_id: active.channel_id.clone(), label: active.entry.label(), error: None });
+        self.start_interaction(nonce, None, body, cmd_tx);
+    }
+
     pub fn finish_interaction(&mut self, nonce: &str, failure: Option<String>) {
+        if let Some(index) = self.pending_commands.iter().position(|p| p.nonce == nonce) {
+            match &failure {
+                Some(reason) => self.pending_commands[index].error = Some(reason.clone()),
+                None => {
+                    self.pending_commands.remove(index);
+                }
+            }
+        }
         if let Some(form) = self.modal_form.as_mut().filter(|f| f.sending.as_deref() == Some(nonce)) {
             match &failure {
                 Some(reason) => {
@@ -4138,6 +4275,69 @@ mod thread_tests {
         state.modal_form.as_mut().unwrap().sending = Some("again".into());
         state.finish_interaction("again", None);
         assert!(state.modal_form.is_none());
+    }
+
+    fn command_index(names: &[&str]) -> rustcord_client::commands::CommandIndex {
+        let commands: Vec<serde_json::Value> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| serde_json::json!({ "id": i.to_string(), "application_id": "app", "version": "1", "type": 1, "name": name, "description": "", "options": [ { "type": 4, "name": "count", "description": "", "required": true, "min_value": 1 } ] }))
+            .collect();
+        rustcord_client::commands::CommandIndex::from_response(&serde_json::json!({ "applications": [], "application_commands": commands })).unwrap()
+    }
+
+    #[test]
+    fn command_indexes_load_once_and_refresh_when_stale() {
+        use rustcord_client::rest::CommandScope;
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), vec![text("c")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.request_command_indexes("c", &tx);
+        state.request_command_indexes("c", &tx);
+        let mut sent = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            if let crate::backend::UiCommand::LoadCommandIndex { scope } = command {
+                sent.push(scope);
+            }
+        }
+        assert_eq!(sent, [CommandScope::Guild("g".into()), CommandScope::User]);
+        assert!(state.commands_for_channel("c").1, "still loading");
+        state.apply_command_index(CommandScope::Guild("g".into()), Some(command_index(&["roll"])));
+        state.apply_command_index(CommandScope::User, Some(command_index(&[])));
+        let (index, loading) = state.commands_for_channel("c");
+        assert!(!loading && index.commands.len() == 1);
+        state.request_command_indexes("c", &tx);
+        assert!(rx.try_recv().is_err(), "a fresh index isn't fetched again");
+        state.mark_command_indexes_stale(Some("g"));
+        state.request_command_indexes("c", &tx);
+        assert!(matches!(rx.try_recv(), Ok(crate::backend::UiCommand::LoadCommandIndex { scope: CommandScope::Guild(_) })));
+        assert!(rx.try_recv().is_err(), "the account's own index wasn't touched");
+        assert_eq!(state.commands_for_channel("c").0.commands.len(), 1, "a stale index still shows while it refreshes");
+    }
+
+    #[test]
+    fn an_active_command_checks_its_options_then_sends_and_waits() {
+        let mut state = AppState::default();
+        state.guild_channels.insert("g".into(), vec![text("c")]);
+        let index = command_index(&["roll"]);
+        let entry = rustcord_client::commands::chat_entries(&index.commands, true).remove(0);
+        state.active_command = Some(ActiveCommand::new("c".into(), entry, None));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.submit_active_command(&tx);
+        assert_eq!(state.active_command.as_ref().unwrap().error.as_deref(), Some("count is required"));
+        state.active_command.as_mut().unwrap().values[0] = "0".into();
+        state.submit_active_command(&tx);
+        assert!(state.active_command.as_ref().unwrap().error.as_deref().unwrap().contains("at least"));
+        state.active_command.as_mut().unwrap().values[0] = "3".into();
+        state.submit_active_command(&tx);
+        assert!(state.active_command.is_none());
+        let Ok(crate::backend::UiCommand::SendInteraction { nonce, body }) = rx.try_recv() else { panic!("not sent") };
+        assert_eq!(body["data"]["options"][0]["value"], 3);
+        assert_eq!(body["guild_id"], "g");
+        assert_eq!(state.pending_commands.len(), 1);
+        state.finish_interaction(&nonce, Some("This interaction failed".into()));
+        assert_eq!(state.pending_commands[0].error.as_deref(), Some("This interaction failed"));
+        state.pending_commands.clear();
     }
 
     #[test]
