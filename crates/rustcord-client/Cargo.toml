@@ -32,6 +32,7 @@ cpal = { version = "0.18", features = ["pulseaudio"] }
 audiopus = "0.3.0-rc.0"
 nnnoiseless = "0.5"
 rtrb = "0.3"
+rsa = { version = "0.9", features = ["sha2"] }
 aes = "0.8"
 ghash = "0.5"
 hmac = "0.12"

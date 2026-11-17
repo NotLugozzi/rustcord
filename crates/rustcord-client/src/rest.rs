@@ -4,7 +4,7 @@ use crate::models::{AuditLog, Ban, Channel, ChannelType, Emoji, Gif, Guild, Guil
 use reqwest::{header, Client, Method, Response};
 use serde::{Deserialize, Serialize};
 
-const API_BASE: &str = "https://discord.com/api/v10";
+pub(crate) const API_BASE: &str = "https://discord.com/api/v10";
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -161,13 +161,20 @@ pub struct UploadFile {
     pub content_type: String,
 }
 
-fn attachments_payload(content: &str, filenames: &[&str], reply_to: Option<&str>) -> Result<String, ClientError> {
+fn add_reply(payload: &mut serde_json::Value, reply_to: Option<&str>, ping_reply: bool) {
+    if let Some(message_id) = reply_to {
+        payload["message_reference"] = serde_json::json!({ "message_id": message_id });
+        if !ping_reply {
+            payload["allowed_mentions"] = serde_json::json!({ "parse": ["users", "roles", "everyone"], "replied_user": false });
+        }
+    }
+}
+
+fn attachments_payload(content: &str, filenames: &[&str], reply_to: Option<&str>, ping_reply: bool) -> Result<String, ClientError> {
     let attachments: Vec<serde_json::Value> =
         filenames.iter().enumerate().map(|(id, filename)| serde_json::json!({ "id": id, "filename": filename })).collect();
     let mut payload = serde_json::json!({ "content": content, "attachments": attachments });
-    if let Some(message_id) = reply_to {
-        payload["message_reference"] = serde_json::json!({ "message_id": message_id });
-    }
+    add_reply(&mut payload, reply_to, ping_reply);
     Ok(serde_json::to_string(&payload)?)
 }
 
@@ -341,7 +348,7 @@ impl RestClient {
     }
 
     pub async fn send_message(&self, channel_id: &str, content: &str) -> Result<Message, ClientError> {
-        self.send_message_reply(channel_id, content, None).await
+        self.send_message_reply(channel_id, content, None, true).await
     }
 
     pub async fn send_message_reply(
@@ -349,41 +356,16 @@ impl RestClient {
         channel_id: &str,
         content: &str,
         reply_to: Option<&str>,
+        ping_reply: bool,
     ) -> Result<Message, ClientError> {
-        #[derive(Serialize)]
-        struct MessageReference<'a> {
-            message_id: &'a str,
-        }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            content: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            message_reference: Option<MessageReference<'a>>,
-        }
-        let body = Body {
-            content,
-            message_reference: reply_to.map(|id| MessageReference { message_id: id }),
-        };
+        let mut body = serde_json::json!({ "content": content });
+        add_reply(&mut body, reply_to, ping_reply);
         self.post(&format!("/channels/{channel_id}/messages"), &body).await
     }
 
-    pub async fn send_sticker(&self, channel_id: &str, sticker_id: &str, reply_to: Option<&str>) -> Result<Message, ClientError> {
-        #[derive(Serialize)]
-        struct MessageReference<'a> {
-            message_id: &'a str,
-        }
-        #[derive(Serialize)]
-        struct Body<'a> {
-            content: &'a str,
-            sticker_ids: [&'a str; 1],
-            #[serde(skip_serializing_if = "Option::is_none")]
-            message_reference: Option<MessageReference<'a>>,
-        }
-        let body = Body {
-            content: "",
-            sticker_ids: [sticker_id],
-            message_reference: reply_to.map(|id| MessageReference { message_id: id }),
-        };
+    pub async fn send_sticker(&self, channel_id: &str, sticker_id: &str, reply_to: Option<&str>, ping_reply: bool) -> Result<Message, ClientError> {
+        let mut body = serde_json::json!({ "content": "", "sticker_ids": [sticker_id] });
+        add_reply(&mut body, reply_to, ping_reply);
         self.post(&format!("/channels/{channel_id}/messages"), &body).await
     }
 
@@ -736,6 +718,15 @@ impl RestClient {
         .await
     }
 
+    pub async fn mark_unread(&self, channel_id: &str, message_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| {
+            self.http
+                .post(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/ack"))
+                .json(&serde_json::json!({ "manual": true, "mention_count": 0 }))
+        })
+        .await
+    }
+
     pub async fn ring_call(&self, channel_id: &str) -> Result<(), ClientError> {
         self.send_empty(|| {
             self.http
@@ -811,7 +802,7 @@ impl RestClient {
         progress: Option<std::sync::Arc<UploadProgress>>,
     ) -> Result<Message, ClientError> {
         let file = UploadFile { filename: filename.to_string(), bytes: file_bytes, content_type: content_type.to_string() };
-        self.send_message_with_files(channel_id, content, vec![file], reply_to, progress).await
+        self.send_message_with_files(channel_id, content, vec![file], reply_to, true, progress).await
     }
 
     pub async fn send_message_with_files(
@@ -820,10 +811,11 @@ impl RestClient {
         content: &str,
         files: Vec<UploadFile>,
         reply_to: Option<&str>,
+        ping_reply: bool,
         progress: Option<std::sync::Arc<UploadProgress>>,
     ) -> Result<Message, ClientError> {
         let filenames: Vec<&str> = files.iter().map(|f| f.filename.as_str()).collect();
-        let payload_json = attachments_payload(content, &filenames, reply_to)?;
+        let payload_json = attachments_payload(content, &filenames, reply_to, ping_reply)?;
         let mut form = reqwest::multipart::Form::new().text("payload_json", payload_json);
         for (index, file) in files.into_iter().enumerate() {
             let part = match &progress {
@@ -1110,15 +1102,29 @@ mod tests {
 
     #[test]
     fn every_file_gets_an_attachment_entry_matching_its_part_index() {
-        let payload: serde_json::Value = serde_json::from_str(&attachments_payload("hi", &["a.png", "b.png"], Some("9")).unwrap()).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&attachments_payload("hi", &["a.png", "b.png"], Some("9"), true).unwrap()).unwrap();
         assert_eq!(payload["content"], "hi");
         assert_eq!(
             payload["attachments"],
             serde_json::json!([{ "id": 0, "filename": "a.png" }, { "id": 1, "filename": "b.png" }])
         );
         assert_eq!(payload["message_reference"]["message_id"], "9");
-        let bare: serde_json::Value = serde_json::from_str(&attachments_payload("", &["a.png"], None).unwrap()).unwrap();
+        let bare: serde_json::Value = serde_json::from_str(&attachments_payload("", &["a.png"], None, false).unwrap()).unwrap();
         assert!(bare.get("message_reference").is_none());
+    }
+
+    #[test]
+    fn a_reply_without_a_ping_tells_discord_not_to_mention_the_author() {
+        let mut quiet = serde_json::json!({ "content": "hi" });
+        add_reply(&mut quiet, Some("9"), false);
+        assert_eq!(quiet["allowed_mentions"]["replied_user"], false);
+        assert_eq!(quiet["allowed_mentions"]["parse"], serde_json::json!(["users", "roles", "everyone"]));
+        let mut loud = serde_json::json!({ "content": "hi" });
+        add_reply(&mut loud, Some("9"), true);
+        assert!(loud.get("allowed_mentions").is_none());
+        let mut plain = serde_json::json!({ "content": "hi" });
+        add_reply(&mut plain, None, false);
+        assert!(plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none());
     }
 
     #[test]

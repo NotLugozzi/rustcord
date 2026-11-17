@@ -12,6 +12,7 @@ pub mod interactions;
 pub mod member_list;
 pub mod models;
 pub mod permissions;
+pub mod remote_auth;
 pub mod rest;
 #[cfg(feature = "screenshare")]
 pub mod screen_capture;

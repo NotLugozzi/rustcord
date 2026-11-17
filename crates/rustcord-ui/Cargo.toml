@@ -52,6 +52,7 @@ notify-rust = "4"
 chrono = "0.4"
 resvg = { version = "0.45", default-features = false }
 arboard = { version = "3", features = ["wayland-data-control"] }
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

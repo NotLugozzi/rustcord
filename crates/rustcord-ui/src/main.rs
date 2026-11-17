@@ -165,7 +165,20 @@ pub fn drain_backend_events(
     let mut media = DrainedMedia::default();
     while let Ok(event) = event_rx.try_recv() {
         match event {
+            BackendEvent::QrLoginStep(step) => {
+                state.qr_login.apply(step);
+            }
+            BackendEvent::QrLoginDone(outcome) => {
+                if let Some(token) = state.qr_login.finish(outcome) {
+                    state.login_status = Some("Logging in\u{2026}".into());
+                    let _ = cmd_tx.send(UiCommand::LoginWithToken { token });
+                }
+            }
             BackendEvent::LoggedIn => {
+                if !matches!(state.qr_login, crate::app_state::QrLogin::Idle) {
+                    let _ = cmd_tx.send(UiCommand::CancelQrLogin);
+                    state.qr_login = crate::app_state::QrLogin::Idle;
+                }
                 state.logged_in = true;
                 state.login_error = None;
                 state.login_status = None;
@@ -265,7 +278,7 @@ pub fn drain_backend_events(
                 }
                 let is_actively_viewing = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
                 state.record_incoming_mention(&message, is_actively_viewing);
-                if is_actively_viewing && state.mark_channel_read(&message.channel_id, &message.id) {
+                if is_actively_viewing && state.auto_read_allowed(&message.channel_id) && state.mark_channel_read(&message.channel_id, &message.id) {
                     let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: message.channel_id.clone(), message_id: message.id.clone() });
                 }
                 state.push_message(message);

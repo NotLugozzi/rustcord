@@ -642,10 +642,8 @@ impl ApplicationHandler for App {
             }
         }
         let active = self.last_input.elapsed() < Duration::from_millis(400) || crate::anim::is_moving();
-        let animating = window.textures.animating || window.textures.has_wanted_icons() || self.state.voice_audio_active();
-        let typing = self.state.selected_channel.as_deref().is_some_and(|channel| {
-            self.state.typing_users_for(channel).iter().any(|id| self.state.current_user.as_ref().is_none_or(|me| me.id != *id))
-        });
+        let animating = window.textures.animating || window.textures.has_wanted_icons() || self.state.voice_audio_active() || self.state.slowmode_ticking();
+        let typing = self.state.selected_channel.as_deref().is_some_and(|channel| self.state.someone_typing_in(channel)) || self.state.dm_list_typing();
         if self.typing_active && !typing {
             self.needs_redraw = true;
         }

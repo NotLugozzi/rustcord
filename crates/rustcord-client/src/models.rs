@@ -465,6 +465,8 @@ pub struct Channel {
     pub user_limit: Option<u32>,
     #[serde(flatten)]
     pub forum: ForumFields,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_per_user: Option<u32>,
 }
 
 pub const CHANNEL_FLAG_PINNED: u64 = 1 << 1;

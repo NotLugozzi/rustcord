@@ -353,13 +353,15 @@ pub enum SearchScope {
 pub enum UiCommand {
     LoginWithPassword { email: String, password: String },
     LoginWithToken { token: String },
+    StartQrLogin,
+    CancelQrLogin,
     SubmitMfa { ticket: String, code: String },
     SelectGuild { guild_id: String },
     LoadAllGuildEmojis { guild_ids: Vec<String> },
     SelectChannel { channel_id: String },
     LoadOlderMessages { channel_id: String, before: String },
-    SendMessage { channel_id: String, content: String, reply_to: Option<String> },
-    SendSticker { channel_id: String, sticker_id: String, reply_to: Option<String> },
+    SendMessage { channel_id: String, content: String, reply_to: Option<String>, ping_reply: bool },
+    SendSticker { channel_id: String, sticker_id: String, reply_to: Option<String>, ping_reply: bool },
     LoadGuildStickers { guild_ids: Vec<String> },
     LoadStickerPacks,
     TimeoutMember { guild_id: String, user_id: String, duration_secs: Option<i64> },
@@ -391,6 +393,7 @@ pub enum UiCommand {
         content: String,
         files: Vec<crate::app_state::PendingAttachment>,
         reply_to: Option<String>,
+        ping_reply: bool,
         upload_id: u64,
         progress: std::sync::Arc<rustcord_client::rest::UploadProgress>,
     },
@@ -433,6 +436,7 @@ pub enum UiCommand {
     SendInteraction { nonce: String, body: serde_json::Value },
     LoadCommandIndex { scope: rustcord_client::rest::CommandScope },
     SubscribeMemberList { guild_id: String, channel_id: String },
+    MarkUnread { channel_id: String, message_id: String },
     LoadForumPostData { forum_id: String, thread_ids: Vec<String> },
     CreateForumPost { forum_id: String, name: String, tags: Vec<String>, content: String, auto_archive_minutes: u32 },
     OpenChannelById { channel_id: String },
@@ -504,6 +508,8 @@ pub enum BackendEvent {
     LoginFailed(String),
     SessionUnreachable(String),
     LoggedIn,
+    QrLoginStep(rustcord_client::remote_auth::Step),
+    QrLoginDone(rustcord_client::remote_auth::Outcome),
     Error(String),
     RpcApps(Vec<crate::presence::RpcAppInfo>),
     ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile, user: Option<rustcord_client::models::User> },
@@ -598,6 +604,7 @@ pub fn spawn(
     rt.spawn(async move {
         let mut rest: Option<RestClient> = None;
         let mut login_session: Option<LoginSession> = None;
+        let mut qr_task: Option<tokio::task::JoinHandle<()>> = None;
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
@@ -715,9 +722,9 @@ pub fn spawn(
                         });
                     }
                 }
-                UiCommand::SendMessage { channel_id, content, reply_to } => {
+                UiCommand::SendMessage { channel_id, content, reply_to, ping_reply } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.send_message_reply(&channel_id, &content, reply_to.as_deref()).await {
+                        if let Err(e) = client.send_message_reply(&channel_id, &content, reply_to.as_deref(), ping_reply).await {
                             tracing::warn!("send failed: {e}");
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to send message: {e}")));
                         }
@@ -810,6 +817,13 @@ pub fn spawn(
                         }
                     }
                 }
+                UiCommand::MarkUnread { channel_id, message_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.mark_unread(&channel_id, &message_id).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("couldn't mark as unread: {e}")));
+                        }
+                    }
+                }
                 UiCommand::SubscribeMemberList { guild_id, channel_id } => {
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                         let _ = tx.send(rustcord_client::member_list::subscription_frame(&guild_id, Some(&channel_id)));
@@ -870,9 +884,9 @@ pub fn spawn(
                         }
                     }
                 }
-                UiCommand::SendSticker { channel_id, sticker_id, reply_to } => {
+                UiCommand::SendSticker { channel_id, sticker_id, reply_to, ping_reply } => {
                     if let Some(client) = &rest {
-                        if let Err(e) = client.send_sticker(&channel_id, &sticker_id, reply_to.as_deref()).await {
+                        if let Err(e) = client.send_sticker(&channel_id, &sticker_id, reply_to.as_deref(), ping_reply).await {
                             tracing::warn!("sticker send failed: {e}");
                             let _ = event_tx.send(BackendEvent::Error(format!("failed to send sticker: {e}")));
                         }
@@ -915,7 +929,7 @@ pub fn spawn(
                         });
                     }
                 }
-                UiCommand::SendAttachments { channel_id, content, files, reply_to, upload_id, progress } => {
+                UiCommand::SendAttachments { channel_id, content, files, reply_to, ping_reply, upload_id, progress } => {
                     if let Some(client) = rest.clone() {
                         let event_tx = event_tx.clone();
                         let task = tokio::spawn(async move {
@@ -924,7 +938,7 @@ pub fn spawn(
                                     let total = files.iter().map(|f| f.bytes.len() as u64).sum();
                                     progress.total.store(total, std::sync::atomic::Ordering::Relaxed);
                                     if let Err(e) = client
-                                        .send_message_with_files(&channel_id, &content, files, reply_to.as_deref(), Some(progress))
+                                        .send_message_with_files(&channel_id, &content, files, reply_to.as_deref(), ping_reply, Some(progress))
                                         .await
                                     {
                                         tracing::warn!("attachment send failed: {e}");
@@ -1158,6 +1172,25 @@ pub fn spawn(
                         if let Err(e) = client.trigger_typing(&channel_id).await {
                             tracing::warn!("failed to send typing indicator: {e}");
                         }
+                    }
+                }
+                UiCommand::StartQrLogin => {
+                    if let Some(task) = qr_task.take() {
+                        task.abort();
+                    }
+                    let event_tx = event_tx.clone();
+                    qr_task = Some(tokio::spawn(async move {
+                        let steps = event_tx.clone();
+                        let outcome = rustcord_client::remote_auth::link(move |step| {
+                            let _ = steps.send(BackendEvent::QrLoginStep(step));
+                        })
+                        .await;
+                        let _ = event_tx.send(BackendEvent::QrLoginDone(outcome));
+                    }));
+                }
+                UiCommand::CancelQrLogin => {
+                    if let Some(task) = qr_task.take() {
+                        task.abort();
                     }
                 }
                 UiCommand::LoginWithToken { token } => {

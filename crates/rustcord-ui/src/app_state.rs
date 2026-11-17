@@ -702,6 +702,10 @@ pub struct AppState {
     pub active_command: Option<ActiveCommand>,
     pub pending_commands: Vec<PendingCommand>,
     pub forum_view: Option<ForumView>,
+    pub reply_no_ping: bool,
+    pub manual_unread: std::collections::HashSet<String>,
+    pub slowmode_until: HashMap<String, std::time::Instant>,
+    pub qr_login: QrLogin,
     pub member_lists: HashMap<String, rustcord_client::member_list::MemberList>,
 }
 
@@ -739,6 +743,62 @@ impl VoiceRecording {
 
 const RECORDING_LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 const RECORDING_LEVEL_HISTORY: usize = 160;
+
+pub const UNREAD_DMS_ON_RAIL: usize = 5;
+
+#[derive(Default)]
+pub enum QrLogin {
+    #[default]
+    Idle,
+    Waiting,
+    Code { modules: Vec<bool>, width: usize },
+    Scanned { name: String, avatar_url: Option<String> },
+    Finishing,
+    Ended(String),
+}
+
+impl QrLogin {
+    pub fn code(url: &str) -> Self {
+        match qrcode::QrCode::new(url.as_bytes()) {
+            Ok(code) => {
+                let width = code.width();
+                let modules = code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect();
+                QrLogin::Code { modules, width }
+            }
+            Err(e) => QrLogin::Ended(format!("couldn't draw the code: {e}")),
+        }
+    }
+
+    pub fn apply(&mut self, step: rustcord_client::remote_auth::Step) {
+        use rustcord_client::remote_auth::Step;
+        *self = match step {
+            Step::Code(url) => Self::code(&url),
+            Step::Scanned { name, avatar_url } => QrLogin::Scanned { name, avatar_url },
+        };
+    }
+
+    pub fn finish(&mut self, outcome: rustcord_client::remote_auth::Outcome) -> Option<String> {
+        use rustcord_client::remote_auth::Outcome;
+        match outcome {
+            Outcome::Token(token) => {
+                *self = QrLogin::Finishing;
+                Some(token)
+            }
+            Outcome::Expired => {
+                *self = QrLogin::Ended("The code expired.".into());
+                None
+            }
+            Outcome::Cancelled => {
+                *self = QrLogin::Ended("The login was cancelled on your phone.".into());
+                None
+            }
+            Outcome::Failed(reason) => {
+                *self = QrLogin::Ended(reason);
+                None
+            }
+        }
+    }
+}
 
 pub const INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -1543,6 +1603,93 @@ impl AppState {
         is_newer
     }
 
+    pub fn mark_unread_from(&mut self, channel_id: &str, message_id: &str) -> String {
+        let target = snowflake_value(message_id);
+        let previous = self
+            .messages
+            .get(channel_id)
+            .and_then(|list| list.iter().rev().map(|m| m.id.clone()).find(|id| snowflake_value(id) < target))
+            .unwrap_or_else(|| target.saturating_sub(1).to_string());
+        self.last_read_message_id.insert(channel_id.to_string(), previous.clone());
+        self.manual_unread.insert(channel_id.to_string());
+        self.message_rows.remove(channel_id);
+        self.save_read_state();
+        previous
+    }
+
+    pub fn composer_block(&self, channel_id: &str) -> Option<&'static str> {
+        use rustcord_client::permissions::{MANAGE_THREADS, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS};
+        let channel = self.find_guild_channel(channel_id)?;
+        let guild_id = channel.guild_id.clone()?;
+        if self.current_user.is_none() || !self.guild_roles.contains_key(&guild_id) {
+            return None;
+        }
+        if channel.is_thread() {
+            let locked = channel.thread.thread_metadata.as_ref().is_some_and(|m| m.locked);
+            if locked && !self.has_channel_permission(&guild_id, channel, MANAGE_THREADS) {
+                return Some("This thread is locked.");
+            }
+            if !self.has_channel_permission(&guild_id, channel, SEND_MESSAGES_IN_THREADS) {
+                return Some("You do not have permission to send messages in this thread.");
+            }
+            return None;
+        }
+        (!self.has_channel_permission(&guild_id, channel, SEND_MESSAGES)).then_some("You do not have permission to send messages in this channel.")
+    }
+
+    fn slowmode_exempt(&self, channel: &Channel) -> bool {
+        use rustcord_client::permissions::{MANAGE_CHANNELS, MANAGE_MESSAGES};
+        let Some(guild_id) = channel.guild_id.as_deref() else { return true };
+        self.current_user.is_none()
+            || self.has_channel_permission(guild_id, channel, MANAGE_MESSAGES)
+            || self.has_channel_permission(guild_id, channel, MANAGE_CHANNELS)
+    }
+
+    pub fn note_message_sent(&mut self, channel_id: &str) {
+        self.manual_unread.remove(channel_id);
+        let Some(channel) = self.find_guild_channel(channel_id) else { return };
+        let Some(seconds) = channel.rate_limit_per_user.filter(|&s| s > 0) else { return };
+        if self.slowmode_exempt(channel) {
+            return;
+        }
+        self.slowmode_until.insert(channel_id.to_string(), std::time::Instant::now() + std::time::Duration::from_secs(u64::from(seconds)));
+    }
+
+    pub fn slowmode_remaining(&self, channel_id: &str, now: std::time::Instant) -> Option<u64> {
+        let until = self.slowmode_until.get(channel_id)?;
+        let left = until.saturating_duration_since(now);
+        (!left.is_zero()).then(|| left.as_secs() + u64::from(left.subsec_nanos() > 0))
+    }
+
+    pub fn slowmode_ticking(&self) -> bool {
+        let now = std::time::Instant::now();
+        self.selected_channel.as_deref().is_some_and(|c| self.slowmode_remaining(c, now).is_some())
+    }
+
+    pub fn unread_dms(&self) -> Vec<&Channel> {
+        let now = chrono::Utc::now();
+        let mut dms: Vec<&Channel> = self
+            .dm_channels
+            .iter()
+            .filter(|dm| self.mention_count(&dm.id) > 0 && !self.is_channel_muted(None, &dm.id, now))
+            .collect();
+        dms.sort_by_key(|dm| std::cmp::Reverse(snowflake_value(dm.last_message_id.as_deref().unwrap_or(&dm.id))));
+        dms.truncate(UNREAD_DMS_ON_RAIL);
+        dms
+    }
+
+    pub fn someone_typing_in(&self, channel_id: &str) -> bool {
+        self.typing_users_for(channel_id).iter().any(|id| self.current_user.as_ref().is_none_or(|me| me.id != *id))
+    }
+
+    pub fn dm_list_typing(&self) -> bool {
+        self.selected_guild.is_none() && self.dm_channels.iter().any(|dm| self.someone_typing_in(&dm.id))
+    }
+
+    pub fn auto_read_allowed(&self, channel_id: &str) -> bool {
+        !self.manual_unread.contains(channel_id)
+    }
+
     pub fn apply_remote_read_state(&mut self, states: &[rustcord_client::gateway::ChannelReadState]) -> usize {
         for state in states {
             match state.mention_count {
@@ -1847,6 +1994,7 @@ impl AppState {
     }
 
     pub fn open_channel(&mut self, channel_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        self.manual_unread.clear();
         self.subscribe_member_list(channel_id, cmd_tx);
         let forum = self.find_guild_channel(channel_id).filter(|c| c.is_forum()).map(|c| c.guild_id.clone().unwrap_or_default());
         match forum {
@@ -3836,6 +3984,7 @@ mod tests {
             thread: Default::default(),
             user_limit: None,
             forum: Default::default(),
+            rate_limit_per_user: None,
         }
     }
 
@@ -3859,6 +4008,7 @@ mod tests {
             thread: Default::default(),
             user_limit: None,
             forum: Default::default(),
+            rate_limit_per_user: None,
         }
     }
 
@@ -4153,6 +4303,7 @@ mod tests {
             thread: Default::default(),
             user_limit: None,
             forum: Default::default(),
+            rate_limit_per_user: None,
         });
 
         let entries = state.switcher_entries();
@@ -4640,6 +4791,96 @@ mod thread_tests {
         assert_eq!(state.member_lists["g"].rows.len(), 2);
         assert!(state.guild_members["g"].iter().any(|m| m.nick.as_deref() == Some("Annie")));
         assert_eq!(state.presence_for("u"), rustcord_client::models::PresenceStatus::Dnd);
+    }
+
+    fn chat_message(id: &str) -> Message {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "channel_id": "c", "content": "x", "timestamp": "2026-11-08T12:00:00+00:00", "edited_timestamp": null,
+            "author": { "id": "a", "username": "a", "discriminator": "0" }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn marking_unread_moves_the_marker_before_the_message_and_holds_it() {
+        let mut state = AppState::default();
+        state.set_message_history("c".into(), vec![chat_message("100"), chat_message("200"), chat_message("300")]);
+        state.mark_channel_read("c", "300");
+        assert_eq!(state.mark_unread_from("c", "200"), "100");
+        assert!(state.channel_is_unread("c", Some("300")));
+        assert!(!state.auto_read_allowed("c"));
+        assert_eq!(state.mark_unread_from("c", "100"), "99", "the first loaded message falls back to the snowflake before it");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.open_channel("c", &tx);
+        assert!(state.auto_read_allowed("c"));
+    }
+
+    #[test]
+    fn slowmode_starts_after_sending_unless_exempt() {
+        let mut state = AppState::default();
+        let mut slow = text("c");
+        slow.rate_limit_per_user = Some(10);
+        state.guild_channels.insert("g".into(), vec![slow]);
+        state.current_user = Some(serde_json::from_value(serde_json::json!({ "id": "me", "username": "me", "discriminator": "0" })).unwrap());
+        state.guild_roles.insert("g".into(), Vec::new());
+        state.guilds.push(serde_json::from_value(serde_json::json!({ "id": "g", "name": "G", "icon": null, "owner_id": "someone" })).unwrap());
+        state.manual_unread.insert("c".into());
+        state.note_message_sent("c");
+        let now = std::time::Instant::now();
+        assert_eq!(state.slowmode_remaining("c", now), Some(10));
+        assert_eq!(state.slowmode_remaining("c", now + std::time::Duration::from_millis(9_200)), Some(1));
+        assert_eq!(state.slowmode_remaining("c", now + std::time::Duration::from_secs(11)), None);
+        assert!(state.auto_read_allowed("c"), "sending ends a manual unread");
+        state.slowmode_until.clear();
+        state.guilds[0].owner_id = Some("me".into());
+        state.note_message_sent("c");
+        assert!(state.slowmode_until.is_empty(), "the owner is exempt");
+    }
+
+    #[test]
+    fn the_composer_is_blocked_without_send_permission_or_in_a_locked_thread() {
+        let mut state = AppState::default();
+        let mut locked = thread("t", "c", true, false);
+        locked.thread.thread_metadata.as_mut().unwrap().locked = true;
+        state.guild_channels.insert("g".into(), vec![text("c"), locked]);
+        state.current_user = Some(serde_json::from_value(serde_json::json!({ "id": "me", "username": "me", "discriminator": "0" })).unwrap());
+        state.guilds.push(serde_json::from_value(serde_json::json!({ "id": "g", "name": "G", "icon": null, "owner_id": "someone" })).unwrap());
+        assert_eq!(state.composer_block("c"), None, "unknown roles never block");
+        state.guild_roles.insert("g".into(), vec![serde_json::from_value(serde_json::json!({ "id": "g", "name": "@everyone", "permissions": "0", "position": 0, "color": 0 })).unwrap()]);
+        assert!(state.composer_block("c").unwrap().contains("permission"));
+        assert_eq!(state.composer_block("t"), Some("This thread is locked."));
+        state.guilds[0].owner_id = Some("me".into());
+        assert_eq!(state.composer_block("c"), None);
+        assert_eq!(state.composer_block("t"), None);
+    }
+
+    #[test]
+    fn unread_dms_are_listed_newest_first_and_skip_muted_ones() {
+        let mut state = AppState::default();
+        let dm = |id: &str, last: &str| -> Channel {
+            serde_json::from_value(serde_json::json!({ "id": id, "type": 1, "last_message_id": last, "recipients": [ { "id": format!("u{id}"), "username": "x", "discriminator": "0" } ] })).unwrap()
+        };
+        state.dm_channels = vec![dm("1", "100"), dm("2", "300"), dm("3", "200")];
+        state.mention_counts.insert("1".into(), 1);
+        state.mention_counts.insert("2".into(), 4);
+        let ids: Vec<&str> = state.unread_dms().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["2", "1"]);
+    }
+
+    #[test]
+    fn the_qr_login_draws_a_code_names_the_scanner_and_hands_over_the_token() {
+        use rustcord_client::remote_auth::{Outcome, Step};
+        let mut qr = QrLogin::Waiting;
+        qr.apply(Step::Code("https://discord.com/ra/abcdef".into()));
+        let QrLogin::Code { modules, width } = &qr else { panic!("no code") };
+        assert_eq!(modules.len(), width * width);
+        assert!(modules.iter().any(|dark| *dark) && modules.iter().any(|dark| !dark));
+        qr.apply(Step::Scanned { name: "luna".into(), avatar_url: None });
+        assert!(matches!(&qr, QrLogin::Scanned { name, .. } if name == "luna"));
+        assert_eq!(qr.finish(Outcome::Token("tok".into())).as_deref(), Some("tok"));
+        assert!(matches!(qr, QrLogin::Finishing));
+        assert_eq!(qr.finish(Outcome::Expired), None);
+        assert!(matches!(&qr, QrLogin::Ended(reason) if reason.contains("expired")));
     }
 
     #[test]

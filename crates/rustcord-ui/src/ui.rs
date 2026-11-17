@@ -2201,7 +2201,8 @@ fn draw_gif_picker(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, c
     });
     if let (Some(content), Some(channel_id)) = (picked, state.selected_channel.clone()) {
         let reply_to = state.reply_target.take().map(|m| m.id);
-        let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to });
+        let ping_reply = !state.reply_no_ping;
+        let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to, ping_reply });
         state.focus_compose = true;
     }
 }
@@ -2290,7 +2291,8 @@ fn draw_sticker_picker(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
     if let (Some(sticker_id), Some(channel_id)) = (picked, state.selected_channel.clone()) {
         state.record_sticker_use(&sticker_id);
         let reply_to = state.reply_target.take().map(|m| m.id);
-        let _ = cmd_tx.send(UiCommand::SendSticker { channel_id, sticker_id, reply_to });
+        let ping_reply = !state.reply_no_ping;
+        let _ = cmd_tx.send(UiCommand::SendSticker { channel_id, sticker_id, reply_to, ping_reply });
         state.focus_compose = true;
     }
 }
@@ -3739,6 +3741,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
     let _server_bg = ui.push_style_color(imgui::StyleColor::WindowBg, servers_bg);
     ui.window("servers")
+        .bring_to_front_on_focus(false)
         .position([0.0, 0.0], imgui::Condition::Always)
         .size([RAIL_WIDTH, display_h], imgui::Condition::Always)
         .no_decoration()
@@ -3766,8 +3769,62 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if ui.is_item_hovered() {
                 ui.tooltip_text("Direct Messages");
             }
+            let mut rail_y = RAIL_PADDING_TOP + RAIL_ICON_SIZE[1];
+            for (channel_id, name, avatar, count, last_message_id) in state
+                .unread_dms()
+                .into_iter()
+                .map(|dm| {
+                    let avatar = match dm.recipients.as_slice() {
+                        [only] if dm.kind == rustcord_client::models::ChannelType::Dm => {
+                            Some(rustcord_client::cdn::avatar_url(only, 64).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(only)))
+                        }
+                        _ => dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 64)),
+                    };
+                    (dm.id.clone(), AppState::dm_display_name(dm), avatar, state.mention_count(&dm.id), dm.last_message_id.clone())
+                })
+                .collect::<Vec<_>>()
+            {
+                rail_y += 8.0;
+                ui.set_cursor_pos([rail_center_x, rail_y]);
+                let icon_min = ui.cursor_screen_pos();
+                let image = avatar.as_deref().and_then(|url| match textures.get_still(url) {
+                    Some((texture, _)) => Some(texture),
+                    None => {
+                        textures.request(url, cmd_tx);
+                        None
+                    }
+                });
+                let label = guild_acronym(&name);
+                let look = RailTileLook {
+                    image,
+                    label: Some(&label),
+                    icon: None,
+                    rest_fill: state.theme.background,
+                    lit_fill: state.theme.accent,
+                    ink: state.theme.text,
+                    lit_ink: [1.0, 1.0, 1.0, 1.0],
+                    pill: true,
+                };
+                let selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
+                if rail_tile(ui, textures, &state.theme, &format!("unread_dm_{channel_id}"), RAIL_ICON_SIZE, look, selected, false) {
+                    state.selected_guild = None;
+                    state.selected_channel = Some(channel_id.clone());
+                    state.server_call_minimized = true;
+                    let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+                    if let Some(last_id) = &last_message_id {
+                        if state.mark_channel_read(&channel_id, last_id) {
+                            let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
+                        }
+                    }
+                }
+                if ui.is_item_hovered() {
+                    ui.tooltip_text(&name);
+                }
+                draw_rail_mention_badge(ui, state.theme.mention_badge(), state.theme.servers_bg(), icon_min, RAIL_ICON_SIZE, count);
+                rail_y += RAIL_ICON_SIZE[1];
+            }
 
-            ui.set_cursor_pos([0.0, RAIL_PADDING_TOP + RAIL_ICON_SIZE[1] + 4.0]);
+            ui.set_cursor_pos([0.0, rail_y + 4.0]);
             draw_rail_separator(ui, &state.theme);
             let after_separator_y = ui.cursor_pos()[1];
             ui.set_cursor_pos([0.0, after_separator_y]);
@@ -3785,6 +3842,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
     let _channels_bg = ui.push_style_color(imgui::StyleColor::WindowBg, surface_bg);
     ui.window("channels")
+        .bring_to_front_on_focus(false)
         .position([RAIL_WIDTH, 0.0], imgui::Condition::Always)
         .size([sidebar_width, display_h], imgui::Condition::Always)
         .no_decoration()
@@ -4146,6 +4204,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     let chat_bg = if state.theme.use_global_gradient { [0.0; 4] } else { state.theme.background };
     let _chat_bg = ui.push_style_color(imgui::StyleColor::WindowBg, chat_bg);
     ui.window("chat")
+        .bring_to_front_on_focus(false)
         .position([RAIL_WIDTH + sidebar_width, 0.0], imgui::Condition::Always)
         .size([display_w - RAIL_WIDTH - sidebar_width - right_panel_width, display_h], imgui::Condition::Always)
         .no_decoration()
@@ -4458,6 +4517,14 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             if ui.menu_item("Copy Text") {
                                 ui.set_clipboard_text(&msg.content);
                             }
+                            if ui.menu_item("Copy Message Link") {
+                                let place = msg.guild_id.clone().or_else(|| state.find_guild_channel(&msg.channel_id).and_then(|c| c.guild_id.clone())).unwrap_or_else(|| "@me".into());
+                                crate::clipboard::write_text(&format!("https://discord.com/channels/{place}/{}/{}", msg.channel_id, msg.id));
+                            }
+                            if ui.menu_item("Mark Unread") {
+                                let ack_id = state.mark_unread_from(&msg.channel_id, &msg.id);
+                                let _ = cmd_tx.send(UiCommand::MarkUnread { channel_id: msg.channel_id.clone(), message_id: ack_id });
+                            }
                             if state.current_user.as_ref().is_some_and(|u| u.id == msg.author.id) {
                                 if ui.menu_item("Edit") {
                                     let previous = std::mem::replace(&mut state.compose_buf, msg.content.clone());
@@ -4523,7 +4590,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                     }
                 });
             state.last_seen_message_count.insert(channel_key.clone(), rows.len());
-            if state.window_focused && !channel_key.is_empty() && !state.viewing_jumped_history {
+            if state.window_focused && !channel_key.is_empty() && !state.viewing_jumped_history && state.auto_read_allowed(&channel_key) {
                 if let Some(newest) = rows.last().map(|r| &r.message) {
                     if state.mark_channel_read(&channel_key, &newest.id) {
                         let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_key.clone(), message_id: newest.id.clone() });
@@ -4571,6 +4638,29 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
                 ui.text(format!("Replying to {reply_author}"));
                 token.pop();
+                let replying_to_self = state.current_user.as_ref().is_some_and(|me| me.id == reply_msg.author.id);
+                if !replying_to_self {
+                    ui.same_line();
+                    let label = if state.reply_no_ping { "@ OFF##reply_ping" } else { "@ ON##reply_ping" };
+                    let (fill, ink) = if state.reply_no_ping {
+                        (state.theme.field(), state.theme.text_muted)
+                    } else {
+                        (state.theme.accent, [1.0, 1.0, 1.0, 1.0])
+                    };
+                    let colors = [
+                        ui.push_style_color(imgui::StyleColor::Button, fill),
+                        ui.push_style_color(imgui::StyleColor::ButtonHovered, mix(fill, [0.0, 0.0, 0.0, 1.0], 0.12)),
+                        ui.push_style_color(imgui::StyleColor::ButtonActive, mix(fill, [0.0, 0.0, 0.0, 1.0], 0.2)),
+                        ui.push_style_color(imgui::StyleColor::Text, ink),
+                    ];
+                    if ui.small_button(label) {
+                        state.reply_no_ping = !state.reply_no_ping;
+                    }
+                    drop(colors);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(if state.reply_no_ping { "Click to mention the author" } else { "Click to not mention the author" });
+                    }
+                }
                 ui.same_line();
                 if ui.small_button("x##cancel_reply") {
                     state.reply_target = None;
@@ -4671,11 +4761,23 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             }
             let before_edit = state.compose_buf.clone();
             ui.set_next_item_width((bar_width - plus_width - right_width - spacing).max(40.0));
+            let compose_channel = state.selected_channel.clone().unwrap_or_default();
+            let blocked = state.composer_block(&compose_channel);
+            let slowmode = state.slowmode_remaining(&compose_channel, std::time::Instant::now());
+            let hint = match (blocked, slowmode) {
+                (Some(reason), _) => reason.to_string(),
+                (None, Some(seconds)) => format!("Slowmode is enabled \u{2014} wait {seconds}s"),
+                (None, None) => state.compose_placeholder.clone(),
+            };
+            let blocked_scope = ui.begin_disabled(blocked.is_some());
             let enter_pressed_raw = ui
                 .input_text("##compose", &mut state.compose_buf)
-                .hint(&state.compose_placeholder)
+                .hint(&hint)
                 .enter_returns_true(true)
-                .build();
+                .build()
+                && blocked.is_none()
+                && (slowmode.is_none() || state.editing.is_some());
+            drop(blocked_scope);
             let input_focused = ui.is_item_focused();
             let mut enter_pressed = enter_pressed_raw;
             let command_form_open = commands::draw_active_command(ui, state, cmd_tx, bar_start, enter_pressed_raw && state.compose_buf.trim().is_empty());
@@ -4777,16 +4879,19 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 if let Some(channel_id) = state.selected_channel.clone() {
                     let content = std::mem::take(&mut state.compose_buf);
                     let reply_to = state.reply_target.take().map(|m| m.id);
+                    let ping_reply = !state.reply_no_ping;
                     let files = state.take_attachments(&channel_id);
                     if !files.is_empty() {
                         let label = match files.as_slice() {
                             [only] => only.filename.clone(),
                             many => format!("{} files", many.len()),
                         };
+                        state.note_message_sent(&channel_id);
                         let (upload_id, progress) = state.start_upload(label);
-                        let _ = cmd_tx.send(UiCommand::SendAttachments { channel_id, content, files, reply_to, upload_id, progress });
+                        let _ = cmd_tx.send(UiCommand::SendAttachments { channel_id, content, files, reply_to, ping_reply, upload_id, progress });
                     } else if !content.trim().is_empty() {
-                        let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to });
+                        state.note_message_sent(&channel_id);
+                        let _ = cmd_tx.send(UiCommand::SendMessage { channel_id, content, reply_to, ping_reply });
                     }
                 }
             }
@@ -4795,6 +4900,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     if search_panel_open {
         let _search_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
         ui.window("search_panel")
+            .bring_to_front_on_focus(false)
             .position([display_w - SEARCH_PANEL_WIDTH, 0.0], imgui::Condition::Always)
             .size([SEARCH_PANEL_WIDTH, display_h], imgui::Condition::Always)
             .no_decoration()
@@ -4808,6 +4914,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     if let Some(user) = &profile_panel_user {
         let _profile_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
         ui.window("profile_panel")
+            .bring_to_front_on_focus(false)
             .position([display_w - PROFILE_PANEL_WIDTH, 0.0], imgui::Condition::Always)
             .size([PROFILE_PANEL_WIDTH, display_h], imgui::Condition::Always)
             .no_decoration()
@@ -4821,6 +4928,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
     if members_panel_open {
         let _members_bg = ui.push_style_color(imgui::StyleColor::WindowBg, state.theme.panel);
         ui.window("members_panel")
+            .bring_to_front_on_focus(false)
             .position([display_w - MEMBERS_PANEL_WIDTH, 0.0], imgui::Condition::Always)
             .size([MEMBERS_PANEL_WIDTH, display_h], imgui::Condition::Always)
             .no_decoration()
@@ -7871,9 +7979,11 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
             let status_line = state.status_line_for(&user.id);
-            let (status_emoji, status_text) = match &status_line {
-                Some((emoji, text)) => (emoji.as_ref(), Some(text.as_str())),
-                None => (None, None),
+            let typing_text = state.someone_typing_in(channel_id).then(|| format!("typing{}", ".".repeat(1 + (ui.time() * 3.0) as usize % 3)));
+            let (status_emoji, status_text) = match (&typing_text, &status_line) {
+                (Some(typing), _) => (None, Some(typing.as_str())),
+                (None, Some((emoji, text))) => (emoji.as_ref(), Some(text.as_str())),
+                (None, None) => (None, None),
             };
             let r = draw_user_row(ui, cmd_tx, textures, user, name, is_selected, status, platform.as_deref(), status_text, status_emoji, state.theme.panel, None);
             (r.row_clicked, r.avatar_clicked, r.right_clicked)
@@ -8097,13 +8207,18 @@ fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
     let [display_w, display_h] = ui.io().display_size;
     let mut open = true;
     let mut message_clicked = false;
+    let mut clicked_outside = false;
     let opaque_bg = [state.theme.background[0], state.theme.background[1], state.theme.background[2], 1.0];
     let _bg_token = ui.push_style_color(imgui::StyleColor::WindowBg, opaque_bg);
     ui.window(format!("Profile##{}", user.id))
         .opened(&mut open)
         .position([display_w / 2.0 - 260.0, display_h / 2.0 - 260.0], imgui::Condition::Appearing)
         .size([520.0, 520.0], imgui::Condition::Appearing)
+        .collapsible(false)
         .build(|| {
+            let inside = ui.is_window_hovered_with_flags(imgui::WindowHoveredFlags::ROOT_AND_CHILD_WINDOWS | imgui::WindowHoveredFlags::ALLOW_WHEN_BLOCKED_BY_POPUP | imgui::WindowHoveredFlags::ALLOW_WHEN_BLOCKED_BY_ACTIVE_ITEM);
+            let clicked = ui.is_mouse_clicked(imgui::MouseButton::Left) || ui.is_mouse_clicked(imgui::MouseButton::Right);
+            clicked_outside = clicked && !inside && !ui.is_window_appearing() && !any_popup_open();
             let width = ui.content_region_avail()[0];
             let banner_size = [width, width * 0.3];
             let banner_pos = ui.cursor_pos();
@@ -8228,9 +8343,14 @@ fn draw_profile_popout(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
                 }
             }
         });
-    if !open || message_clicked {
+    if !open || message_clicked || clicked_outside {
         state.profile_popout = None;
     }
+}
+
+fn any_popup_open() -> bool {
+    let flags = (imgui::sys::ImGuiPopupFlags_AnyPopupId | imgui::sys::ImGuiPopupFlags_AnyPopupLevel) as imgui::sys::ImGuiPopupFlags;
+    unsafe { imgui::sys::igIsPopupOpen(c"".as_ptr(), flags) }
 }
 
 fn draw_activity_card(
@@ -9566,43 +9686,119 @@ fn current_theme_file(theme: &crate::theme::Theme) -> Option<String> {
     })
 }
 
+const QR_SIZE: f32 = 184.0;
+const QR_QUIET_MODULES: usize = 4;
+
+fn draw_qr_code(ui: &Ui, modules: &[bool], width: usize) {
+    let min = ui.cursor_screen_pos();
+    let max = [min[0] + QR_SIZE, min[1] + QR_SIZE];
+    let cell = QR_SIZE / (width + QR_QUIET_MODULES * 2) as f32;
+    let draw_list = ui.get_window_draw_list();
+    draw_list.add_rect(min, max, [1.0, 1.0, 1.0, 1.0]).filled(true).rounding(6.0).build();
+    for (index, dark) in modules.iter().enumerate() {
+        if !dark {
+            continue;
+        }
+        let (x, y) = ((index % width + QR_QUIET_MODULES) as f32, (index / width + QR_QUIET_MODULES) as f32);
+        let cell_min = [min[0] + x * cell, min[1] + y * cell];
+        draw_list.add_rect(cell_min, [cell_min[0] + cell + 0.5, cell_min[1] + cell + 0.5], [0.0, 0.0, 0.0, 1.0]).filled(true).build();
+    }
+    drop(draw_list);
+    ui.dummy([QR_SIZE, QR_SIZE]);
+}
+
+fn draw_qr_panel(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    use crate::app_state::QrLogin;
+    if matches!(state.qr_login, QrLogin::Idle) && state.login_status.is_none() && state.mfa_ticket.is_none() {
+        state.qr_login = QrLogin::Waiting;
+        let _ = cmd_tx.send(UiCommand::StartQrLogin);
+    }
+    let title = ui.push_font(faces().title);
+    ui.text("Log in with QR Code");
+    title.pop();
+    ui.dummy([0.0, 4.0]);
+    let mut restart = false;
+    match &state.qr_login {
+        QrLogin::Idle | QrLogin::Waiting => {
+            ui.dummy([QR_SIZE, QR_SIZE]);
+            ui.text_disabled("Getting a code\u{2026}");
+        }
+        QrLogin::Code { modules, width } => {
+            draw_qr_code(ui, modules, *width);
+            ui.dummy([0.0, 4.0]);
+            ui.text_wrapped("Scan this with the Discord mobile app to log in instantly.");
+        }
+        QrLogin::Scanned { name, .. } => {
+            ui.dummy([0.0, 40.0]);
+            let font = ui.push_font(faces().semibold);
+            ui.text_wrapped(format!("Scanned by {name}"));
+            font.pop();
+            ui.text_colored(state.theme.text_muted, "Confirm the login on your phone.");
+        }
+        QrLogin::Finishing => {
+            ui.dummy([0.0, 40.0]);
+            ui.text_disabled("Logging in\u{2026}");
+        }
+        QrLogin::Ended(reason) => {
+            ui.dummy([0.0, 40.0]);
+            ui.text_wrapped(reason);
+            restart = ui.button("Show a new code");
+        }
+    }
+    if restart {
+        state.qr_login = QrLogin::Waiting;
+        let _ = cmd_tx.send(UiCommand::StartQrLogin);
+    }
+}
+
 fn draw_login(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    const WIDTH: f32 = 720.0;
+    const HEIGHT: f32 = 340.0;
+    const FORM_WIDTH: f32 = 400.0;
     let [display_w, display_h] = ui.io().display_size;
     ui.window("login")
-        .position([display_w / 2.0 - 220.0, display_h / 2.0 - 110.0], imgui::Condition::Always)
-        .size([440.0, 260.0], imgui::Condition::Always)
+        .position([display_w / 2.0 - WIDTH / 2.0, display_h / 2.0 - HEIGHT / 2.0], imgui::Condition::Always)
+        .size([WIDTH, HEIGHT], imgui::Condition::Always)
         .no_decoration()
         .build(|| {
-            if let Some(ticket) = state.mfa_ticket.clone() {
-                ui.text("Enter 2FA code:");
-                ui.input_text("##mfa", &mut state.mfa_code_input).build();
-                if ui.button("Verify") {
-                    let _ = cmd_tx.send(UiCommand::SubmitMfa { ticket, code: state.mfa_code_input.clone() });
+            ui.child_window("login_form").size([FORM_WIDTH, 0.0]).build(|| {
+                let title = ui.push_font(faces().title);
+                ui.text("Welcome back!");
+                title.pop();
+                ui.dummy([0.0, 6.0]);
+                if let Some(ticket) = state.mfa_ticket.clone() {
+                    ui.text("Enter 2FA code:");
+                    ui.set_next_item_width(-1.0);
+                    ui.input_text("##mfa", &mut state.mfa_code_input).build();
+                    if ui.button("Verify") {
+                        let _ = cmd_tx.send(UiCommand::SubmitMfa { ticket, code: state.mfa_code_input.clone() });
+                    }
+                } else {
+                    ui.text("Email:");
+                    ui.set_next_item_width(-1.0);
+                    ui.input_text("##email", &mut state.email_input).build();
+                    ui.text("Password:");
+                    ui.set_next_item_width(-1.0);
+                    ui.input_text("##password", &mut state.password_input).password(true).build();
+                    ui.dummy([0.0, 4.0]);
+                    if ui.button_with_size("Log In", [FORM_WIDTH - 16.0, 0.0]) {
+                        let _ = cmd_tx.send(UiCommand::LoginWithPassword {
+                            email: state.email_input.clone(),
+                            password: state.password_input.clone(),
+                        });
+                    }
                 }
-            } else {
-                ui.text("Email:");
-                ui.input_text("##email", &mut state.email_input).build();
-                ui.text("Password:");
-                ui.input_text("##password", &mut state.password_input)
-                    .password(true)
-                    .build();
-                if ui.button("Login") {
-                    let _ = cmd_tx.send(UiCommand::LoginWithPassword {
-                        email: state.email_input.clone(),
-                        password: state.password_input.clone(),
-                    });
+                if let Some(err) = &state.login_error {
+                    ui.text_colored(state.theme.danger(), err);
                 }
-            }
-            if let Some(err) = &state.login_error {
-                let token = ui.push_style_color(imgui::StyleColor::Text, [1.0, 0.4, 0.4, 1.0]);
-                ui.text_wrapped(err);
-                token.pop();
-            }
-            if let Some(status) = &state.login_status {
-                let token = ui.push_style_color(imgui::StyleColor::Text, state.theme.text_muted);
-                ui.text_wrapped(status);
-                token.pop();
-            }
+                if let Some(status) = &state.login_status {
+                    ui.text_colored(state.theme.text_muted, status);
+                }
+            });
+            ui.same_line_with_spacing(0.0, 24.0);
+            ui.child_window("login_qr").size([0.0, 0.0]).build(|| {
+                draw_qr_panel(ui, state, cmd_tx);
+            });
         });
 }
 
