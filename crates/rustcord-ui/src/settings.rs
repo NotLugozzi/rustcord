@@ -14,10 +14,12 @@ pub struct Settings {
     pub clock_24h: Option<bool>,
     pub self_mute: bool,
     pub self_deaf: bool,
+    pub close_to_tray: Option<bool>,
+    pub share_game: Option<bool>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|dirs| dirs.config_dir().join("settings.toml"))
+    crate::paths::config_dir().map(|dir| dir.join("settings.toml"))
 }
 
 pub fn load() -> Settings {

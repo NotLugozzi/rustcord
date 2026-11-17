@@ -1265,7 +1265,7 @@ fn draw_expanded_folder(
         *toggle_folder = Some(folder_idx);
     }
     if ui.is_item_hovered() {
-        ui.tooltip_text(&folder.name);
+        ui.tooltip_text(state.folder_label(folder));
         if ui.is_mouse_clicked(imgui::MouseButton::Right) {
             *start_rename_folder = Some(folder_idx);
         }
@@ -1438,13 +1438,13 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
                         toggle_folder = Some(folder_idx);
                     }
                     if ui.is_item_hovered() {
-                        ui.tooltip_text(&folder.name);
+                        ui.tooltip_text(state.folder_label(&folder));
                         if ui.is_mouse_clicked(imgui::MouseButton::Right) {
                             start_rename_folder = Some(folder_idx);
                         }
                     }
                     if let Some(_tooltip) = ui.drag_drop_source_config(RAIL_DRAG_GUILD).begin_payload(rail_item_payload(&DraggedRailItem::Folder(folder_idx))) {
-                        ui.text(&folder.name);
+                        ui.text(state.folder_label(&folder));
                     }
                     if drop_action.is_none() {
                         if let Some(target) = ui.drag_drop_target() {
@@ -1473,9 +1473,6 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
                     if ui.button("Save") || ui.is_key_pressed(imgui::Key::Enter) {
                         if let Some(f) = state.rail_folders.get_mut(folder_idx) {
                             f.name = state.folder_rename_buf.trim().to_string();
-                            if f.name.is_empty() {
-                                f.name = "Folder".to_string();
-                            }
                         }
                         state.save_rail();
                         state.renaming_folder = None;
@@ -1546,7 +1543,7 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
     if let Some(folder_idx) = toggle_folder {
         if let Some(folder) = state.rail_folders.get_mut(folder_idx) {
             folder.expanded = !folder.expanded;
-            state.save_rail();
+            state.persist_rail();
         }
     }
     if let Some((folder_idx, guild_id)) = folder_guild_context {
@@ -9233,10 +9230,27 @@ fn draw_settings_account(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender
 
 fn draw_settings_notifications(ui: &Ui, state: &mut AppState) {
     ui.checkbox("Desktop notifications for DMs and mentions", &mut state.notifications_enabled);
+    ui.dummy([0.0, 8.0]);
+    if ui.checkbox("Close to tray", &mut state.close_to_tray) {
+        persist_settings(state);
+    }
+    let note = if state.tray_available {
+        "Closing the window keeps rustcord running in the system tray, with calls and notifications."
+    } else {
+        "There's no system tray here, so closing the window quits. On GNOME, the AppIndicator extension adds one."
+    };
+    ui.text_colored(state.theme.text_muted, note);
 }
 
 fn draw_settings_activity(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
     let muted = state.theme.text_muted;
+    if ui.checkbox("Share the game you're playing", &mut state.share_game) {
+        crate::presence::set_game_sharing(state.share_game);
+        persist_settings(state);
+    }
+    ui.text_colored(muted, "rustcord looks for games from Discord's list among your running programs, including Wine and Proton ones.");
+    ui.text_colored(muted, "Spotify shows on its own when your Spotify connection has \"Display on profile\" turned on.");
+    ui.dummy([0.0, 10.0]);
     ui.text_colored(muted, "Forced activity (shown as Playing)");
     let [name, details, st] = &mut state.manual_activity;
     ui.set_next_item_width(-1.0);

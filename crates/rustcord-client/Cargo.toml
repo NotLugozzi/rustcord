@@ -33,6 +33,7 @@ audiopus = "0.3.0-rc.0"
 nnnoiseless = "0.5"
 rtrb = "0.3"
 rsa = { version = "0.9", features = ["sha2"] }
+sysinfo = { version = "0.37", default-features = false, features = ["system", "user"] }
 aes = "0.8"
 ghash = "0.5"
 hmac = "0.12"

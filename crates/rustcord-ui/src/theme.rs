@@ -401,8 +401,7 @@ impl Theme {
     }
 
     pub fn themes_dir() -> Option<PathBuf> {
-        directories::ProjectDirs::from("dev", "rustcord", "rustcord")
-            .map(|dirs| dirs.config_dir().join("themes"))
+        crate::paths::config_dir().map(|dir| dir.join("themes"))
     }
 
     pub fn install_bundled() {

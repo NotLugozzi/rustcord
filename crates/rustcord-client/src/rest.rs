@@ -549,6 +549,21 @@ impl RestClient {
         self.send_empty(|| self.http.post(format!("{API_BASE}/interactions")).json(body)).await
     }
 
+    pub async fn save_user_settings_proto(&self, encoded: &str) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "settings": encoded });
+        let _: serde_json::Value = self.request(Method::PATCH, "/users/@me/settings-proto/1", Some(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn spotify_token(&self, connection_id: &str) -> Result<String, ClientError> {
+        let value: serde_json::Value = self.get(&format!("/users/@me/connections/spotify/{connection_id}/access-token")).await?;
+        value["access_token"].as_str().map(str::to_string).ok_or_else(|| ClientError::GatewayClosed("Discord gave no Spotify token".into()))
+    }
+
+    pub async fn connected_accounts(&self) -> Result<Vec<crate::spotify::ConnectedAccount>, ClientError> {
+        self.get("/users/@me/connections").await
+    }
+
     pub async fn channel(&self, channel_id: &str) -> Result<Channel, ClientError> {
         self.get(&format!("/channels/{channel_id}")).await
     }

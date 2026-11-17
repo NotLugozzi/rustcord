@@ -126,7 +126,7 @@ fn path() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|dirs| dirs.cache_dir().join(FILE_NAME))
+    crate::paths::cache_dir().map(|dir| dir.join(FILE_NAME))
 }
 
 fn decode(bytes: &[u8]) -> Option<Snapshot> {

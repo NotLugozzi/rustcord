@@ -3,6 +3,7 @@ mod app_state;
 mod build_info;
 mod backend;
 mod clipboard;
+mod demo;
 mod devtools;
 mod emoji;
 mod fonts;
@@ -14,6 +15,7 @@ mod keybinds;
 mod markdown;
 mod memory;
 mod message_rows;
+mod paths;
 mod presence;
 mod renderer;
 mod session_store;
@@ -21,6 +23,7 @@ mod startup_cache;
 mod settings;
 mod switcher;
 mod theme;
+mod tray;
 mod timefmt;
 mod ui;
 #[cfg(feature = "video")]
@@ -49,6 +52,10 @@ pub(crate) fn show_notification(notification: &notify_rust::Notification) {
 }
 
 fn main() {
+    let demo = demo::requested();
+    if demo.is_some() {
+        demo::enter_sandbox();
+    }
     memory::configure();
     {
         use tracing_subscriber::layer::SubscriberExt;
@@ -93,8 +100,11 @@ fn main() {
         clock_24h: saved_settings.clock_24h,
         self_muted: saved_settings.self_mute || saved_settings.self_deaf,
         self_deafened: saved_settings.self_deaf,
+        close_to_tray: saved_settings.close_to_tray.unwrap_or(true),
+        share_game: saved_settings.share_game.unwrap_or(true),
         ..Default::default()
     };
+    presence::set_game_sharing(state.share_game);
     theme::Theme::install_bundled();
     if let Some(dir) = theme::Theme::themes_dir() {
         let selected_file = saved_settings.theme_file.unwrap_or_else(|| "discord-dark.toml".into());
@@ -104,6 +114,15 @@ fn main() {
         } else {
             tracing::warn!("saved theme {} could not be loaded; using the default theme", path.display());
         }
+    }
+
+    if let Some(source) = demo {
+        if let Err(error) = demo::load(&source).and_then(|data| demo::apply(data, &mut state)) {
+            eprintln!("demo mode: {error}");
+            std::process::exit(1);
+        }
+        renderer::run(state, cmd_tx, event_rx, rt.handle().clone());
+        return;
     }
 
     match session_store::load_token() {
@@ -124,7 +143,7 @@ fn main() {
         Err(_) => tracing::warn!("failed to read saved credentials"),
     }
 
-    renderer::run(state, cmd_tx, event_rx);
+    renderer::run(state, cmd_tx, event_rx, rt.handle().clone());
 }
 
 fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
@@ -161,6 +180,12 @@ pub fn drain_backend_events(
     }
     if !state.pending_interactions.is_empty() {
         state.expire_interactions(std::time::Instant::now());
+    }
+    if state.rail_sync_pending && state.gateway_connected {
+        state.rail_sync_pending = false;
+        let encoded = rustcord_client::user_settings::encode_server_rail(&state.rail_entries());
+        state.persist_rail();
+        let _ = cmd_tx.send(UiCommand::SaveServerRail { encoded });
     }
     let mut media = DrainedMedia::default();
     while let Ok(event) = event_rx.try_recv() {
@@ -628,7 +653,14 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::InteractionModal(modal)) => {
                 state.open_modal(modal);
             }
-            BackendEvent::Gateway(GatewayEvent::SessionStarted { .. } | GatewayEvent::InteractionCreated { .. }) => {}
+            BackendEvent::Gateway(GatewayEvent::UserSettingsProto(encoded)) => {
+                if let Some(entries) = rustcord_client::user_settings::server_rail(&encoded) {
+                    state.apply_discord_rail(entries);
+                }
+            }
+            BackendEvent::Gateway(
+                GatewayEvent::SessionStarted { .. } | GatewayEvent::InteractionCreated { .. } | GatewayEvent::ConnectedAccounts(_) | GatewayEvent::ConnectionsChanged,
+            ) => {}
             BackendEvent::ThreadMembershipChanged { thread_id, joined } => {
                 state.set_thread_membership(&thread_id, joined.then(Default::default));
             }

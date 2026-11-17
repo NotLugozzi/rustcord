@@ -13,6 +13,8 @@ pub mod member_list;
 pub mod models;
 pub mod permissions;
 pub mod remote_auth;
+pub mod spotify;
+pub mod user_settings;
 pub mod rest;
 #[cfg(feature = "screenshare")]
 pub mod screen_capture;
@@ -22,6 +24,7 @@ pub mod screen_audio;
 pub mod screen_decode;
 #[cfg(feature = "screenshare")]
 pub mod screen_encode;
+pub mod games;
 pub mod gateway;
 pub mod voice_audio;
 pub mod voice_gateway;

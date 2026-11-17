@@ -80,7 +80,7 @@ fn config_dir() -> Option<std::path::PathBuf> {
     if cfg!(test) {
         return None;
     }
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.config_dir().to_path_buf())
+    crate::paths::config_dir()
 }
 
 fn groups_path() -> Option<std::path::PathBuf> {
@@ -93,6 +93,10 @@ pub struct GuildFolder {
     pub color: [f32; 4],
     pub guild_ids: Vec<String>,
     pub expanded: bool,
+    #[serde(default)]
+    pub discord_id: Option<u64>,
+    #[serde(default)]
+    pub discord_color: Option<u32>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -706,6 +710,10 @@ pub struct AppState {
     pub manual_unread: std::collections::HashSet<String>,
     pub slowmode_until: HashMap<String, std::time::Instant>,
     pub qr_login: QrLogin,
+    pub close_to_tray: bool,
+    pub share_game: bool,
+    pub tray_available: bool,
+    pub rail_sync_pending: bool,
     pub member_lists: HashMap<String, rustcord_client::member_list::MemberList>,
 }
 
@@ -1348,7 +1356,12 @@ impl AppState {
         }
     }
 
-    pub fn save_rail(&self) {
+    pub fn save_rail(&mut self) {
+        self.persist_rail();
+        self.rail_sync_pending = true;
+    }
+
+    pub fn persist_rail(&self) {
         let Some(path) = rail_path() else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -1389,12 +1402,70 @@ impl AppState {
             .chain(self.rail_folders.iter().flat_map(|f| f.guild_ids.iter().cloned()))
             .collect();
 
-        for guild in &self.guilds {
-            if !placed_guild_ids.contains(&guild.id) {
-                self.rail_order.push(RailItem::Guild(guild.id.clone()));
+        let unplaced: Vec<RailItem> = self.guilds.iter().filter(|g| !placed_guild_ids.contains(&g.id)).map(|g| RailItem::Guild(g.id.clone())).collect();
+        self.rail_order.splice(0..0, unplaced);
+        self.persist_rail();
+    }
+
+    pub fn folder_label(&self, folder: &GuildFolder) -> String {
+        if !folder.name.trim().is_empty() {
+            return folder.name.clone();
+        }
+        let names: Vec<&str> = folder.guild_ids.iter().filter_map(|id| self.guilds.iter().find(|g| &g.id == id)).map(|g| g.name.as_str()).take(3).collect();
+        if names.is_empty() { "Folder".into() } else { names.join(", ") }
+    }
+
+    pub fn apply_discord_rail(&mut self, entries: Vec<rustcord_client::user_settings::RailEntry>) {
+        use rustcord_client::user_settings::RailEntry;
+        let expanded: HashMap<u64, bool> = self.rail_folders.iter().filter_map(|f| Some((f.discord_id?, f.expanded))).collect();
+        self.rail_folders.clear();
+        self.rail_order.clear();
+        for entry in entries {
+            match entry {
+                RailEntry::Guild(id) => self.rail_order.push(RailItem::Guild(id)),
+                RailEntry::Folder(folder) => {
+                    let color = folder.color.map(|rgb| [((rgb >> 16) & 0xff) as f32 / 255.0, ((rgb >> 8) & 0xff) as f32 / 255.0, (rgb & 0xff) as f32 / 255.0, 1.0]);
+                    self.rail_folders.push(GuildFolder {
+                        name: folder.name.unwrap_or_default(),
+                        color: color.unwrap_or(self.theme.accent),
+                        guild_ids: folder.guild_ids,
+                        expanded: expanded.get(&folder.id).copied().unwrap_or(false),
+                        discord_id: Some(folder.id),
+                        discord_color: folder.color,
+                    });
+                    self.rail_order.push(RailItem::Folder(self.rail_folders.len() - 1));
+                }
             }
         }
-        self.save_rail();
+        self.rail_sync_pending = false;
+        if self.guilds.is_empty() {
+            self.persist_rail();
+        } else {
+            self.reconcile_rail_order();
+        }
+    }
+
+    pub fn rail_entries(&mut self) -> Vec<rustcord_client::user_settings::RailEntry> {
+        use rustcord_client::user_settings::{new_folder_id, Folder, RailEntry};
+        for folder in &mut self.rail_folders {
+            if folder.discord_id.is_none() {
+                folder.discord_id = Some(new_folder_id());
+            }
+        }
+        self.rail_order
+            .iter()
+            .filter_map(|item| match item {
+                RailItem::Guild(id) => Some(RailEntry::Guild(id.clone())),
+                RailItem::Folder(index) => self.rail_folders.get(*index).map(|folder| {
+                    RailEntry::Folder(Folder {
+                        id: folder.discord_id.unwrap_or_default(),
+                        name: Some(folder.name.trim().to_string()).filter(|name| !name.is_empty()),
+                        color: folder.discord_color,
+                        guild_ids: folder.guild_ids.clone(),
+                    })
+                }),
+            })
+            .collect()
     }
 
     pub fn guild_has_active_voice(&self, guild_id: &str) -> bool {
@@ -1477,10 +1548,12 @@ impl AppState {
         let Some(target_pos) = self.rail_order.iter().position(|item| matches!(item, RailItem::Guild(id) if id == target_guild_id)) else { return };
 
         let folder = GuildFolder {
-            name: "Folder".to_string(),
+            name: String::new(),
             color: self.theme.accent,
             guild_ids: vec![target_guild_id.to_string(), dragged_guild_id.to_string()],
             expanded: false,
+            discord_id: Some(rustcord_client::user_settings::new_folder_id()),
+            discord_color: None,
         };
         self.rail_folders.push(folder);
         let folder_idx = self.rail_folders.len() - 1;
@@ -1686,6 +1759,10 @@ impl AppState {
         self.selected_guild.is_none() && self.dm_channels.iter().any(|dm| self.someone_typing_in(&dm.id))
     }
 
+    pub fn has_unread_attention(&self) -> bool {
+        self.mention_counts.values().any(|&count| count > 0)
+    }
+
     pub fn auto_read_allowed(&self, channel_id: &str) -> bool {
         !self.manual_unread.contains(channel_id)
     }
@@ -1761,7 +1838,6 @@ impl AppState {
             self.selected_channel = None;
         }
         self.reconcile_rail_order();
-        self.save_rail();
     }
 
     fn forget_channel(&mut self, channel_id: &str) {
@@ -2943,6 +3019,8 @@ impl AppState {
             self_mute: self.self_muted,
             self_deaf: self.self_deafened,
             camera_device: self.camera_device.clone(),
+            close_to_tray: Some(self.close_to_tray),
+            share_game: Some(self.share_game),
             ..Default::default()
         }
     }
@@ -4881,6 +4959,60 @@ mod thread_tests {
         assert!(matches!(qr, QrLogin::Finishing));
         assert_eq!(qr.finish(Outcome::Expired), None);
         assert!(matches!(&qr, QrLogin::Ended(reason) if reason.contains("expired")));
+    }
+
+    fn rail_guild(id: &str) -> Guild {
+        serde_json::from_value(serde_json::json!({ "id": id, "name": format!("Server {id}"), "icon": null })).unwrap()
+    }
+
+    #[test]
+    fn discords_rail_replaces_the_local_one_and_keeps_folders_open() {
+        use rustcord_client::user_settings::{Folder, RailEntry};
+        let mut state = AppState::default();
+        state.guilds = vec![rail_guild("1"), rail_guild("2"), rail_guild("3"), rail_guild("9")];
+        let layout = vec![
+            RailEntry::Guild("3".into()),
+            RailEntry::Folder(Folder { id: 5, name: None, color: Some(0xff0000), guild_ids: vec!["1".into(), "2".into()] }),
+        ];
+        state.apply_discord_rail(layout.clone());
+        state.rail_folders[0].expanded = true;
+        state.apply_discord_rail(layout);
+        assert!(state.rail_folders[0].expanded, "expanded stays this client's own");
+        assert_eq!(state.rail_folders[0].color, [1.0, 0.0, 0.0, 1.0]);
+        assert!(!state.rail_sync_pending, "applying Discord's rail never echoes it back");
+        let order: Vec<String> = state
+            .rail_order
+            .iter()
+            .map(|item| match item {
+                RailItem::Guild(id) => id.clone(),
+                RailItem::Folder(index) => format!("folder{index}"),
+            })
+            .collect();
+        assert_eq!(order, ["9", "3", "folder0"], "a server Discord's list doesn't place goes on top");
+        assert_eq!(state.folder_label(&state.rail_folders[0]), "Server 1, Server 2");
+    }
+
+    #[test]
+    fn a_local_change_is_marked_for_discord_and_encodes_back() {
+        use rustcord_client::user_settings::RailEntry;
+        let mut state = AppState::default();
+        state.guilds = vec![rail_guild("1"), rail_guild("2"), rail_guild("3")];
+        state.apply_discord_rail(vec![RailEntry::Guild("1".into()), RailEntry::Guild("2".into()), RailEntry::Guild("3".into())]);
+        state.create_folder_from_guilds("3", "1");
+        assert!(state.rail_sync_pending);
+        let entries = state.rail_entries();
+        assert!(matches!(&entries[0], RailEntry::Folder(f) if f.guild_ids == ["1", "3"] && f.name.is_none() && f.id > 0));
+        assert!(matches!(&entries[1], RailEntry::Guild(id) if id == "2"));
+        let round_trip = rustcord_client::user_settings::server_rail(&rustcord_client::user_settings::encode_server_rail(&entries)).unwrap();
+        assert_eq!(round_trip, entries);
+    }
+
+    #[test]
+    fn settings_arriving_before_the_server_list_are_kept_whole() {
+        use rustcord_client::user_settings::RailEntry;
+        let mut state = AppState::default();
+        state.apply_discord_rail(vec![RailEntry::Guild("1".into()), RailEntry::Guild("2".into())]);
+        assert_eq!(state.rail_order.len(), 2);
     }
 
     #[test]

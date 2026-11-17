@@ -54,6 +54,9 @@ pub enum GatewayEvent {
     GuildSettings(Vec<GuildSettings>),
     ThreadListSync { guild_id: String, channel_ids: Option<Vec<String>>, threads: Vec<Channel> },
     SessionStarted { session_id: String },
+    ConnectedAccounts(Vec<crate::spotify::ConnectedAccount>),
+    ConnectionsChanged,
+    UserSettingsProto(String),
     MemberListUpdate(crate::member_list::MemberListUpdate),
     CommandIndexStale { guild_id: Option<String> },
     InteractionCreated { id: String, nonce: String },
@@ -385,6 +388,16 @@ impl Gateway {
                 if let Some(session_id) = data["session_id"].as_str() {
                     let _ = tx.send(GatewayEvent::SessionStarted { session_id: session_id.to_string() });
                 }
+                let accounts: Vec<crate::spotify::ConnectedAccount> = data["connected_accounts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|account| serde_json::from_value(account.clone()).ok())
+                    .collect();
+                let _ = tx.send(GatewayEvent::ConnectedAccounts(accounts));
+                if let Some(proto) = data["user_settings_proto"].as_str() {
+                    let _ = tx.send(GatewayEvent::UserSettingsProto(proto.to_string()));
+                }
                 let user: User = serde_json::from_value(data["user"].clone())?;
                 let guilds: Vec<Guild> = serde_json::from_value(data["guilds"].clone())?;
                 let voice_states = parse_initial_voice_states(data.get("guilds"));
@@ -533,6 +546,11 @@ impl Gateway {
                 let _ = tx.send(GatewayEvent::ThreadListSync { guild_id: guild_id.clone(), channel_ids: None, threads });
                 GatewayEvent::GuildCreate { guild_id, roles, member_roles }
             }
+            Some("USER_CONNECTIONS_UPDATE") => GatewayEvent::ConnectionsChanged,
+            Some("USER_SETTINGS_PROTO_UPDATE") => match (data["settings"]["type"].as_u64(), data["settings"]["proto"].as_str()) {
+                (Some(1), Some(proto)) => GatewayEvent::UserSettingsProto(proto.to_string()),
+                _ => return Ok(()),
+            },
             Some("GUILD_MEMBER_LIST_UPDATE") => match crate::member_list::MemberListUpdate::parse(&data) {
                 Some(update) => GatewayEvent::MemberListUpdate(update),
                 None => return Ok(()),

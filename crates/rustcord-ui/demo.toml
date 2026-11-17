@@ -1,0 +1,297 @@
+[me]
+username = "luna"
+display_name = "Luna"
+status = "online"
+custom_status = "shipping rustcord"
+
+[[users]]
+key = "ferris"
+username = "ferris"
+display_name = "Ferris"
+status = "online"
+playing = "Factorio"
+
+[[users]]
+key = "mira"
+username = "mira.dev"
+display_name = "Mira"
+status = "idle"
+custom_status = "brb, coffee"
+
+[[users]]
+key = "kai"
+username = "kai"
+display_name = "Kai"
+status = "dnd"
+playing = "Visual Studio Code"
+
+[[users]]
+key = "juno"
+username = "juno_"
+display_name = "Juno"
+status = "online"
+listening = "Lofi Girl - beats to relax/study to"
+
+[[users]]
+key = "orion"
+username = "orion"
+display_name = "Orion"
+status = "offline"
+
+[[users]]
+key = "sage"
+username = "sagebrush"
+display_name = "Sage"
+status = "online"
+
+[[users]]
+key = "bot"
+username = "Clippy"
+status = "online"
+bot = true
+playing = "/help"
+
+[[servers]]
+name = "Rustcord"
+members = ["ferris", "mira", "kai", "juno", "orion", "sage", "bot"]
+
+[[servers.roles]]
+name = "Maintainers"
+color = "#f0883e"
+members = ["me", "ferris"]
+
+[[servers.roles]]
+name = "Contributors"
+color = "#58a6ff"
+members = ["mira", "kai"]
+
+[[servers.roles]]
+name = "Bots"
+color = "#a371f7"
+members = ["bot"]
+
+[[servers.channels]]
+name = "announcements"
+kind = "announcement"
+category = "Information"
+topic = "Release notes and project news"
+
+[[servers.channels.messages]]
+from = "me"
+minutes_ago = 2880
+text = "**v0.9 is out!** Voice, screen share and slash commands are all in. Grab it from the releases page."
+reactions = [{ emoji = "🎉", count = 14, me = true }, { emoji = "🦀", count = 9 }]
+
+[[servers.channels]]
+name = "rules"
+category = "Information"
+
+[[servers.channels]]
+name = "general"
+category = "Text Channels"
+topic = "Talk about anything, keep it friendly"
+
+[[servers.channels.messages]]
+from = "ferris"
+minutes_ago = 42
+text = "morning everyone"
+
+[[servers.channels.messages]]
+from = "mira"
+minutes_ago = 40
+text = "Has anyone tried the new theme editor yet? The gradient support is *so* nice"
+reactions = [{ emoji = "👀", count = 2 }]
+
+[[servers.channels.messages]]
+from = "me"
+minutes_ago = 37
+text = "yep, I've been tweaking mine all week. Screenshot incoming"
+
+[[servers.channels.messages]]
+from = "kai"
+minutes_ago = 31
+text = "Found the startup regression btw, it was the font cache:"
+
+[[servers.channels.messages]]
+from = "kai"
+minutes_ago = 31
+text = """
+```rust
+let fonts = FontCache::load(&dir)?;
+fonts.warm(&["Inter", "JetBrains Mono"]);
+```"""
+
+[[servers.channels.messages]]
+from = "ferris"
+minutes_ago = 28
+reply_to = 4
+text = "nice catch <@kai>, that shaves off almost a second here"
+reactions = [{ emoji = "🔥", count = 3, me = true }]
+
+[[servers.channels.messages]]
+from = "juno"
+minutes_ago = 12
+text = "voice chat in a bit? want to show off the call layout"
+
+[[servers.channels.messages]]
+from = "sage"
+minutes_ago = 3
+text = "I'm in, joining Lounge now"
+reactions = [{ emoji = "👍", count = 4 }]
+
+[[servers.channels]]
+name = "showcase"
+category = "Text Channels"
+unread = true
+mentions = 1
+
+[[servers.channels.messages]]
+from = "mira"
+minutes_ago = 8
+text = "<@me> made a compact layout preset, thoughts?"
+
+[[servers.channels]]
+name = "help"
+category = "Text Channels"
+unread = true
+
+[[servers.channels.messages]]
+from = "orion"
+minutes_ago = 90
+text = "How do I enable screen share on Wayland?"
+
+[[servers.channels.messages]]
+from = "bot"
+minutes_ago = 89
+text = "Build with `--features screenshare` and make sure xdg-desktop-portal is running."
+
+[[servers.channels]]
+name = "Lounge"
+kind = "voice"
+category = "Voice Channels"
+voice = ["ferris", "juno", "sage", "kai"]
+muted = ["kai"]
+streaming = ["juno"]
+
+[[servers.channels]]
+name = "Pairing"
+kind = "voice"
+category = "Voice Channels"
+user_limit = 4
+voice = ["mira"]
+
+[[servers.channels]]
+name = "AFK"
+kind = "voice"
+category = "Voice Channels"
+
+[[servers]]
+name = "Pixel Garden"
+members = ["juno", "sage", "orion"]
+
+[[servers.channels]]
+name = "gallery"
+topic = "Share your art"
+unread = true
+
+[[servers.channels.messages]]
+from = "juno"
+minutes_ago = 300
+text = "finished the tileset!"
+reactions = [{ emoji = "😍", count = 6 }]
+
+[[servers.channels]]
+name = "Studio"
+kind = "voice"
+
+[[servers]]
+name = "Night Owls"
+members = ["ferris", "kai", "orion"]
+
+[[servers.channels]]
+name = "general"
+
+[[servers.channels.messages]]
+from = "orion"
+minutes_ago = 600
+text = "gn all"
+
+[[servers]]
+name = "Speedrun Club"
+members = ["ferris", "mira"]
+
+[[servers.channels]]
+name = "routes"
+unread = true
+mentions = 3
+
+[[servers.channels.messages]]
+from = "ferris"
+minutes_ago = 20
+text = "<@me> new any% route just dropped"
+
+[[dms]]
+with = ["ferris"]
+
+[[dms.messages]]
+from = "ferris"
+minutes_ago = 65
+text = "did you push the voice fix?"
+
+[[dms.messages]]
+from = "me"
+minutes_ago = 60
+text = "not yet, still testing it"
+
+[[dms.messages]]
+from = "ferris"
+minutes_ago = 59
+text = "no rush 🦀"
+
+[[dms]]
+with = ["mira"]
+unread = true
+mentions = 2
+
+[[dms.messages]]
+from = "mira"
+minutes_ago = 6
+text = "can you review my PR when you get a sec?"
+
+[[dms.messages]]
+from = "mira"
+minutes_ago = 5
+text = "it's the theme one"
+
+[[dms]]
+with = ["kai", "juno", "sage"]
+name = "weekend plans"
+
+[[dms.messages]]
+from = "juno"
+minutes_ago = 180
+text = "game night saturday?"
+
+[[dms.messages]]
+from = "sage"
+minutes_ago = 170
+text = "yes!!"
+
+[[dms]]
+with = ["orion"]
+
+[[dms.messages]]
+from = "orion"
+minutes_ago = 4320
+text = "thanks for the help earlier"
+
+[call]
+server = "Rustcord"
+channel = "Lounge"
+speaking = ["ferris", "sage"]
+minutes_in = 23
+open = false
+
+[open]
+server = "Rustcord"
+channel = "general"

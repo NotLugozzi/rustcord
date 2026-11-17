@@ -22,7 +22,7 @@ fn cache_file(url: &str) -> Option<std::path::PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     url.hash(&mut h);
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.cache_dir().join("images").join(format!("{:016x}", h.finish())))
+    crate::paths::cache_dir().map(|d| d.join("images").join(format!("{:016x}", h.finish())))
 }
 
 const MAX_DISK_CACHED_BYTES: usize = 1024 * 1024;
@@ -437,6 +437,7 @@ pub enum UiCommand {
     LoadCommandIndex { scope: rustcord_client::rest::CommandScope },
     SubscribeMemberList { guild_id: String, channel_id: String },
     MarkUnread { channel_id: String, message_id: String },
+    SaveServerRail { encoded: String },
     LoadForumPostData { forum_id: String, thread_ids: Vec<String> },
     CreateForumPost { forum_id: String, name: String, tags: Vec<String>, content: String, auto_archive_minutes: u32 },
     OpenChannelById { channel_id: String },
@@ -600,7 +601,9 @@ pub fn spawn(
     mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
 ) {
-    rt.spawn(crate::ipc::serve(event_tx.clone()));
+    if !crate::paths::is_sandboxed() {
+        rt.spawn(crate::ipc::serve(event_tx.clone()));
+    }
     rt.spawn(async move {
         let mut rest: Option<RestClient> = None;
         let mut login_session: Option<LoginSession> = None;
@@ -814,6 +817,13 @@ pub fn spawn(
                             Err(e) => {
                                 let _ = event_tx.send(BackendEvent::Error(format!("failed to create post: {e}")));
                             }
+                        }
+                    }
+                }
+                UiCommand::SaveServerRail { encoded } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.save_user_settings_proto(&encoded).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("couldn't save the server list to Discord: {e}")));
                         }
                     }
                 }
@@ -2294,6 +2304,93 @@ fn attempt_login<'a>(
     })
 }
 
+static SPOTIFY_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static GAME_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+const GAME_SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
+const GAME_LIST_RETRY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn follow_spotify(accounts: Vec<rustcord_client::spotify::ConnectedAccount>, client: RestClient, event_tx: mpsc::UnboundedSender<BackendEvent>) {
+    if let Some(task) = SPOTIFY_TASK.lock().unwrap().take() {
+        task.abort();
+    }
+    if presence::set_spotify(None) {
+        presence::publish(&event_tx);
+    }
+    let Some(account) = accounts.into_iter().find(|a| a.shares_spotify()) else { return };
+    let discord_user_id = presence::me()["id"].as_str().unwrap_or_default().to_string();
+    let publish_tx = event_tx.clone();
+    let follower = rustcord_client::spotify::Follower {
+        account,
+        discord_user_id,
+        discord: client,
+        publish: move |activity| {
+            if presence::set_spotify(activity) {
+                presence::publish(&publish_tx);
+            }
+        },
+    };
+    *SPOTIFY_TASK.lock().unwrap() = Some(tokio::spawn(follower.run()));
+}
+
+fn games_cache_dir() -> Option<std::path::PathBuf> {
+    crate::paths::cache_dir()
+}
+
+async fn load_game_list(dir: &std::path::Path) -> Option<rustcord_client::games::GameList> {
+    let cached = rustcord_client::games::cached_list(dir);
+    let stale = cached.as_ref().is_none_or(|(_, modified)| modified.elapsed().map_or(true, |age| age >= rustcord_client::games::LIST_MAX_AGE));
+    let fresh = if stale {
+        match rustcord_client::games::refresh_list(dir).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::info!("couldn't refresh Discord's game list: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let bytes = fresh.or_else(|| rustcord_client::games::cached_list(dir).map(|(bytes, _)| bytes))?;
+    rustcord_client::games::GameList::parse(&bytes)
+}
+
+fn restart_game_detection(event_tx: mpsc::UnboundedSender<BackendEvent>) {
+    if let Some(task) = GAME_TASK.lock().unwrap().take() {
+        task.abort();
+    }
+    let Some(dir) = games_cache_dir() else { return };
+    *GAME_TASK.lock().unwrap() = Some(tokio::spawn(async move {
+        let list = loop {
+            match load_game_list(&dir).await {
+                Some(list) => break list,
+                None => tokio::time::sleep(GAME_LIST_RETRY).await,
+            }
+        };
+        tracing::info!(games = list.len(), "game detection is watching for this system's games");
+        let mut scanner = Some(rustcord_client::games::Scanner::new(list));
+        loop {
+            let running = if presence::game_sharing() {
+                let mut taken = scanner.take().expect("scanner");
+                let (back, running) = tokio::task::spawn_blocking(move || {
+                    let running = taken.scan();
+                    (taken, running)
+                })
+                .await
+                .unwrap_or_else(|_| panic!("game scan panicked"));
+                scanner = Some(back);
+                running
+            } else {
+                None
+            };
+            let activity = running.map(|r| rustcord_client::games::activity(&r.game, r.started_ms));
+            if presence::set_game(activity) {
+                presence::publish(&event_tx);
+            }
+            tokio::time::sleep(GAME_SCAN_EVERY).await;
+        }
+    }));
+}
+
 async fn start_session(
     token: String,
     rest: &mut Option<RestClient>,
@@ -2333,6 +2430,9 @@ async fn start_session(
     let gateway = Gateway::new(token.clone());
     let (out_tx, out_rx) = mpsc::unbounded_channel();
     *GATEWAY_TX.lock().unwrap() = Some(out_tx);
+    restart_game_detection(event_tx.clone());
+    let spotify_client = client.clone();
+    let spotify_events = event_tx.clone();
     let forward_tx = event_tx.clone();
     tokio::spawn(async move {
         let mut my_user_id: Option<String> = None;
@@ -2344,6 +2444,19 @@ async fn start_session(
             match &ev {
                 GatewayEvent::Ready { user, .. } => {
                     my_user_id = Some(user.id.clone());
+                }
+                GatewayEvent::ConnectedAccounts(accounts) => {
+                    follow_spotify(accounts.clone(), spotify_client.clone(), spotify_events.clone());
+                }
+                GatewayEvent::ConnectionsChanged => {
+                    let client = spotify_client.clone();
+                    let events = spotify_events.clone();
+                    tokio::spawn(async move {
+                        match client.connected_accounts().await {
+                            Ok(accounts) => follow_spotify(accounts, client, events),
+                            Err(e) => tracing::debug!("couldn't reload connected accounts: {e}"),
+                        }
+                    });
                 }
                 GatewayEvent::SessionStarted { session_id } => {
                     *GATEWAY_SESSION.lock().unwrap() = Some(session_id.clone());

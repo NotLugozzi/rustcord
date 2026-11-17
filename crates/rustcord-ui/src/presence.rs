@@ -28,10 +28,62 @@ struct State {
     manual: Option<Value>,
     apps: BTreeMap<u64, App>,
     me: Value,
+    game: Option<Value>,
+    spotify: Option<Value>,
 }
 
-static STATE: Mutex<State> =
-    Mutex::new(State { status: String::new(), custom: None, manual: None, apps: BTreeMap::new(), me: Value::Null });
+static STATE: Mutex<State> = Mutex::new(State {
+    status: String::new(),
+    custom: None,
+    manual: None,
+    apps: BTreeMap::new(),
+    me: Value::Null,
+    game: None,
+    spotify: None,
+});
+
+static GAME_SHARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_game_sharing(enabled: bool) {
+    GAME_SHARING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn game_sharing() -> bool {
+    GAME_SHARING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_game(activity: Option<Value>) -> bool {
+    with(|s| {
+        let changed = s.game != activity;
+        s.game = activity;
+        changed
+    })
+}
+
+pub fn set_spotify(activity: Option<Value>) -> bool {
+    with(|s| {
+        let changed = s.spotify != activity;
+        s.spotify = activity;
+        changed
+    })
+}
+
+fn gather(s: &State) -> Vec<Value> {
+    let mut activities: Vec<Value> = Vec::new();
+    if let Some(text) = &s.custom {
+        activities.push(json!({ "type": 4, "name": "Custom Status", "state": text }));
+    }
+    activities.extend(s.manual.clone());
+    let apps: Vec<Value> = s.apps.values().filter(|a| a.enabled).map(|a| a.activity.clone()).collect();
+    if apps.is_empty() {
+        activities.extend(s.game.clone());
+    }
+    activities.extend(apps);
+    if s.status != "invisible" {
+        activities.extend(s.spotify.clone());
+    }
+    activities
+}
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     f(&mut STATE.lock().unwrap())
@@ -77,12 +129,7 @@ pub fn set_enabled(conn_id: u64, enabled: bool) {
 
 pub fn publish(event_tx: &UnboundedSender<BackendEvent>) {
     let (frame, infos) = with(|s| {
-        let mut activities: Vec<Value> = Vec::new();
-        if let Some(text) = &s.custom {
-            activities.push(json!({ "type": 4, "name": "Custom Status", "state": text }));
-        }
-        activities.extend(s.manual.clone());
-        activities.extend(s.apps.values().filter(|a| a.enabled).map(|a| a.activity.clone()));
+        let activities = gather(s);
         let status = if s.status.is_empty() { "online" } else { &s.status };
         let infos = s
             .apps
@@ -103,3 +150,26 @@ pub fn publish(event_tx: &UnboundedSender<BackendEvent>) {
     }
     let _ = event_tx.send(BackendEvent::RpcApps(infos));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> State {
+        State { status: "online".into(), custom: None, manual: None, apps: BTreeMap::new(), me: Value::Null, game: None, spotify: None }
+    }
+
+    #[test]
+    fn a_detected_game_steps_aside_for_rich_presence_and_spotify_hides_when_invisible() {
+        let mut s = state();
+        s.game = Some(json!({ "type": 0, "name": "Celeste" }));
+        s.spotify = Some(json!({ "type": 2, "name": "Spotify" }));
+        let kinds = |s: &State| gather(s).iter().map(|a| a["name"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(kinds(&s), ["Celeste", "Spotify"]);
+        s.apps.insert(1, App { icon_url: None, image_url: None, name: "osu!".into(), activity: json!({ "type": 0, "name": "osu!" }), enabled: true });
+        assert_eq!(kinds(&s), ["osu!", "Spotify"]);
+        s.status = "invisible".into();
+        assert_eq!(kinds(&s), ["osu!"]);
+    }
+}
+

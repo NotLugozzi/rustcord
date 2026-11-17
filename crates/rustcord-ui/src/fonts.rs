@@ -57,7 +57,7 @@ fn cache_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
-    directories::ProjectDirs::from("dev", "rustcord", "rustcord").map(|d| d.cache_dir().join("fonts"))
+    crate::paths::cache_dir().map(|d| d.join("fonts"))
 }
 
 fn read_font(path: PathBuf) -> Option<Vec<u8>> {

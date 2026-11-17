@@ -182,9 +182,11 @@ impl AppWindow {
             ..Default::default()
         });
 
+        let icon_size = crate::tray::ICON_SIZE;
         let attributes = Window::default_attributes()
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
-            .with_title("rustcord");
+            .with_title("rustcord")
+            .with_window_icon(winit::window::Icon::from_rgba(crate::tray::icon_rgba(icon_size, false), icon_size, icon_size).ok());
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
         let size = window.inner_size();
@@ -243,6 +245,11 @@ impl AppWindow {
     }
 
     fn redraw(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
+        self.pump(state, cmd_tx, event_rx);
+        self.render(state, cmd_tx);
+    }
+
+    fn pump(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, event_rx: &mut UnboundedReceiver<BackendEvent>) {
         let media = drain_backend_events(state, event_rx, cmd_tx);
         crate::startup_cache::autosave(state);
         self.textures.sync_icons(self.window.scale_factor() as f32, &self.device, &self.queue, &mut self.imgui.renderer);
@@ -271,7 +278,9 @@ impl AppWindow {
         self.textures.tick(&mut self.imgui.renderer, cmd_tx);
         #[cfg(not(feature = "video"))]
         self.textures.tick();
+    }
 
+    fn render(&mut self, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
         self.last_redraw = Instant::now();
         self.sync_theme_fonts(state, cmd_tx);
         let textures = &mut self.textures;
@@ -517,10 +526,19 @@ struct App {
     last_input: Instant,
     needs_redraw: bool,
     typing_active: bool,
+    tray: Option<crate::tray::Tray>,
+    tray_tried: bool,
+    hidden: bool,
+    runtime: tokio::runtime::Handle,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.tray.is_none() && !self.tray_tried && !crate::paths::is_sandboxed() {
+            self.tray_tried = true;
+            self.tray = crate::tray::Tray::start(&self.runtime);
+            self.state.tray_available = self.tray.is_some();
+        }
         if self.window.is_none() {
             let mut window = AppWindow::new(event_loop);
             if !self.theme_applied {
@@ -565,7 +583,12 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CloseRequested => {
                 crate::startup_cache::save_now(&self.state);
-                event_loop.exit();
+                if self.state.close_to_tray && self.tray.as_ref().is_some_and(crate::tray::Tray::available) {
+                    window.window.set_visible(false);
+                    self.hidden = true;
+                } else {
+                    event_loop.exit();
+                }
             }
             WindowEvent::RedrawRequested => self.needs_redraw = false,
             WindowEvent::Focused(focused) => {
@@ -624,6 +647,35 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         rustcord_client::captcha::pump_main_thread();
         let Some(window) = self.window.as_mut() else { return };
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_unread(self.state.has_unread_attention());
+            while let Some(event) = tray.next_event() {
+                match event {
+                    crate::tray::TrayEvent::Show => {
+                        window.window.set_visible(true);
+                        window.window.set_minimized(false);
+                        window.window.focus_window();
+                        self.hidden = false;
+                        self.needs_redraw = true;
+                    }
+                    crate::tray::TrayEvent::Quit => {
+                        crate::startup_cache::save_now(&self.state);
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+            if self.hidden && !tray.available() {
+                window.window.set_visible(true);
+                self.hidden = false;
+                self.needs_redraw = true;
+            }
+        }
+        if self.hidden {
+            window.pump(&mut self.state, &self.cmd_tx, &mut self.event_rx);
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + IDLE_WAKE));
+            return;
+        }
         if std::mem::take(&mut self.state.devtools_requested) {
             match &self.devtools {
                 Some(dev) => dev.window.focus_window(),
@@ -680,7 +732,7 @@ fn continuous_redraw_interval(interacting: bool, animating: bool, uploading: boo
     }
 }
 
-pub fn run(state: AppState, cmd_tx: UnboundedSender<UiCommand>, event_rx: UnboundedReceiver<BackendEvent>) {
+pub fn run(state: AppState, cmd_tx: UnboundedSender<UiCommand>, event_rx: UnboundedReceiver<BackendEvent>, runtime: tokio::runtime::Handle) {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
@@ -694,6 +746,10 @@ pub fn run(state: AppState, cmd_tx: UnboundedSender<UiCommand>, event_rx: Unboun
         last_input: Instant::now(),
         needs_redraw: true,
         typing_active: false,
+        tray: None,
+        tray_tried: false,
+        hidden: false,
+        runtime,
     };
 
     event_loop.run_app(&mut app).expect("event loop failed");
