@@ -15,7 +15,7 @@ const MAX_KEY_BYTES: usize = 128;
 const MAX_LOG_BYTES: usize = 4096;
 const MAX_PENDING_LOGS: usize = 4096;
 const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
-const INTERRUPT_LIMIT: u64 = 5_000_000;
+const INTERRUPT_LIMIT: u64 = 1_000_000_000;
 const EXECUTION_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
@@ -123,6 +123,7 @@ pub enum PluginState {
 struct RunningPlugin {
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    completion: mpsc::Receiver<Result<(), String>>,
 }
 
 struct PluginRecord {
@@ -213,33 +214,81 @@ impl PluginManager {
         let logs = Arc::clone(&self.logs);
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (completion_tx, completion_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(format!("luna-{}", id))
             .spawn(move || {
-                let result =
-                    execute_plugin(&manifest, &source, storage, logs, Arc::clone(&worker_stop));
-                let _ = ready_tx.send(result.map_err(|error| error.to_string()));
-                while !worker_stop.load(Ordering::Acquire) {
-                    thread::park_timeout(Duration::from_millis(20));
-                }
+                let result = execute_plugin(
+                    &manifest,
+                    &source,
+                    storage,
+                    logs,
+                    Arc::clone(&worker_stop),
+                    started_tx,
+                );
+                let _ = completion_tx.send(result.map_err(|error| error.to_string()));
             })?;
-        match ready_rx.recv().map_err(|_| PluginError::WorkerStopped)? {
+        match started_rx.recv() {
             Ok(()) => {
                 record.failure = None;
                 record.running = Some(RunningPlugin {
                     stop,
                     worker: Some(worker),
+                    completion: completion_rx,
                 });
                 Ok(())
             }
-            Err(error) => {
+            Err(_) => {
+                let error = completion_rx
+                    .recv()
+                    .unwrap_or_else(|_| Err("plugin worker stopped unexpectedly".into()))
+                    .err()
+                    .unwrap_or_else(|| "plugin worker stopped before startup".into());
                 stop.store(true, Ordering::Release);
                 worker.join().map_err(|_| PluginError::WorkerPanicked)?;
                 record.failure = Some(error.clone());
                 Err(PluginError::Execution(error))
             }
         }
+    }
+
+    pub fn poll(&mut self) -> Result<Vec<(String, String)>, PluginError> {
+        let ids: Vec<String> = self.plugins.keys().cloned().collect();
+        let mut failures = Vec::new();
+        for id in ids {
+            let completed = self
+                .plugins
+                .get(&id)
+                .and_then(|record| record.running.as_ref())
+                .and_then(|running| match running.completion.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        Some(Err("plugin worker stopped unexpectedly".into()))
+                    }
+                });
+            let Some(completed) = completed else {
+                continue;
+            };
+            let record = self
+                .plugins
+                .get_mut(&id)
+                .ok_or_else(|| PluginError::NotFound(id.clone()))?;
+            if let Some(mut running) = record.running.take() {
+                running.stop.store(true, Ordering::Release);
+                if let Some(worker) = running.worker.take() {
+                    worker.join().map_err(|_| PluginError::WorkerPanicked)?;
+                }
+            }
+            let failure = completed.err();
+            record.failure = failure.clone();
+            persist_storage(&self.storage_dir, &id, &record.storage)?;
+            if let Some(error) = failure {
+                failures.push((id, error));
+            }
+        }
+        Ok(failures)
     }
 
     pub fn disable(&mut self, id: &str) -> Result<(), PluginError> {
@@ -253,6 +302,13 @@ impl PluginManager {
         running.stop.store(true, Ordering::Release);
         if let Some(worker) = running.worker.take() {
             worker.join().map_err(|_| PluginError::WorkerPanicked)?;
+        }
+        if let Ok(Err(error)) = running.completion.try_recv() {
+            if !error.contains("plugin stopped") {
+                record.failure = Some(error.clone());
+                persist_storage(&self.storage_dir, id, &record.storage)?;
+                return Err(PluginError::Execution(error));
+            }
         }
         persist_storage(&self.storage_dir, id, &record.storage)
     }
@@ -335,6 +391,7 @@ fn execute_plugin(
     storage: Arc<Mutex<BTreeMap<String, serde_json::Value>>>,
     logs: Arc<Mutex<Vec<PluginLog>>>,
     stop: Arc<AtomicBool>,
+    startup_tx: mpsc::Sender<()>,
 ) -> Result<(), PluginError> {
     let lua = Lua::new_with(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8 | StdLib::COROUTINE,
@@ -448,6 +505,9 @@ fn execute_plugin(
         }
         Ok(VmState::Continue)
     });
+    startup_tx
+        .send(())
+        .map_err(|_| PluginError::WorkerStopped)?;
     lua.load(source).set_name(&manifest.entry).exec()?;
     Ok(())
 }
@@ -491,6 +551,25 @@ mod tests {
         }
     }
 
+    fn wait_for_completion(
+        manager: &mut PluginManager,
+        id: &str,
+        timeout: Duration,
+    ) -> Vec<(String, String)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let failures = manager.poll().unwrap();
+            if manager.state(id).unwrap() != PluginState::Enabled {
+                return failures;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "plugin did not finish before the test deadline"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn executes_logs_and_exposes_metadata_and_storage() {
         let fixture = Fixture::new(
@@ -504,6 +583,8 @@ mod tests {
             manager.state("example.hello").unwrap(),
             PluginState::Enabled
         );
+        wait_for_completion(&mut manager, "example.hello", Duration::from_secs(2));
+        assert_eq!(manager.state("example.hello").unwrap(), PluginState::Loaded);
         assert_eq!(manager.take_logs()[0].message, "Hello");
         manager.disable("example.hello").unwrap();
         assert_eq!(manager.state("example.hello").unwrap(), PluginState::Loaded);
@@ -528,6 +609,12 @@ mod tests {
             manifest.validate(),
             Err(PluginError::UnsupportedApi(2))
         ));
+        let fixture = Fixture::new("return true");
+        fs::write(fixture.plugin.join("manifest.json"), "{").unwrap();
+        assert!(matches!(
+            PluginManifest::read(&fixture.plugin),
+            Err(PluginError::Manifest(_))
+        ));
     }
 
     #[test]
@@ -541,7 +628,7 @@ mod tests {
             Err(PluginError::Duplicate(_))
         ));
         manager.enable("example.hello").unwrap();
-        manager.disable("example.hello").unwrap();
+        wait_for_completion(&mut manager, "example.hello", Duration::from_secs(2));
         let plugin2 = second.plugin.join("manifest.json");
         let contents = fs::read_to_string(plugin2)
             .unwrap()
@@ -549,7 +636,78 @@ mod tests {
         fs::write(second.plugin.join("manifest.json"), contents).unwrap();
         manager.load(&second.plugin).unwrap();
         manager.enable("example.other").unwrap();
+        wait_for_completion(&mut manager, "example.other", Duration::from_secs(2));
         manager.disable("example.other").unwrap();
+    }
+
+    #[test]
+    fn runs_two_plugins_simultaneously_and_disables_one_while_running() {
+        let first = Fixture::new(r#"luna.log("first running"); while true do end"#);
+        let second = Fixture::new(r#"luna.log("second running"); while true do end"#);
+        let mut second_manifest = fs::read_to_string(second.plugin.join("manifest.json")).unwrap();
+        second_manifest = second_manifest.replace("example.hello", "example.second");
+        fs::write(second.plugin.join("manifest.json"), second_manifest).unwrap();
+        let mut manager = PluginManager::new(&first.storage);
+        manager.load(&first.plugin).unwrap();
+        manager.load(&second.plugin).unwrap();
+        manager.enable("example.hello").unwrap();
+        manager.enable("example.second").unwrap();
+        assert_eq!(
+            manager.state("example.hello").unwrap(),
+            PluginState::Enabled
+        );
+        assert_eq!(
+            manager.state("example.second").unwrap(),
+            PluginState::Enabled
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut started_logs = Vec::new();
+        while started_logs.len() < 2 {
+            started_logs.extend(manager.take_logs());
+            assert!(Instant::now() < deadline, "both plugins did not start");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let started = Instant::now();
+        manager.disable("example.hello").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(manager.state("example.hello").unwrap(), PluginState::Loaded);
+        assert_eq!(
+            manager.state("example.second").unwrap(),
+            PluginState::Enabled
+        );
+        manager.disable("example.second").unwrap();
+    }
+
+    #[test]
+    fn storage_survives_manager_restart_and_remains_plugin_scoped() {
+        let writer = Fixture::new(r#"luna.storage.set("persisted", { value = 73 })"#);
+        let reader = Fixture::new(r#"assert(luna.storage.get("persisted") == nil)"#);
+        let mut reader_manifest = fs::read_to_string(reader.plugin.join("manifest.json")).unwrap();
+        reader_manifest = reader_manifest.replace("example.hello", "example.reader");
+        fs::write(reader.plugin.join("manifest.json"), reader_manifest).unwrap();
+        {
+            let mut manager = PluginManager::new(&writer.storage);
+            manager.load(&writer.plugin).unwrap();
+            manager.enable("example.hello").unwrap();
+            wait_for_completion(&mut manager, "example.hello", Duration::from_secs(2));
+            manager.unload("example.hello").unwrap();
+        }
+        let verifier = Fixture::new(r#"assert(luna.storage.get("persisted").value == 73)"#);
+        let mut manager = PluginManager::new(&writer.storage);
+        manager.load(&verifier.plugin).unwrap();
+        manager.load(&reader.plugin).unwrap();
+        manager.enable("example.hello").unwrap();
+        wait_for_completion(&mut manager, "example.hello", Duration::from_secs(2));
+        manager.enable("example.reader").unwrap();
+        wait_for_completion(&mut manager, "example.reader", Duration::from_secs(2));
+        assert!(matches!(
+            manager.state("example.hello").unwrap(),
+            PluginState::Loaded
+        ));
+        assert!(matches!(
+            manager.state("example.reader").unwrap(),
+            PluginState::Loaded
+        ));
     }
 
     #[test]
@@ -559,18 +717,31 @@ mod tests {
         let mut manager = PluginManager::new(&fixture.storage);
         manager.load(&fixture.plugin).unwrap();
         manager.enable("example.hello").unwrap();
+        wait_for_completion(&mut manager, "example.hello", Duration::from_secs(2));
         manager.disable("example.hello").unwrap();
         let broken = Fixture::new("error('broken')");
         let mut broken_manager = PluginManager::new(&broken.storage);
         broken_manager.load(&broken.plugin).unwrap();
-        assert!(matches!(
-            broken_manager.enable("example.hello"),
-            Err(PluginError::Execution(message)) if message.contains("broken")
-        ));
+        broken_manager.enable("example.hello").unwrap();
+        let failures =
+            wait_for_completion(&mut broken_manager, "example.hello", Duration::from_secs(2));
+        assert!(failures
+            .iter()
+            .any(|(id, message)| id == "example.hello" && message.contains("broken")));
         assert!(matches!(
             broken_manager.state("example.hello").unwrap(),
             PluginState::Failed(_)
         ));
+        let malformed = Fixture::new("local = ");
+        let mut malformed_manager = PluginManager::new(&malformed.storage);
+        malformed_manager.load(&malformed.plugin).unwrap();
+        malformed_manager.enable("example.hello").unwrap();
+        let failures = wait_for_completion(
+            &mut malformed_manager,
+            "example.hello",
+            Duration::from_secs(2),
+        );
+        assert!(failures.iter().any(|(id, _)| id == "example.hello"));
     }
 
     #[test]
@@ -578,7 +749,11 @@ mod tests {
         let fixture = Fixture::new("while true do end");
         let mut manager = PluginManager::new(&fixture.storage);
         manager.load(&fixture.plugin).unwrap();
-        assert!(manager.enable("example.hello").is_err());
+        manager.enable("example.hello").unwrap();
+        let failures = wait_for_completion(&mut manager, "example.hello", Duration::from_secs(7));
+        assert!(failures
+            .iter()
+            .any(|(_, message)| message.contains("execution limit")));
         assert!(matches!(
             manager.state("example.hello").unwrap(),
             PluginState::Failed(_)
