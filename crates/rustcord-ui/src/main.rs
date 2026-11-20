@@ -842,6 +842,7 @@ pub fn drain_backend_events(
                     state.dm_channels.insert(0, channel);
                 }
                 state.selected_guild = None;
+                state.last_dm_channel = Some(channel_id.clone());
                 state.selected_channel = Some(channel_id);
                 state.sidebar_tab = 0;
             }

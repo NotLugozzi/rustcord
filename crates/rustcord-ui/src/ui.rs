@@ -1529,9 +1529,7 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
     });
 
     if let Some(guild_id) = select_guild {
-        let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
-        state.selected_guild = Some(guild_id);
-        state.selected_channel = None;
+        state.select_guild(guild_id, cmd_tx);
     }
     match drop_action {
         Some(RailDropAction::MoveGuildToIndex(dragged_id, target_index)) => state.move_guild_to_rail_index(&dragged_id, target_index),
@@ -3760,8 +3758,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             };
             let home_selected = state.selected_guild.is_none();
             if rail_tile(ui, textures, &state.theme, "dm_button", RAIL_ICON_SIZE, home_look, home_selected, false) {
-                state.selected_guild = None;
-                state.selected_channel = None;
+                state.open_dm_home(cmd_tx);
             }
             if ui.is_item_hovered() {
                 ui.tooltip_text("Direct Messages");
@@ -3804,10 +3801,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                 };
                 let selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
                 if rail_tile(ui, textures, &state.theme, &format!("unread_dm_{channel_id}"), RAIL_ICON_SIZE, look, selected, false) {
-                    state.selected_guild = None;
-                    state.selected_channel = Some(channel_id.clone());
-                    state.server_call_minimized = true;
-                    let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+                    state.open_dm(&channel_id, cmd_tx);
+                    state.focus_compose = true;
                     if let Some(last_id) = &last_message_id {
                         if state.mark_channel_read(&channel_id, last_id) {
                             let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });
@@ -5349,9 +5344,7 @@ fn draw_conversation_start(
             }
         });
         if let Some(guild_id) = picked {
-            let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
-            state.selected_guild = Some(guild_id);
-            state.selected_channel = None;
+            state.select_guild(guild_id, cmd_tx);
         }
     }
     if !started_row {
@@ -6065,6 +6058,7 @@ fn draw_incoming_calls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<U
                 let _ = cmd_tx.send(UiCommand::JoinVoiceChannel { guild_id: None, channel_id: channel_id.clone(), ring: false });
                 state.selected_guild = None;
                 state.selected_channel = Some(channel_id.clone());
+                state.last_dm_channel = Some(channel_id.clone());
                 state.incoming_calls.retain(|c| *c != channel_id);
                 state.sync_ringtone();
             }
@@ -6518,9 +6512,7 @@ fn apply_switcher_target(state: &mut AppState, cmd_tx: &UnboundedSender<UiComman
     use crate::switcher::Target;
     match target {
         Target::Guild { guild_id } => {
-            let _ = cmd_tx.send(UiCommand::SelectGuild { guild_id: guild_id.clone() });
-            state.selected_guild = Some(guild_id);
-            state.selected_channel = None;
+            state.select_guild(guild_id, cmd_tx);
         }
         Target::Channel { guild_id, channel_id } => {
             if state.selected_guild.as_deref() != Some(guild_id.as_str()) {
@@ -6528,15 +6520,13 @@ fn apply_switcher_target(state: &mut AppState, cmd_tx: &UnboundedSender<UiComman
                 state.selected_guild = Some(guild_id);
             }
             let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
+            state.remember_guild_channel(&channel_id);
             state.selected_channel = Some(channel_id);
             state.server_call_minimized = true;
         }
         Target::Dm { channel_id } => {
-            state.selected_guild = None;
             state.pending_sidebar_tab = Some(0);
-            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
-            state.selected_channel = Some(channel_id);
-            state.server_call_minimized = true;
+            state.open_dm(&channel_id, cmd_tx);
         }
     }
 }
@@ -7999,9 +7989,8 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
                 state.profile_popout = Some(user.clone());
             }
         } else if row_clicked {
-            let _ = cmd_tx.send(UiCommand::SelectChannel { channel_id: channel_id.clone() });
-            state.selected_channel = Some(channel_id.clone());
-            state.server_call_minimized = true;
+            state.open_dm(channel_id, cmd_tx);
+            state.focus_compose = true;
             if let Some(last_id) = last_message_id {
                 if state.mark_channel_read(channel_id, last_id) {
                     let _ = cmd_tx.send(UiCommand::AckMessage { channel_id: channel_id.clone(), message_id: last_id.clone() });

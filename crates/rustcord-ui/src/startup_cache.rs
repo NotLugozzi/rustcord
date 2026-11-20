@@ -28,6 +28,10 @@ pub struct Snapshot {
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
     #[serde(default)]
+    pub last_guild_channel: HashMap<String, String>,
+    #[serde(default)]
+    pub last_dm_channel: Option<String>,
+    #[serde(default)]
     pub command_indexes: Vec<(rustcord_client::rest::CommandScope, rustcord_client::commands::CommandIndex)>,
 }
 
@@ -72,6 +76,8 @@ impl Snapshot {
             messages,
             selected_guild: state.selected_guild.clone(),
             selected_channel: state.selected_channel.clone(),
+            last_guild_channel: state.last_guild_channel.clone(),
+            last_dm_channel: state.last_dm_channel.clone(),
             command_indexes: state.command_indexes.iter().map(|(scope, cached)| (scope.clone(), cached.index.clone())).collect(),
         })
     }
@@ -100,6 +106,8 @@ impl Snapshot {
         }
         state.selected_guild = self.selected_guild;
         state.selected_channel = self.selected_channel;
+        state.last_guild_channel = self.last_guild_channel;
+        state.last_dm_channel = self.last_dm_channel;
         state.logged_in = true;
         state.restored_from_cache = true;
         state.login_status = None;
@@ -119,6 +127,8 @@ pub fn forget_cached_account(state: &mut AppState) {
     state.command_indexes.clear();
     state.selected_guild = None;
     state.selected_channel = None;
+    state.last_guild_channel.clear();
+    state.last_dm_channel = None;
     state.restored_from_cache = false;
 }
 
