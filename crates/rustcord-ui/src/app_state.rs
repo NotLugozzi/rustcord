@@ -550,6 +550,8 @@ pub struct AppState {
     pub message_rows: HashMap<String, std::sync::Arc<crate::message_rows::ChannelRows>>,
     pub selected_guild: Option<String>,
     pub selected_channel: Option<String>,
+    pub last_guild_channel: HashMap<String, String>,
+    pub last_dm_channel: Option<String>,
     pub compose_buf: String,
     pub email_input: String,
     pub password_input: String,
@@ -1833,6 +1835,7 @@ impl AppState {
         if self.server_settings.as_ref().is_some_and(|s| s.guild_id == guild_id) {
             self.server_settings = None;
         }
+        self.last_guild_channel.remove(guild_id);
         if self.selected_guild.as_deref() == Some(guild_id) {
             self.selected_guild = None;
             self.selected_channel = None;
@@ -1845,6 +1848,10 @@ impl AppState {
         self.message_rows.remove(channel_id);
         self.typing_users.remove(channel_id);
         self.last_read_message_id.remove(channel_id);
+        self.last_guild_channel.retain(|_, remembered| remembered != channel_id);
+        if self.last_dm_channel.as_deref() == Some(channel_id) {
+            self.last_dm_channel = None;
+        }
         if self.selected_channel.as_deref() == Some(channel_id) {
             self.selected_channel = None;
         }
@@ -2086,11 +2093,48 @@ impl AppState {
         }
         self.selected_channel = Some(channel_id.to_string());
         self.server_call_minimized = true;
+        self.remember_guild_channel(channel_id);
         let last_id = self.find_guild_channel(channel_id).and_then(|c| c.last_message_id.clone());
         if let Some(last_id) = last_id {
             if self.mark_channel_read(channel_id, &last_id) {
                 let _ = cmd_tx.send(crate::backend::UiCommand::AckMessage { channel_id: channel_id.to_string(), message_id: last_id });
             }
+        }
+    }
+
+    pub fn remember_guild_channel(&mut self, channel_id: &str) {
+        if let Some(guild_id) = self.find_guild_channel(channel_id).and_then(|c| c.guild_id.clone()) {
+            self.last_guild_channel.insert(guild_id, channel_id.to_string());
+        }
+    }
+
+    pub fn open_dm(&mut self, channel_id: &str, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let _ = cmd_tx.send(crate::backend::UiCommand::SelectChannel { channel_id: channel_id.to_string() });
+        self.selected_guild = None;
+        self.selected_channel = Some(channel_id.to_string());
+        self.last_dm_channel = Some(channel_id.to_string());
+        self.server_call_minimized = true;
+    }
+
+    pub fn open_dm_home(&mut self, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        match self.last_dm_channel.clone().filter(|id| self.dm_channels.iter().any(|dm| &dm.id == id)) {
+            Some(channel_id) => self.open_dm(&channel_id, cmd_tx),
+            None => {
+                self.selected_guild = None;
+                self.selected_channel = None;
+            }
+        }
+    }
+
+    pub fn select_guild(&mut self, guild_id: String, cmd_tx: &tokio::sync::mpsc::UnboundedSender<crate::backend::UiCommand>) {
+        let _ = cmd_tx.send(crate::backend::UiCommand::SelectGuild { guild_id: guild_id.clone() });
+        let remembered = self.last_guild_channel.get(&guild_id).cloned().filter(|channel_id| {
+            self.guild_channels.get(&guild_id).is_none_or(|channels| channels.iter().any(|c| &c.id == channel_id))
+        });
+        self.selected_guild = Some(guild_id);
+        self.selected_channel = None;
+        if let Some(channel_id) = remembered {
+            self.open_channel(&channel_id, cmd_tx);
         }
     }
 
@@ -4783,6 +4827,42 @@ mod thread_tests {
         assert!(sent.iter().any(|c| matches!(c, crate::backend::UiCommand::LoadArchivedThreads { channel_id, .. } if channel_id == "f")));
         assert!(!sent.iter().any(|c| matches!(c, crate::backend::UiCommand::SelectChannel { .. })));
         assert!(state.forum_view.is_some());
+    }
+
+    #[test]
+    fn switching_back_to_a_guild_reopens_its_last_channel() {
+        let text = |id: &str, guild: &str| -> Channel { serde_json::from_value(serde_json::json!({ "id": id, "type": 0, "guild_id": guild, "name": id })).unwrap() };
+        let mut state = AppState::default();
+        state.guild_channels.insert("g1".into(), vec![text("a", "g1"), text("b", "g1")]);
+        state.guild_channels.insert("g2".into(), vec![text("c", "g2")]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.select_guild("g1".into(), &tx);
+        assert_eq!(state.selected_channel, None);
+        state.open_channel("b", &tx);
+        state.select_guild("g2".into(), &tx);
+        state.open_channel("c", &tx);
+        state.select_guild("g1".into(), &tx);
+        assert_eq!(state.selected_channel.as_deref(), Some("b"));
+        state.guild_channels.get_mut("g2").unwrap().clear();
+        state.select_guild("g2".into(), &tx);
+        assert_eq!(state.selected_channel, None);
+    }
+
+    #[test]
+    fn dm_home_reopens_the_last_dm() {
+        let dm: Channel = serde_json::from_value(serde_json::json!({ "id": "dm", "type": 1, "recipients": [] })).unwrap();
+        let mut state = AppState::default();
+        state.dm_channels.push(dm);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        state.open_dm_home(&tx);
+        assert_eq!(state.selected_channel, None);
+        state.open_dm("dm", &tx);
+        state.select_guild("g".into(), &tx);
+        state.open_dm_home(&tx);
+        assert_eq!((state.selected_guild.as_deref(), state.selected_channel.as_deref()), (None, Some("dm")));
+        state.dm_channels.clear();
+        state.open_dm_home(&tx);
+        assert_eq!(state.selected_channel, None);
     }
 
     #[test]
