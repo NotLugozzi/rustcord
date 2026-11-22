@@ -24,6 +24,16 @@ pub(crate) fn audio_host() -> cpal::Host {
     cpal::default_host()
 }
 
+pub fn slider_gain(slider: f32) -> f32 {
+    if slider <= 0.0 {
+        0.0
+    } else if slider <= 1.0 {
+        slider.powf(2.8)
+    } else {
+        10f32.powf(6.0 * (slider.min(2.0) - 1.0) / 20.0)
+    }
+}
+
 #[derive(Clone)]
 pub struct MicProcessing {
     gain_bits: Arc<std::sync::atomic::AtomicU32>,
@@ -594,92 +604,6 @@ pub(crate) fn find_device(host: &cpal::Host, name: Option<&str>, input: bool) ->
     if input { host.default_input_device() } else { host.default_output_device() }
 }
 
-pub fn play_ringtone(stop: Arc<AtomicBool>) {
-    std::thread::spawn(move || {
-        let host = audio_host();
-        let Some(device) = find_device(&host, None, false) else { return };
-        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
-        let mut n: u64 = 0;
-        let cycle = SAMPLE_RATE as u64 * 2;
-        let Ok(stream) = device.build_output_stream(
-            config,
-            move |out: &mut [i16], _| {
-                for s in out.iter_mut() {
-                    let t = n % cycle;
-                    let freq = if t < 12_000 { 523.0 } else if (24_000..36_000).contains(&t) { 659.0 } else { 0.0 };
-                    *s = if freq > 0.0 { ((t as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 4000.0) as i16 } else { 0 };
-                    n += 1;
-                }
-            },
-            |e: cpal::Error| tracing::warn!("ringtone stream error: {e}"),
-            None,
-        ) else {
-            return;
-        };
-        if stream.play().is_err() {
-            return;
-        }
-        while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    });
-}
-
-pub fn play_notification_sound() {
-    std::thread::spawn(|| {
-        let host = audio_host();
-        let Some(device) = find_device(&host, None, false) else { return };
-        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
-        let first_note = SAMPLE_RATE as u64 * 85 / 1000;
-        let gap = SAMPLE_RATE as u64 * 35 / 1000;
-        let second_note = SAMPLE_RATE as u64 * 85 / 1000;
-        let total = first_note + gap + second_note;
-        let fade = SAMPLE_RATE as u64 * 5 / 1000;
-        let mut sample_index = 0u64;
-        let finished = Arc::new(AtomicBool::new(false));
-        let callback_finished = finished.clone();
-        let Ok(stream) = device.build_output_stream(
-            config,
-            move |out: &mut [i16], _| {
-                for sample in out.iter_mut() {
-                    let index = sample_index;
-                    sample_index = sample_index.saturating_add(1);
-                    let (frequency, note_index, note_len) = if index < first_note {
-                        (660.0, index, first_note)
-                    } else if index < first_note + gap {
-                        (0.0, 0, 0)
-                    } else if index < total {
-                        (880.0, index - first_note - gap, second_note)
-                    } else {
-                        callback_finished.store(true, Ordering::Relaxed);
-                        (0.0, 0, 0)
-                    };
-                    if frequency == 0.0 {
-                        *sample = 0;
-                        continue;
-                    }
-                    let envelope = (note_index as f32 / fade as f32)
-                        .min((note_len - note_index) as f32 / fade as f32)
-                        .clamp(0.0, 1.0);
-                    let phase = note_index as f32 * frequency * std::f32::consts::TAU / SAMPLE_RATE as f32;
-                    *sample = (phase.sin() * 3200.0 * envelope) as i16;
-                }
-            },
-            |e: cpal::Error| tracing::warn!("notification stream error: {e}"),
-            None,
-        ) else {
-            return;
-        };
-        if stream.play().is_err() {
-            return;
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        while !finished.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    });
-}
-
 pub fn run_mic_test(input_device: Option<String>, output_device: Option<String>, duration: std::time::Duration) {
     let host = audio_host();
     let Some(in_device) = find_device(&host, input_device.as_deref(), true) else { return };
@@ -731,38 +655,20 @@ pub fn run_mic_test(input_device: Option<String>, output_device: Option<String>,
     }
 }
 
-pub fn play_ding(join: bool, device_name: Option<String>) {
-    std::thread::spawn(move || {
-        let host = audio_host();
-        let Some(device) = find_device(&host, device_name.as_deref(), false) else { return };
-        let config = StreamConfig { channels: CHANNELS, sample_rate: SAMPLE_RATE, buffer_size: low_latency_buffer_size() };
-        let (first, second) = if join { (660.0f32, 880.0f32) } else { (880.0, 660.0) };
-        let note = SAMPLE_RATE as usize / 8;
-        let mut n: usize = 0;
-        let Ok(stream) = device.build_output_stream(
-            config,
-            move |out: &mut [i16], _| {
-                for s in out.iter_mut() {
-                    let i = n % (note * 2);
-                    let (freq, pos) = if n < note { (first, n) } else { (second, n - note) };
-                    let env = 1.0 - pos as f32 / note as f32;
-                    *s = if n < note * 2 { ((i as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 2500.0 * env) as i16 } else { 0 };
-                    n += 1;
-                }
-            },
-            |e: cpal::Error| tracing::warn!("ding stream error: {e}"),
-            None,
-        ) else {
-            return;
-        };
-        if stream.play().is_ok() {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn volume_sliders_follow_a_perceptual_curve() {
+        use super::slider_gain;
+        assert_eq!(slider_gain(0.0), 0.0);
+        assert_eq!(slider_gain(1.0), 1.0);
+        let half_db = 20.0 * slider_gain(0.5).log10();
+        assert!((-18.0..-16.0).contains(&half_db), "50% is {half_db} dB");
+        assert!((slider_gain(0.4) - 0.077).abs() < 0.002);
+        assert!((slider_gain(2.0) - 1.995).abs() < 0.01);
+        assert!(slider_gain(0.3) < slider_gain(0.31) && slider_gain(1.5) < slider_gain(1.6));
+    }
+
     use super::*;
 
     fn loud() -> Option<Vec<i16>> {

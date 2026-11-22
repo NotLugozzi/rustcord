@@ -1304,7 +1304,7 @@ impl VoiceGateway {
                             let user_gain = remote_speakers
                                 .get(&ssrc)
                                 .and_then(|user| self.media_state.user_volumes.lock().unwrap().get(user).copied())
-                                .unwrap_or(1.0);
+                                .map_or(1.0, crate::voice_audio::slider_gain);
                             if let Some(speaker) = speaker.as_ref() {
                                 speaker.push_packet(ssrc, timestamp, decoded_payload, user_gain);
                             } else {

@@ -643,6 +643,20 @@ fn try_parse_bare_url(chars: &[char]) -> Option<(String, usize)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn styled_words_keep_the_spaces_around_them() {
+        for input in ["i *so* do", "i _so_ do", "i **so** do", "i __so__ do", "i ~~so~~ do", "i `so` do"] {
+            let text: String = parse_spans(input)
+                .into_iter()
+                .map(|span| match span {
+                    Span::Text { text, .. } => text,
+                    _ => String::new(),
+                })
+                .collect();
+            assert_eq!(text, "i so do", "{input}");
+        }
+    }
+
     fn links(text: &str) -> Vec<String> {
         parse_spans(text)
             .into_iter()

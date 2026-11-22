@@ -1,4 +1,5 @@
 use rustcord_client::models::{Channel, ChannelType, Emoji, Guild, Message, Presence, Relationship, RelationshipType, User};
+use rustcord_client::sounds::Sound;
 use std::collections::HashMap;
 
 fn merge_read_state(
@@ -571,7 +572,7 @@ pub struct AppState {
     pub user_volumes: HashMap<String, f32>,
     pub reached_start: std::collections::HashSet<String>,
     pub incoming_calls: Vec<String>,
-    pub ringtone_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub ringing: bool,
     pub pending_attachments: HashMap<String, Vec<PendingAttachment>>,
     pub poll_views: HashMap<String, PollView>,
     pub poll_card_heights: HashMap<String, f32>,
@@ -622,9 +623,14 @@ pub struct AppState {
     pub voice_channel_states: HashMap<String, Vec<rustcord_client::models::VoiceState>>,
     pub active_streams: HashMap<String, String>,
     pub watching_stream: Option<String>,
+    pub watching_since: Option<std::time::Instant>,
     pub unwatching_stream: Option<String>,
     pub server_call_minimized: bool,
     pub server_call_focus_stream: bool,
+    pub stream_zoom: crate::zoom::Zoom,
+    pub lightbox_zoom: crate::zoom::Zoom,
+    pub voice_started: HashMap<String, u64>,
+    pub voice_status: HashMap<String, String>,
     pub voice_speaking_users: std::collections::HashSet<String>,
     pub connected_voice_channel: Option<(Option<String>, String)>,
     pub pending_voice_channel: Option<(Option<String>, String)>,
@@ -677,6 +683,10 @@ pub struct AppState {
     pub invites: HashMap<String, crate::invites::InviteEntry>,
     pub pending_invite_voice: Option<(String, String)>,
     pub relationship_busy: std::collections::HashSet<String>,
+    pub leave_guild_confirm: Option<String>,
+    pub friend_nickname_edit: Option<(String, String)>,
+    pub show_message_requests: bool,
+    pub context_friend: Option<User>,
     pub relationship_confirm: Option<(crate::backend::RelationshipAction, String, String)>,
     pub mutual_server_labels: HashMap<String, String>,
     pub muted_before_deafen: bool,
@@ -714,6 +724,12 @@ pub struct AppState {
     pub qr_login: QrLogin,
     pub close_to_tray: bool,
     pub share_game: bool,
+    pub sound_volume: f32,
+    pub call_sounds: bool,
+    pub stream_sounds: bool,
+    pub message_sounds: bool,
+    pub stream_viewers: HashMap<String, Vec<String>>,
+    pub sounded_voice_channel: Option<String>,
     pub tray_available: bool,
     pub rail_sync_pending: bool,
     pub member_lists: HashMap<String, rustcord_client::member_list::MemberList>,
@@ -1297,7 +1313,7 @@ impl AppState {
     pub fn forward_targets(&self, query: &str) -> Vec<ForwardTarget> {
         let query = query.trim().to_lowercase();
         let matches = |text: &str| query.is_empty() || text.to_lowercase().contains(&query);
-        let dms = self.dm_channels.iter().map(|dm| ForwardTarget { channel_id: dm.id.clone(), label: Self::dm_display_name(dm), detail: None });
+        let dms = self.dm_channels.iter().map(|dm| ForwardTarget { channel_id: dm.id.clone(), label: self.dm_title(dm), detail: None });
         let channels = self.guilds.iter().flat_map(|guild| {
             self.guild_channels
                 .get(&guild.id)
@@ -1694,6 +1710,9 @@ impl AppState {
 
     pub fn composer_block(&self, channel_id: &str) -> Option<&'static str> {
         use rustcord_client::permissions::{MANAGE_THREADS, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS};
+        if self.is_message_request(channel_id) {
+            return Some("Accept this message request to reply.");
+        }
         let channel = self.find_guild_channel(channel_id)?;
         let guild_id = channel.guild_id.clone()?;
         if self.current_user.is_none() || !self.guild_roles.contains_key(&guild_id) {
@@ -1905,7 +1924,7 @@ impl AppState {
                 .map(crate::switcher::Icon::Image)
                 .unwrap_or(crate::switcher::Icon::Channel);
             entries.push(Entry {
-                label: Self::dm_display_name(dm),
+                label: self.dm_title(dm),
                 context: Some("Direct Message".to_string()),
                 icon,
                 target: Target::Dm { channel_id: dm.id.clone() },
@@ -2532,6 +2551,10 @@ impl AppState {
         }
     }
 
+    pub fn mentions_me(&self, message: &Message) -> bool {
+        self.current_user.as_ref().is_some_and(|me| message.mentions.iter().any(|u| u.id == me.id))
+    }
+
     pub fn should_notify(&self, message: &Message, now: chrono::DateTime<chrono::Utc>) -> bool {
         use rustcord_client::models::{NOTIFY_ALL, NOTIFY_MENTIONS};
         let Some(me) = &self.current_user else { return false };
@@ -2539,7 +2562,7 @@ impl AppState {
             return false;
         }
         let guild_id = message.guild_id.as_deref();
-        if self.is_channel_muted(guild_id, &message.channel_id, now) {
+        if self.is_channel_muted(guild_id, &message.channel_id, now) || self.is_message_request(&message.channel_id) {
             return false;
         }
         let Some(guild_id) = guild_id else { return true };
@@ -2805,10 +2828,8 @@ impl AppState {
         let Some(channel_id) = self.selected_channel.as_deref() else { return String::new() };
         if let Some(dm) = self.dm_channels.iter().find(|c| c.id == channel_id) {
             return match (dm.kind, dm.recipients.first()) {
-                (ChannelType::Dm, Some(user)) => {
-                    format!("Message @{}", user.global_name.as_deref().filter(|n| !n.is_empty()).unwrap_or(&user.username))
-                }
-                _ => format!("Message {}", Self::dm_display_name(dm)),
+                (ChannelType::Dm, Some(user)) => format!("Message @{}", self.person_name(user)),
+                _ => format!("Message {}", self.dm_title(dm)),
             };
         }
         match self.guild_channels.values().flatten().find(|c| c.id == channel_id).and_then(|c| c.name.as_deref()) {
@@ -2998,6 +3019,38 @@ impl AppState {
         users
     }
 
+    pub fn friend_nickname(&self, user_id: &str) -> Option<&str> {
+        self.relationships.iter()
+            .find(|r| r.user.id == user_id)
+            .and_then(|r| r.nickname.as_deref())
+            .filter(|nickname| !nickname.trim().is_empty())
+    }
+
+    pub fn person_name(&self, user: &User) -> String {
+        self.friend_nickname(&user.id).map(str::to_string).unwrap_or_else(|| user.global_name.clone().unwrap_or_else(|| user.username.clone()))
+    }
+
+    pub fn dm_title(&self, dm: &Channel) -> String {
+        if dm.kind == ChannelType::GroupDm && dm.name.as_deref().is_some_and(|name| !name.trim().is_empty()) {
+            return Self::dm_display_name(dm);
+        }
+        match dm.kind {
+            ChannelType::GroupDm if !dm.recipients.is_empty() => dm.recipients.iter().map(|u| self.person_name(u)).collect::<Vec<_>>().join(", "),
+            ChannelType::Dm if !dm.recipients.is_empty() => self.person_name(&dm.recipients[0]),
+            _ => Self::dm_display_name(dm),
+        }
+    }
+
+    pub fn message_requests(&self) -> Vec<&Channel> {
+        let mut requests: Vec<&Channel> = self.dm_channels.iter().filter(|dm| dm.is_message_request || dm.is_spam).collect();
+        requests.sort_by_key(|dm| std::cmp::Reverse(dm.last_message_id.as_deref().map(snowflake_value).unwrap_or(0)));
+        requests
+    }
+
+    pub fn is_message_request(&self, channel_id: &str) -> bool {
+        self.dm_channels.iter().any(|dm| dm.id == channel_id && (dm.is_message_request || dm.is_spam))
+    }
+
     pub fn dm_display_name(dm: &Channel) -> String {
         if dm.kind == ChannelType::GroupDm {
             if let Some(name) = dm.name.as_deref().filter(|name| !name.trim().is_empty()) {
@@ -3022,9 +3075,10 @@ impl AppState {
         let mut dms: Vec<&Channel> = self
             .dm_channels
             .iter()
+            .filter(|dm| !dm.is_message_request && !dm.is_spam)
             .filter(|dm| {
                 query.is_empty()
-                    || Self::dm_display_name(dm).to_lowercase().contains(&query)
+                    || self.dm_title(dm).to_lowercase().contains(&query)
                     || dm.recipients.iter().any(|u| {
                         u.username.to_lowercase().contains(&query)
                             || u.global_name.as_deref().is_some_and(|name| name.to_lowercase().contains(&query))
@@ -3065,44 +3119,68 @@ impl AppState {
             camera_device: self.camera_device.clone(),
             close_to_tray: Some(self.close_to_tray),
             share_game: Some(self.share_game),
+            sound_volume: Some(self.sound_volume),
+            call_sounds: Some(self.call_sounds),
+            stream_sounds: Some(self.stream_sounds),
+            message_sounds: Some(self.message_sounds),
             ..Default::default()
         }
     }
 
     pub fn sync_ringtone(&mut self) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        match (self.incoming_calls.is_empty(), self.ringtone_stop.is_some()) {
-            (false, false) => {
-                let stop = std::sync::Arc::new(AtomicBool::new(false));
-                rustcord_client::voice_audio::play_ringtone(stop.clone());
-                self.ringtone_stop = Some(stop);
-            }
-            (true, true) => {
-                if let Some(stop) = self.ringtone_stop.take() {
-                    stop.store(true, Ordering::Relaxed);
-                }
-            }
-            _ => {}
+        let ringing = !self.incoming_calls.is_empty();
+        if ringing != self.ringing {
+            self.ringing = ringing;
+            rustcord_client::sounds::set_ringing(ringing);
         }
     }
 
-    pub fn ding_for_voice_state(&self, voice_state: &rustcord_client::models::VoiceState) {
-        let Some((_, my_channel)) = &self.connected_voice_channel else { return };
+    pub fn voice_state_sounds(&self, voice_state: &rustcord_client::models::VoiceState) -> Vec<Sound> {
+        let Some((_, my_channel)) = &self.connected_voice_channel else { return Vec::new() };
         if self.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) || self.self_deafened {
-            return;
+            return Vec::new();
         }
         if self.voice_joined_at.is_none_or(|t| t.elapsed() < std::time::Duration::from_secs(2)) {
-            return;
+            return Vec::new();
         }
-        let was_in = self
+        let previous = self
             .voice_channel_states
             .values()
             .flatten()
-            .any(|s| s.user_id == voice_state.user_id && s.channel_id.as_ref() == Some(my_channel));
+            .find(|s| s.user_id == voice_state.user_id && s.channel_id.as_ref() == Some(my_channel));
         let is_in = voice_state.channel_id.as_ref() == Some(my_channel);
-        if was_in != is_in {
-            rustcord_client::voice_audio::play_ding(is_in, self.selected_output_device.clone());
+        let sound = match (previous, is_in) {
+            (None, true) if self.call_sounds => Some(Sound::Join),
+            (Some(_), false) if self.call_sounds => Some(Sound::Leave),
+            (Some(previous), true) if self.stream_sounds => match (previous.self_stream, voice_state.self_stream) {
+                (Some(true), Some(false)) => Some(Sound::StreamStop),
+                (before, Some(true)) if before != Some(true) => Some(Sound::StreamStart),
+                _ => None,
+            },
+            (None, true) if self.stream_sounds && voice_state.self_stream == Some(true) => Some(Sound::StreamStart),
+            _ => None,
+        };
+        sound.into_iter().collect()
+    }
+
+    pub fn viewer_sounds(&self, stream_key: &str, viewer_ids: &[String]) -> Vec<Sound> {
+        let Some(me) = self.current_user.as_ref().map(|u| u.id.as_str()) else { return Vec::new() };
+        let mine = stream_key.rsplit(':').next() == Some(me);
+        let watched = self.watching_stream.as_deref() == Some(stream_key);
+        if !self.stream_sounds || self.self_deafened || !(mine || watched) {
+            return Vec::new();
         }
+        let Some(before) = self.stream_viewers.get(stream_key) else { return Vec::new() };
+        let owner = stream_key.rsplit(':').next().unwrap_or_default();
+        let others = |ids: &[String], id: &String| id != me && id != owner && !ids.contains(id);
+        let mut sounds = Vec::new();
+        if viewer_ids.iter().any(|id| others(before, id)) {
+            sounds.push(Sound::ViewerJoin);
+        }
+        if before.iter().any(|id| others(viewer_ids, id)) {
+            sounds.push(Sound::ViewerLeave);
+        }
+        sounds
     }
 
     pub fn apply_voice_state(&mut self, voice_state: rustcord_client::models::VoiceState) {
@@ -3117,8 +3195,11 @@ impl AppState {
                     self.unwatching_stream = None;
                 }
             } else if voice_state.self_stream == Some(true) {
-                if let (Some(guild_id), Some(channel_id)) = (&voice_state.guild_id, &voice_state.channel_id) {
-                    let stream_key = format!("guild:{guild_id}:{channel_id}:{}", voice_state.user_id);
+                if let Some(channel_id) = &voice_state.channel_id {
+                    let stream_key = match &voice_state.guild_id {
+                        Some(guild_id) => format!("guild:{guild_id}:{channel_id}:{}", voice_state.user_id),
+                        None => format!("call:{channel_id}:{}", voice_state.user_id),
+                    };
                     self.active_streams.insert(voice_state.user_id.clone(), stream_key);
                 }
             }
@@ -3134,6 +3215,13 @@ impl AppState {
         if voice_state.channel_id.is_some() {
             states.push(voice_state);
         }
+    }
+
+    pub fn shows_call_timer(&self) -> bool {
+        let Some(guild_id) = &self.selected_guild else { return false };
+        self.voice_channel_states.get(guild_id).is_some_and(|states| {
+            states.iter().any(|state| state.channel_id.as_ref().is_some_and(|id| self.voice_started.contains_key(id)))
+        })
     }
 
     pub fn voice_channels_for_selected_guild(&self) -> Vec<&Channel> {
@@ -3516,7 +3604,7 @@ mod tests {
     fn relationships_upsert_by_id_and_remove() {
         use rustcord_client::models::{Relationship, RelationshipType};
         let mut state = AppState::default();
-        let request = Relationship { id: "1".into(), kind: RelationshipType::IncomingRequest, user: test_user("1", "ada", None), since: None };
+        let request = Relationship { id: "1".into(), kind: RelationshipType::IncomingRequest, user: test_user("1", "ada", None), since: None, nickname: None };
         state.upsert_relationship(request.clone());
         state.upsert_relationship(Relationship { kind: RelationshipType::Friend, ..request });
         assert_eq!(state.relationships.len(), 1);
@@ -3597,6 +3685,94 @@ mod tests {
         assert!(state.is_channel_muted(Some("g"), "c", noon()));
         assert!(!state.channel_mute_is_direct(Some("g"), "c", noon()));
         assert!(!state.should_notify(&incoming(Some("g"), "c", true), noon()));
+    }
+
+    #[test]
+    fn message_requests_stay_out_of_the_dm_list_and_never_notify() {
+        let mut state = notifying_state();
+        let dm = |id: &str, request: bool| -> Channel {
+            serde_json::from_value(serde_json::json!({ "id": id, "type": 1, "recipients": [], "is_message_request": request })).unwrap()
+        };
+        state.dm_channels = vec![dm("dm", false), dm("req", true)];
+        assert!(state.should_notify(&incoming(None, "dm", false), noon()));
+        assert!(!state.should_notify(&incoming(None, "req", false), noon()));
+        assert_eq!(state.filtered_dm_channels().iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["dm"]);
+        assert_eq!(state.message_requests().iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["req"]);
+        assert_eq!(state.composer_block("req"), Some("Accept this message request to reply."));
+    }
+
+    #[test]
+    fn friend_nicknames_name_the_dm() {
+        let mut state = notifying_state();
+        let ada = test_user("1", "ada", Some("Ada"));
+        state.relationships.push(Relationship { id: "1".into(), kind: RelationshipType::Friend, user: ada.clone(), since: None, nickname: Some("bestie".into()) });
+        let dm: Channel = serde_json::from_value(serde_json::json!({ "id": "d", "type": 1, "recipients": [ada] })).unwrap();
+        assert_eq!(state.dm_title(&dm), "bestie");
+        assert_eq!(AppState::dm_display_name(&dm), "Ada");
+    }
+
+    fn voice(user: &str, channel: Option<&str>, streaming: bool) -> rustcord_client::models::VoiceState {
+        serde_json::from_value(serde_json::json!({
+            "guild_id": "g", "channel_id": channel, "user_id": user, "session_id": "s", "self_stream": streaming
+        }))
+        .unwrap()
+    }
+
+    fn in_call() -> AppState {
+        let mut state = notifying_state();
+        state.call_sounds = true;
+        state.stream_sounds = true;
+        state.connected_voice_channel = Some((Some("g".into()), "vc".into()));
+        state.voice_joined_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+        state.apply_voice_state(voice("2", Some("vc"), false));
+        state
+    }
+
+    #[test]
+    fn people_coming_and_going_in_your_call_make_sounds() {
+        let state = in_call();
+        assert_eq!(state.voice_state_sounds(&voice("3", Some("vc"), false)), vec![Sound::Join]);
+        assert_eq!(state.voice_state_sounds(&voice("2", None, false)), vec![Sound::Leave]);
+        assert_eq!(state.voice_state_sounds(&voice("2", Some("other"), false)), vec![Sound::Leave]);
+        assert!(state.voice_state_sounds(&voice("3", Some("other"), false)).is_empty());
+        assert!(state.voice_state_sounds(&voice("2", Some("vc"), false)).is_empty());
+        assert_eq!(state.voice_state_sounds(&voice("2", Some("vc"), true)), vec![Sound::StreamStart]);
+    }
+
+    #[test]
+    fn call_sounds_wait_for_your_own_join_and_respect_the_toggles() {
+        let mut state = in_call();
+        state.stream_sounds = false;
+        assert!(state.voice_state_sounds(&voice("2", Some("vc"), true)).is_empty());
+        state.call_sounds = false;
+        assert!(state.voice_state_sounds(&voice("3", Some("vc"), false)).is_empty());
+        let mut state = in_call();
+        state.voice_joined_at = Some(std::time::Instant::now());
+        assert!(state.voice_state_sounds(&voice("3", Some("vc"), false)).is_empty());
+        let mut state = in_call();
+        state.self_deafened = true;
+        assert!(state.voice_state_sounds(&voice("3", Some("vc"), false)).is_empty());
+    }
+
+    #[test]
+    fn a_stream_ending_plays_only_when_the_streamer_stays() {
+        let mut state = in_call();
+        state.apply_voice_state(voice("2", Some("vc"), true));
+        assert_eq!(state.voice_state_sounds(&voice("2", Some("vc"), false)), vec![Sound::StreamStop]);
+        assert_eq!(state.voice_state_sounds(&voice("2", None, false)), vec![Sound::Leave]);
+    }
+
+    #[test]
+    fn viewers_are_announced_on_your_stream_after_the_first_update() {
+        let mut state = in_call();
+        let me = state.current_user.as_ref().unwrap().id.clone();
+        let key = format!("guild:g:vc:{me}");
+        assert!(state.viewer_sounds(&key, &["2".into()]).is_empty());
+        state.stream_viewers.insert(key.clone(), vec![]);
+        assert_eq!(state.viewer_sounds(&key, &["2".into()]), vec![Sound::ViewerJoin]);
+        state.stream_viewers.insert(key.clone(), vec!["2".into()]);
+        assert_eq!(state.viewer_sounds(&key, &[]), vec![Sound::ViewerLeave]);
+        assert!(state.viewer_sounds("guild:g:vc:9", &["2".into()]).is_empty());
     }
 
     #[test]
@@ -4107,6 +4283,8 @@ mod tests {
             user_limit: None,
             forum: Default::default(),
             rate_limit_per_user: None,
+            is_message_request: false,
+            is_spam: false,
         }
     }
 
@@ -4131,6 +4309,8 @@ mod tests {
             user_limit: None,
             forum: Default::default(),
             rate_limit_per_user: None,
+            is_message_request: false,
+            is_spam: false,
         }
     }
 
@@ -4426,6 +4606,8 @@ mod tests {
             user_limit: None,
             forum: Default::default(),
             rate_limit_per_user: None,
+            is_message_request: false,
+            is_spam: false,
         });
 
         let entries = state.switcher_entries();

@@ -415,6 +415,8 @@ pub struct VoiceState {
     #[serde(default)]
     pub self_stream: Option<bool>,
     #[serde(default)]
+    pub self_video: bool,
+    #[serde(default)]
     pub mute: bool,
     #[serde(default)]
     pub deaf: bool,
@@ -467,6 +469,10 @@ pub struct Channel {
     pub forum: ForumFields,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_per_user: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_message_request: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_spam: bool,
 }
 
 pub const CHANNEL_FLAG_PINNED: u64 = 1 << 1;
@@ -1311,6 +1317,8 @@ pub struct Relationship {
     pub user: User,
     #[serde(default)]
     pub since: Option<String>,
+    #[serde(default)]
+    pub nickname: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

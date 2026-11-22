@@ -3,6 +3,8 @@ use crate::models::{OverwriteKind, PermissionOverwrite, Role, Snowflake};
 pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const MANAGE_THREADS: u64 = 1 << 34;
 pub const MOVE_MEMBERS: u64 = 1 << 24;
+pub const MUTE_MEMBERS: u64 = 1 << 22;
+pub const DEAFEN_MEMBERS: u64 = 1 << 23;
 pub const SEND_MESSAGES: u64 = 1 << 11;
 pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;

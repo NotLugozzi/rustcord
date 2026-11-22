@@ -10,6 +10,7 @@ username = "ferris"
 display_name = "Ferris"
 status = "online"
 playing = "Factorio"
+nickname = "crab"
 
 [[users]]
 key = "mira"
@@ -50,6 +51,13 @@ username = "Clippy"
 status = "online"
 bot = true
 playing = "/help"
+
+[[users]]
+key = "pixel"
+username = "pixelpusher"
+display_name = "Pixel"
+status = "online"
+friend = false
 
 [[servers]]
 name = "Rustcord"
@@ -172,6 +180,9 @@ category = "Voice Channels"
 voice = ["ferris", "juno", "sage", "kai"]
 muted = ["kai"]
 streaming = ["juno"]
+cameras = ["ferris"]
+started_minutes_ago = 47
+status = "shipping the new call layout"
 
 [[servers.channels]]
 name = "Pairing"
@@ -284,6 +295,15 @@ with = ["orion"]
 from = "orion"
 minutes_ago = 4320
 text = "thanks for the help earlier"
+
+[[dms]]
+with = ["pixel"]
+request = true
+
+[[dms.messages]]
+from = "pixel"
+minutes_ago = 30
+text = "hey! saw your theme in #showcase, can I use it?"
 
 [call]
 server = "Rustcord"

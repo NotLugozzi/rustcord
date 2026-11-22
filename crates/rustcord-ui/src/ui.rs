@@ -559,10 +559,13 @@ fn draw_styled_text(ui: &Ui, fonts: &Fonts, theme: &crate::theme::Theme, text: &
             rest = rest.trim_start();
             continue;
         };
-        ui.text(rest[..end].trim_end());
+        let chunk = rest[..end].trim_end();
+        let span_ends = rest[end..].trim_start().is_empty();
+        ui.text(if span_ends { &rest[..end] } else { chunk });
         if style.strikethrough || style.underline {
             let [x, y] = ui.item_rect_min();
-            let [x2, y2] = ui.item_rect_max();
+            let y2 = ui.item_rect_max()[1];
+            let x2 = x + ui.calc_text_size(chunk)[0];
             let line_y = if style.strikethrough { (y + y2) / 2.0 } else { y2 };
             ui.get_window_draw_list().add_line([x, line_y], [x2, line_y], theme.text).build();
         }
@@ -1551,6 +1554,7 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         state.guild_context = Some(context);
         ui.open_popup("guild_ctx");
     }
+    let mut open_leave = false;
     ui.popup("guild_ctx", || {
         let Some((guild_id, folder_idx)) = state.guild_context.clone() else { return };
         if let Some(guild) = state.guilds.iter().find(|g| g.id == guild_id) {
@@ -1574,10 +1578,43 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         if let Some(folder_idx) = folder_idx {
             ui.separator();
             if ui.selectable("Remove from folder") {
-                remove_from_folder = Some((folder_idx, guild_id));
+                remove_from_folder = Some((folder_idx, guild_id.clone()));
+            }
+        }
+        if !state.is_guild_owner(&guild_id) {
+            ui.separator();
+            let _danger = ui.push_style_color(imgui::StyleColor::Text, state.theme.danger());
+            if ui.selectable("Leave Server") {
+                state.leave_guild_confirm = Some(guild_id);
+                open_leave = true;
             }
         }
     });
+    if open_leave {
+        ui.open_popup("Leave Server##confirm");
+    }
+    if let Some(_modal) = ui.modal_popup_config("Leave Server##confirm").always_auto_resize(true).begin_popup() {
+        let mut close = state.leave_guild_confirm.is_none();
+        if let Some(guild_id) = state.leave_guild_confirm.clone() {
+            let name = state.guilds.iter().find(|g| g.id == guild_id).map(|g| g.name.clone()).unwrap_or_default();
+            ui.text(format!("Leave {name}?"));
+            ui.text_colored(state.theme.text_muted, "You won't be able to rejoin unless you're invited again.");
+            ui.dummy([0.0, 6.0]);
+            if ui.button("Cancel") {
+                close = true;
+            }
+            ui.same_line();
+            let _danger = ui.push_style_color(imgui::StyleColor::Button, state.theme.danger());
+            if ui.button("Leave Server") {
+                let _ = cmd_tx.send(UiCommand::LeaveGuild { guild_id });
+                close = true;
+            }
+        }
+        if close {
+            state.leave_guild_confirm = None;
+            ui.close_current_popup();
+        }
+    }
     if let Some((folder_idx, guild_id)) = remove_from_folder {
         state.remove_guild_from_folder(folder_idx, &guild_id);
     }
@@ -3725,8 +3762,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
 
     let [display_w, display_h] = ui.io().display_size;
     #[cfg(feature = "screenshare")]
-    let server_call_fullscreen = state.connected_voice_channel.as_ref().is_some_and(|(guild_id, _)| guild_id.is_some())
-        && !state.server_call_minimized;
+    let server_call_fullscreen = state.connected_voice_channel.as_ref().is_some_and(|(guild_id, channel_id)| {
+        guild_id.is_some() || state.selected_channel.as_deref() == Some(channel_id.as_str())
+    }) && !state.server_call_minimized;
     #[cfg(not(feature = "screenshare"))]
     let server_call_fullscreen = false;
     state.sidebar_width = state.sidebar_width.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH);
@@ -3774,7 +3812,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                         }
                         _ => dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 64)),
                     };
-                    (dm.id.clone(), AppState::dm_display_name(dm), avatar, state.mention_count(&dm.id), dm.last_message_id.clone())
+                    (dm.id.clone(), state.dm_title(dm), avatar, state.mention_count(&dm.id), dm.last_message_id.clone())
                 })
                 .collect::<Vec<_>>()
             {
@@ -3990,9 +4028,18 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             font.pop();
                             width
                         });
+                        let elapsed = state.voice_started.get(channel_id)
+                            .filter(|_| !state.members_in_voice_channel(&guild_id, channel_id).is_empty())
+                            .map(|started| format_call_elapsed(chrono::Utc::now().timestamp().max(0) as u64, *started));
+                        let elapsed_w = elapsed.as_ref().map_or(0.0, |text| {
+                            let font = ui.push_font(faces().xs);
+                            let width = ui.calc_text_size(text)[0] + 8.0;
+                            font.pop();
+                            width
+                        });
                         let row_min = ui.cursor_screen_pos();
                         let row_w = ui.content_region_avail()[0];
-                        let shown = truncate_to_width(ui, &label, row_w - capacity_w);
+                        let shown = truncate_to_width(ui, &label, row_w - capacity_w - elapsed_w);
                         let clicked = ui.selectable(shown.as_deref().unwrap_or(&label));
                         let row_h = ui.item_rect_size()[1];
                         if ui.is_item_hovered() {
@@ -4012,6 +4059,25 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             draw_list.add_rect(pill_min, pill_max, state.theme.field()).filled(true).rounding(4.0).build();
                             draw_list.add_text([pill_min[0] + 4.0, pill_min[1] + 2.0], ink, text);
                             drop(draw_list);
+                            font.pop();
+                        }
+                        if let Some(text) = &elapsed {
+                            let font = ui.push_font(faces().xs);
+                            let size = ui.calc_text_size(text);
+                            let x = row_min[0] + row_w - capacity_w - size[0] - 6.0;
+                            ui.get_window_draw_list().add_text([x, row_min[1] + (row_h - size[1]) / 2.0], state.theme.text_muted, text);
+                            font.pop();
+                        }
+                        if let Some(status) = state.voice_status.get(channel_id).cloned() {
+                            let font = ui.push_font(faces().xs);
+                            ui.indent();
+                            let room = ui.content_region_avail()[0];
+                            let shown_status = truncate_to_width(ui, &status, room).unwrap_or_else(|| status.clone());
+                            ui.text_colored(state.theme.text_muted, &shown_status);
+                            if ui.is_item_hovered() && shown_status != status {
+                                ui.tooltip_text(&status);
+                            }
+                            ui.unindent();
                             font.pop();
                         }
                         if clicked && *blocked && !is_connected {
@@ -4047,7 +4113,8 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                             if state.active_streams.contains_key(&member_id) {
                                 let is_self = state.current_user.as_ref().is_some_and(|user| user.id == member_id);
                                 if !is_self {
-                                    ui.set_cursor_screen_pos([row_pos[0] + row_width - 60.0, row_pos[1] + 7.0]);
+                                    let icons = [member.self_mute || member.mute || member.self_deaf || member.deaf, member.self_video].iter().filter(|shown| **shown).count() as f32;
+                                    ui.set_cursor_screen_pos([row_pos[0] + row_width - 60.0 - icons * 20.0, row_pos[1] + 7.0]);
                                     ui.text_colored([0.95, 0.25, 0.35, 1.0], "LIVE");
                                     ui.set_cursor_screen_pos([row_pos[0], row_pos[1] + ROW_H]);
                                 }
@@ -4078,9 +4145,16 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 } else {
                                     None
                                 };
+                                let mut icon_x = row_pos[0] + row_width - 22.0;
                                 if let Some(texture) = status_icon.and_then(|icon| textures.icon(icon, 16.0)) {
-                                    let x = row_pos[0] + row_width - 22.0;
-                                    dl.add_image(texture, [x, center[1] - 8.0], [x + 16.0, center[1] + 8.0]).col(state.theme.mention_badge()).build();
+                                    let tint = if member.mute || member.deaf { state.theme.danger() } else { state.theme.mention_badge() };
+                                    dl.add_image(texture, [icon_x, center[1] - 8.0], [icon_x + 16.0, center[1] + 8.0]).col(tint).build();
+                                    icon_x -= 20.0;
+                                }
+                                if member.self_video {
+                                    if let Some(texture) = textures.icon(crate::icons::Icon::Video, 16.0) {
+                                        dl.add_image(texture, [icon_x, center[1] - 8.0], [icon_x + 16.0, center[1] + 8.0]).col(state.theme.text_muted).build();
+                                    }
                                 }
                             }
                             ui.unindent();
@@ -4127,6 +4201,9 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
                                 state.server_call_minimized = false;
                                 state.server_call_focus_stream = false;
                             }
+                        }
+                        if let Some(guild_id) = state.selected_guild.clone() {
+                            draw_voice_moderation_items(ui, state, cmd_tx, &guild_id, &member_id);
                         }
                         ui.separator();
                         draw_user_volume_controls(ui, state, cmd_tx, &member_id);
@@ -4205,7 +4282,7 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
         .build(|| {
             #[cfg(feature = "screenshare")]
             if server_call_fullscreen {
-                draw_server_call_fullscreen(ui, state, textures, cmd_tx);
+                draw_call_stage(ui, state, textures, cmd_tx, false);
                 return;
             }
             state.sync_draft_channel();
@@ -4226,8 +4303,19 @@ pub fn draw(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, 
             if let Some(dm) = &dm_channel {
                 if state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == dm.id) {
                     let _call_panel_bg = ui.push_style_color(imgui::StyleColor::ChildBg, surface_bg);
-                    draw_dm_call_panel(ui, state, textures, cmd_tx, dm);
-                    header_height += CALL_PANEL_HEIGHT;
+                    #[cfg(feature = "screenshare")]
+                    {
+                        let panel_height = dm_call_panel_height(state, ui.window_size()[1] - header_height);
+                        ui.child_window("dm_call_panel").size([0.0, panel_height]).scrollable(false).scroll_bar(false).build(|| {
+                            draw_call_stage(ui, state, textures, cmd_tx, true);
+                        });
+                        header_height += panel_height;
+                    }
+                    #[cfg(not(feature = "screenshare"))]
+                    {
+                        draw_dm_call_panel(ui, state, textures, cmd_tx, dm);
+                        header_height += CALL_PANEL_HEIGHT;
+                    }
                 }
             }
             #[cfg(feature = "screenshare")]
@@ -5257,7 +5345,7 @@ fn draw_conversation_start(
     let indent = |ui: &Ui| ui.set_cursor_pos([left, ui.cursor_pos()[1]]);
 
     if dm.kind == ChannelType::GroupDm {
-        let name = AppState::dm_display_name(dm);
+        let name = state.dm_title(dm);
         let icon_url = dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 128));
         indent(ui);
         draw_start_avatar(ui, textures, cmd_tx, icon_url.as_deref(), accent);
@@ -5689,9 +5777,19 @@ fn camera_tooltip(on: bool) -> &'static str {
 }
 
 fn toggle_voice(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, toggle: VoiceToggle) {
+    use rustcord_client::sounds::Sound;
+    let was_deafened = state.self_deafened;
     match toggle {
         VoiceToggle::Mute => state.toggle_mute(),
         VoiceToggle::Deafen => state.toggle_deafen(),
+    }
+    if state.call_sounds {
+        rustcord_client::sounds::play(match (was_deafened, state.self_deafened, state.self_muted) {
+            (true, false, _) => Sound::Undeafen,
+            (false, true, _) => Sound::Deafen,
+            (_, _, true) => Sound::Mute,
+            _ => Sound::Unmute,
+        });
     }
     persist_settings(state);
     if let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() {
@@ -6214,8 +6312,11 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
     let max_w = display_w * 0.85;
     let max_h = display_h * 0.85;
     let [nw, nh] = natural_size;
-    let scale = if nw > 0.0 && nh > 0.0 { (max_w / nw).min(max_h / nh).min(1.0) } else { 1.0 };
+    let fit = if nw > 0.0 && nh > 0.0 { (max_w / nw).min(max_h / nh) } else { 1.0 };
+    let scale = if state.lightbox_zoom.zoomed() { fit } else { fit.min(1.0) };
     let size = [nw * scale, nh * scale];
+    let min = [display_w / 2.0 - size[0] / 2.0, display_h / 2.0 - size[1] / 2.0];
+    let max = [min[0] + size[0], min[1] + size[1]];
 
     ui.window("##lightbox_backdrop")
         .position([0.0, 0.0], imgui::Condition::Always)
@@ -6228,18 +6329,34 @@ fn draw_image_lightbox(ui: &Ui, state: &mut AppState, textures: &mut TextureCach
 
     let close_clicked = ui
         .window("##lightbox")
-        .position([display_w / 2.0 - size[0] / 2.0, display_h / 2.0 - size[1] / 2.0], imgui::Condition::Always)
-        .size(size, imgui::Condition::Always)
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([display_w, display_h], imgui::Condition::Always)
         .no_decoration()
+        .scrollable(false)
+        .scroll_bar(false)
         .draw_background(false)
         .build(|| {
-            imgui::Image::new(texture_id, size).build(ui);
-            ui.is_item_clicked()
+            let zoom = &mut state.lightbox_zoom;
+            let hovered = zoom.interact(ui, min, max);
+            let (uv_min, uv_max) = zoom.uv();
+            let dl = ui.get_window_draw_list();
+            dl.add_image(texture_id, min, max).uv_min(uv_min).uv_max(uv_max).build();
+            let hint = if zoom.zoomed() {
+                format!("{:.1}×  ·  drag to move  ·  double-click to reset  ·  Esc to close", zoom.scale)
+            } else {
+                "Scroll or double-click to zoom  ·  click outside or Esc to close".to_string()
+            };
+            let hint_size = ui.calc_text_size(&hint);
+            let hint_pos = [(display_w - hint_size[0]) * 0.5, (max[1] + 12.0).min(display_h - hint_size[1] - 12.0)];
+            dl.add_rect([hint_pos[0] - 10.0, hint_pos[1] - 5.0], [hint_pos[0] + hint_size[0] + 10.0, hint_pos[1] + hint_size[1] + 5.0], [0.0, 0.0, 0.0, 0.6]).filled(true).rounding(8.0).build();
+            dl.add_text(hint_pos, [0.92, 0.92, 0.96, 1.0], &hint);
+            !hovered && ui.is_window_hovered() && ui.is_mouse_clicked(imgui::MouseButton::Left)
         })
         .unwrap_or(false);
 
     if close_clicked || ui.is_key_pressed(imgui::Key::Escape) {
         state.image_lightbox = None;
+        state.lightbox_zoom = crate::zoom::Zoom::default();
     }
 }
 
@@ -6616,7 +6733,7 @@ fn draw_server_call_controls(ui: &Ui, state: &mut AppState, textures: &TextureCa
     let dock_width = COUNT * SIZE + (COUNT - 1.0) * GAP + 28.0;
     {
         let dl = ui.get_window_draw_list();
-        let origin = ui.cursor_screen_pos();
+        let origin = ui.window_pos();
         dl.add_rect([origin[0] + x - 14.0, origin[1] + y - 8.0], [origin[0] + x + dock_width - 14.0, origin[1] + y + SIZE + 8.0], [0.105, 0.105, 0.125, 0.96]).filled(true).rounding(22.0).build();
     }
     let mut index = 0.0f32;
@@ -6669,112 +6786,216 @@ fn cover_uv(source: [f32; 2], target: [f32; 2]) -> ([f32; 2], [f32; 2]) {
 }
 
 #[cfg(feature = "screenshare")]
+struct CallParticipant {
+    user: rustcord_client::models::User,
+    speaking: bool,
+    muted: bool,
+}
+
+#[cfg(feature = "screenshare")]
+fn call_grid(count: usize, width: f32, height: f32, gap: f32) -> (usize, [f32; 2]) {
+    let mut best = (1, [1.0, 1.0]);
+    for columns in 1..=count.max(1) {
+        let rows = count.div_ceil(columns);
+        let cell_w = (width - gap * (columns - 1) as f32) / columns as f32;
+        let cell_h = (height - gap * (rows - 1) as f32) / rows as f32;
+        let tile_w = cell_w.min(cell_h * 16.0 / 9.0).min(640.0);
+        if tile_w > best.1[0] {
+            best = (columns, [tile_w, tile_w * 9.0 / 16.0]);
+        }
+    }
+    best
+}
+
+#[cfg(feature = "screenshare")]
+fn call_participants(state: &AppState) -> Vec<CallParticipant> {
+    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return Vec::new() };
+    let scope = guild_id.unwrap_or_else(|| channel_id.clone());
+    state.members_in_voice_channel(&scope, &channel_id)
+        .into_iter()
+        .filter_map(|voice_state| {
+            let user = state.known_users.get(&voice_state.user_id)
+                .or_else(|| voice_state.member.as_ref().and_then(|m| m.user.as_ref()))
+                .or_else(|| state.dm_channels.iter().find(|dm| dm.id == channel_id).and_then(|dm| dm.recipients.iter().find(|u| u.id == voice_state.user_id)))
+                .or_else(|| state.current_user.as_ref().filter(|u| u.id == voice_state.user_id))?;
+            Some(CallParticipant {
+                user: user.clone(),
+                speaking: state.voice_speaking_users.contains(&voice_state.user_id),
+                muted: voice_state.self_mute || voice_state.mute || voice_state.self_deaf || voice_state.deaf,
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "screenshare")]
+fn watch_stream(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, stream_key: String) {
+    let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
+    state.watching_stream = Some(stream_key);
+    state.watching_since = Some(std::time::Instant::now());
+    state.stream_zoom = crate::zoom::Zoom::default();
+    state.server_call_minimized = false;
+    state.server_call_focus_stream = false;
+}
+
+#[cfg(feature = "screenshare")]
+fn stop_watching_stream(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, stream_key: String) {
+    let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
+    state.unwatching_stream = Some(stream_key);
+    state.watching_stream = None;
+    state.watching_since = None;
+}
+
+#[cfg(feature = "screenshare")]
+fn draw_call_member_menu(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    ui.popup("call_member_ctx", || {
+        let Some(member_id) = state.context_vc_member.clone() else { return };
+        let known = state.known_users.get(&member_id).cloned()
+            .or_else(|| state.dm_channels.iter().flat_map(|dm| dm.recipients.iter()).find(|u| u.id == member_id).cloned())
+            .or_else(|| state.current_user.clone().filter(|u| u.id == member_id));
+        if let Some(user) = &known {
+            ui.text_disabled(user.global_name.clone().unwrap_or_else(|| user.username.clone()));
+            ui.separator();
+        }
+        if ui.selectable("Profile") {
+            state.profile_popout = known;
+        }
+        if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
+            if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
+                if ui.selectable("Stop watching") {
+                    stop_watching_stream(state, cmd_tx, stream_key);
+                }
+            } else if ui.selectable("Watch screen share") {
+                watch_stream(state, cmd_tx, stream_key);
+            }
+        }
+        if let Some((Some(guild_id), _)) = state.connected_voice_channel.clone() {
+            draw_voice_moderation_items(ui, state, cmd_tx, &guild_id, &member_id);
+        }
+        draw_user_volume_controls(ui, state, cmd_tx, &member_id);
+    });
+}
+
+#[cfg(feature = "screenshare")]
 fn draw_call_participant_tiles(
     ui: &Ui,
     state: &mut AppState,
     textures: &mut TextureCache,
     cmd_tx: &UnboundedSender<UiCommand>,
-    participants: &[(rustcord_client::models::User, bool)],
-    origin: [f32; 2],
-    width: f32,
-    height: f32,
+    participants: &[CallParticipant],
+    area_top: f32,
+    area_bottom: f32,
     large: bool,
 ) {
     if participants.is_empty() { return; }
-    let gap = if large { 18.0 } else { 12.0 };
-    let columns = if large {
-        participants.len().min(3).max(1)
+    let origin = ui.window_pos();
+    let width = ui.window_size()[0];
+    let gap = if large { 14.0 } else { 10.0 };
+    let side = 24.0;
+    let area_h = (area_bottom - area_top).max(60.0);
+    let (columns, [tile_w, tile_h], visible) = if large {
+        let visible = participants.len().min(25);
+        let (columns, size) = call_grid(visible, width - side * 2.0, area_h, gap);
+        (columns, size, visible)
     } else {
-        (((width + gap) / (220.0 + gap)).floor() as usize).clamp(1, 6).min(participants.len())
+        let tile_h = area_h.min(118.0);
+        let tile_w = tile_h * 16.0 / 9.0;
+        let columns = (((width - side * 2.0 + gap) / (tile_w + gap)).floor() as usize).max(1).min(participants.len());
+        (columns, [tile_w, tile_h], columns)
     };
-    let rows = (participants.len() + columns - 1) / columns;
-    let area_top = if large { 72.0 } else { height - 224.0 };
-    let area_bottom = if large { height - 122.0 } else { height - 106.0 };
-    let area_h = (area_bottom - area_top).max(90.0);
-    let tile_w = if large {
-        ((width - 48.0 - gap * (columns.saturating_sub(1) as f32)) / columns as f32).min(420.0).max(180.0)
-    } else { 220.0 };
-    let tile_h = if large {
-        ((area_h - gap * (rows.saturating_sub(1) as f32)) / rows as f32).min(340.0).max(180.0)
-    } else { 118.0 };
-    let visible = participants.len().min(columns * if large { 3 } else { 1 });
+    let rows = visible.div_ceil(columns);
     let grid_w = columns as f32 * tile_w + columns.saturating_sub(1) as f32 * gap;
-    let grid_h = if large { rows.min(3) as f32 * tile_h + rows.min(3).saturating_sub(1) as f32 * gap } else { tile_h };
+    let grid_h = rows as f32 * tile_h + rows.saturating_sub(1) as f32 * gap;
     let start_x = (width - grid_w) * 0.5;
-    let start_y = if large { area_top + (area_h - grid_h) * 0.5 } else { area_top };
-    for (index, (user, speaking)) in participants.iter().take(visible).enumerate() {
+    let start_y = area_top + ((area_h - grid_h) * 0.5).max(0.0);
+    let rounding = (tile_h * 0.08).clamp(6.0, 14.0);
+    let watching = state.watching_stream.clone();
+    for (index, participant) in participants.iter().take(visible).enumerate() {
+        let user = &participant.user;
         let col = index % columns;
         let row = index / columns;
-        let p_min = [origin[0] + start_x + col as f32 * (tile_w + gap), origin[1] + start_y + row as f32 * (tile_h + gap)];
+        let row_count = if row + 1 == rows { visible - row * columns } else { columns };
+        let row_x = start_x + (grid_w - (row_count as f32 * tile_w + row_count.saturating_sub(1) as f32 * gap)) * 0.5;
+        let p_min = [origin[0] + row_x + col as f32 * (tile_w + gap), origin[1] + start_y + row as f32 * (tile_h + gap)];
         let p_max = [p_min[0] + tile_w, p_min[1] + tile_h];
-        let avatar_size = if large { 124.0 } else { 58.0 };
-        let avatar_min = [p_min[0] + (tile_w - avatar_size) * 0.5, p_min[1] + (tile_h - avatar_size) * 0.5 - if large { 14.0 } else { 8.0 }];
+        let band = if tile_h >= 150.0 { 30.0 } else { 24.0 };
+        let avatar_size = ((tile_h - band) * 0.55).min(124.0);
+        let avatar_min = [p_min[0] + (tile_w - avatar_size) * 0.5, p_min[1] + (tile_h - band - avatar_size) * 0.5];
         let avatar_max = [avatar_min[0] + avatar_size, avatar_min[1] + avatar_size];
         let avatar_url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
         let avatar = textures.get_still(&avatar_url).map(|(id, _)| id);
         if avatar.is_none() { textures.request(&avatar_url, cmd_tx); }
+        let is_me = state.current_user.as_ref().is_some_and(|me| me.id == user.id);
         let camera = textures.live_video(&crate::app_state::camera_video_key(&user.id))
-            .or_else(|| state.current_user.as_ref().filter(|me| me.id == user.id)
-                .and_then(|_| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id))));
+            .or_else(|| if is_me { textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)) } else { None });
+        let stream_key = state.active_streams.get(&user.id).cloned();
         let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
-        let display_name = truncate_to_width(ui, &name, tile_w - if large { 32.0 } else { 82.0 }).unwrap_or(name);
+        let name_room = tile_w - 40.0 - if participant.muted { 20.0 } else { 0.0 };
+        let display_name = truncate_to_width(ui, &name, name_room).unwrap_or(name);
         let speaking_color = [0.26, 0.83, 0.44, 1.0];
-        let border = if *speaking { speaking_color } else { [0.23, 0.23, 0.27, 1.0] };
-        let fill = if *speaking { [0.10, 0.16, 0.13, 1.0] } else { [0.09, 0.09, 0.105, 1.0] };
+        let border = if participant.speaking { speaking_color } else { [0.23, 0.23, 0.27, 1.0] };
+        let fill = if participant.speaking { [0.10, 0.16, 0.13, 1.0] } else { [0.09, 0.09, 0.105, 1.0] };
+        let inner_min = [p_min[0] + 2.0, p_min[1] + 2.0];
+        let inner_max = [p_max[0] - 2.0, p_max[1] - 2.0];
+        let text_y = p_max[1] - band + (band - ui.text_line_height()) * 0.5 - 4.0;
         {
             let dl = ui.get_window_draw_list();
-            dl.add_rect(p_min, p_max, border).filled(true).rounding(if large { 16.0 } else { 12.0 }).build();
-            dl.add_rect([p_min[0] + 2.0, p_min[1] + 2.0], [p_max[0] - 2.0, p_max[1] - 2.0], fill).filled(true).rounding(if large { 14.0 } else { 10.0 }).build();
+            dl.add_rect(p_min, p_max, border).filled(true).rounding(rounding).build();
+            dl.add_rect(inner_min, inner_max, fill).filled(true).rounding(rounding - 2.0).build();
             if let Some((texture_id, source)) = camera {
-                let (inner_min, inner_max) = ([p_min[0] + 2.0, p_min[1] + 2.0], [p_max[0] - 2.0, p_max[1] - 2.0]);
                 let (uv_min, uv_max) = cover_uv(source, [inner_max[0] - inner_min[0], inner_max[1] - inner_min[1]]);
-                dl.add_image_rounded(texture_id, inner_min, inner_max, if large { 14.0 } else { 10.0 }).uv_min(uv_min).uv_max(uv_max).build();
+                dl.add_image_rounded(texture_id, inner_min, inner_max, rounding - 2.0).uv_min(uv_min).uv_max(uv_max).build();
             } else if let Some(texture_id) = avatar {
                 dl.add_image_rounded(texture_id, avatar_min, avatar_max, avatar_size * 0.5).build();
             } else {
                 dl.add_circle([avatar_min[0] + avatar_size * 0.5, avatar_min[1] + avatar_size * 0.5], avatar_size * 0.5, [0.35, 0.35, 0.40, 1.0]).filled(true).build();
             }
-            let text_y = p_max[1] - if large { 34.0 } else { 25.0 };
-            dl.add_rect([p_min[0] + 8.0, text_y - 4.0], [p_max[0] - 8.0, p_max[1] - 8.0], [0.035, 0.035, 0.045, 0.9]).filled(true).rounding(8.0).build();
-            dl.add_text([p_min[0] + 16.0, text_y], ui.style_color(imgui::StyleColor::Text), display_name);
-            if *speaking {
-                dl.add_circle([p_max[0] - 18.0, text_y + 6.0], 4.0, speaking_color).filled(true).build();
-            }
-            if large && state.active_streams.contains_key(&user.id) {
-                dl.add_rect([p_min[0] + 14.0, p_min[1] + 14.0], [p_min[0] + 60.0, p_min[1] + 38.0], [0.82, 0.12, 0.18, 1.0]).filled(true).rounding(8.0).build();
-                dl.add_text([p_min[0] + 22.0, p_min[1] + 18.0], [1.0, 1.0, 1.0, 1.0], "LIVE");
+            let name_w = ui.calc_text_size(&display_name)[0] + 16.0 + if participant.muted { 20.0 } else { 0.0 };
+            dl.add_rect([p_min[0] + 6.0, text_y - 3.0], [p_min[0] + 6.0 + name_w, text_y + ui.text_line_height() + 3.0], [0.035, 0.035, 0.045, 0.85]).filled(true).rounding(6.0).build();
+            dl.add_text([p_min[0] + 14.0, text_y], ui.style_color(imgui::StyleColor::Text), &display_name);
+            if stream_key.is_some() {
+                let live_min = [p_min[0] + 10.0, p_min[1] + 10.0];
+                let live_size = ui.calc_text_size("LIVE");
+                dl.add_rect(live_min, [live_min[0] + live_size[0] + 14.0, live_min[1] + live_size[1] + 6.0], [0.82, 0.12, 0.18, 1.0]).filled(true).rounding(6.0).build();
+                dl.add_text([live_min[0] + 7.0, live_min[1] + 3.0], [1.0, 1.0, 1.0, 1.0], "LIVE");
             }
         }
-        if large {
-            if let Some(stream_key) = state.active_streams.get(&user.id).cloned() {
-                let button_width = 152.0;
-                let button_height = 38.0;
-                ui.set_cursor_pos([p_min[0] - origin[0] + (tile_w - button_width) * 0.5, p_max[1] - origin[1] - 82.0]);
-                let clicked = ui.invisible_button(format!("watch_stream_tile_{}", user.id), [button_width, button_height]);
-                let hovered = ui.is_item_hovered();
-                let button_min = ui.item_rect_min();
-                {
-                    let dl = ui.get_window_draw_list();
-                    let color = if hovered { [0.42, 0.27, 0.83, 1.0] } else { [0.36, 0.22, 0.73, 1.0] };
-                    dl.add_rect(button_min, [button_min[0] + button_width, button_min[1] + button_height], color).filled(true).rounding(9.0).build();
-                    let label = "Watch Stream";
-                    let label_size = ui.calc_text_size(label);
-                    dl.add_text([button_min[0] + (button_width - label_size[0]) * 0.5, button_min[1] + (button_height - label_size[1]) * 0.5], [1.0, 1.0, 1.0, 1.0], label);
-                }
-                if clicked {
-                    let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
-                    state.watching_stream = Some(stream_key);
-                    state.server_call_minimized = false;
-                    state.server_call_focus_stream = false;
-                }
-            }
+        if participant.muted {
+            let icon = ui.text_line_height();
+            draw_icon_at(ui, textures, crate::icons::Icon::MicOff, [p_min[0] + 14.0 + ui.calc_text_size(&display_name)[0] + 4.0, text_y], icon, [0.94, 0.33, 0.36, 1.0]);
+        }
+        if ui.is_window_hovered() && ui.is_mouse_hovering_rect(p_min, p_max) && ui.is_mouse_clicked(imgui::MouseButton::Right) {
+            state.context_vc_member = Some(user.id.clone());
+            ui.open_popup("call_member_ctx");
+        }
+        let Some(stream_key) = stream_key else { continue };
+        if watching.as_deref() == Some(stream_key.as_str()) || tile_h < 110.0 {
+            continue;
+        }
+        let label = "Watch Stream";
+        let button_height = 32.0;
+        let button_width = ui.calc_text_size(label)[0] + 32.0;
+        ui.set_cursor_screen_pos([p_min[0] + (tile_w - button_width) * 0.5, p_max[1] - band - button_height - 10.0]);
+        let clicked = ui.invisible_button(format!("watch_stream_tile_{}", user.id), [button_width, button_height]);
+        let hovered = ui.is_item_hovered();
+        let button_min = ui.item_rect_min();
+        {
+            let dl = ui.get_window_draw_list();
+            let color = if hovered { [0.42, 0.27, 0.83, 1.0] } else { [0.36, 0.22, 0.73, 1.0] };
+            dl.add_rect(button_min, [button_min[0] + button_width, button_min[1] + button_height], color).filled(true).rounding(8.0).build();
+            let label_size = ui.calc_text_size(label);
+            dl.add_text([button_min[0] + (button_width - label_size[0]) * 0.5, button_min[1] + (button_height - label_size[1]) * 0.5], [1.0, 1.0, 1.0, 1.0], label);
+        }
+        if clicked {
+            watch_stream(state, cmd_tx, stream_key);
         }
     }
     if participants.len() > visible {
         let text = format!("+{} more", participants.len() - visible);
-        ui.set_cursor_pos([start_x + grid_w + 8.0, start_y + tile_h * 0.5]);
+        let text_w = ui.calc_text_size(&text)[0];
+        ui.set_cursor_pos([(start_x + grid_w + 8.0).min(width - text_w - 8.0), start_y + tile_h * 0.5]);
         ui.text_disabled(text);
     }
+    draw_call_member_menu(ui, state, cmd_tx);
 }
 
 fn dispatch_keybinds(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
@@ -6917,15 +7138,15 @@ fn draw_screen_share_setup_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &Unboun
         });
 }
 
+#[cfg(not(feature = "screenshare"))]
 fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>, guild_id: Option<String>, channel_id: &str, center: bool) {
     const BUTTON: f32 = 30.0;
     const GAP: f32 = 8.0;
     const RED: [f32; 4] = [0.75, 0.25, 0.25, 1.0];
     const GREEN: [f32; 4] = [0.20, 0.60, 0.35, 1.0];
-    #[cfg(not(feature = "screenshare"))]
     let _ = channel_id;
     if center {
-        let button_count = if cfg!(feature = "screenshare") { 6.0 } else { 5.0 };
+        let button_count = 5.0;
         let total = button_count * BUTTON + (button_count - 1.0) * GAP;
         let y = ui.cursor_pos()[1];
         ui.set_cursor_pos([(ui.window_size()[0] - total) / 2.0, y]);
@@ -6956,26 +7177,59 @@ fn draw_voice_controls(ui: &Ui, state: &mut AppState, textures: &TextureCache, c
         state.show_voice_info = !state.show_voice_info;
     }
     ui.same_line_with_spacing(0.0, GAP);
-    #[cfg(feature = "screenshare")]
-    {
-        let camera = state.camera_on;
-        if icon_button(ui, textures, "vc_camera", crate::icons::Icon::Video, camera_tooltip(camera), camera.then_some(GREEN)) {
-            toggle_camera(state, cmd_tx);
-        }
-        ui.same_line_with_spacing(0.0, GAP);
-        let active = state.screen_sharing;
-        if icon_button(ui, textures, "vc_screenshare", SCREENSHARE_ICON, if active { "Stop screen sharing" } else { "Share your screen" }, active.then_some(GREEN)) {
-            if active {
-                state.screen_sharing = false;
-                let _ = cmd_tx.send(UiCommand::SetScreenSharing { enabled: false, include_system_audio: state.share_system_audio, audio_source_pid: state.selected_screen_audio_pid, max_height: state.screen_share_max_height, framerate: state.screen_share_fps, guild_id: guild_id.clone(), channel_id: channel_id.to_string() });
-            } else {
-                state.show_screen_share_setup = true;
-            }
-        }
-        ui.same_line_with_spacing(0.0, GAP);
-    }
     if icon_button(ui, textures, "vc_disconnect", crate::icons::Icon::PhoneOff, "Disconnect", None) {
         let _ = cmd_tx.send(UiCommand::LeaveVoiceChannel { guild_id: guild_id.clone() });
+    }
+}
+
+fn format_call_elapsed(now: u64, started: u64) -> String {
+    let seconds = now.saturating_sub(started);
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 { format!("{hours}:{minutes:02}:{seconds:02}") } else { format!("{minutes:02}:{seconds:02}") }
+}
+
+fn draw_voice_moderation_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, guild_id: &str, member_id: &str) {
+    use rustcord_client::permissions::{DEAFEN_MEMBERS, MOVE_MEMBERS, MUTE_MEMBERS};
+    use rustcord_client::rest::VoiceMemberChange;
+    let Some(voice) = state.voice_channel_states.get(guild_id).and_then(|states| states.iter().find(|v| v.user_id == member_id)).cloned() else { return };
+    let (can_mute, can_deafen, can_move) = (
+        state.has_guild_permission(guild_id, MUTE_MEMBERS),
+        state.has_guild_permission(guild_id, DEAFEN_MEMBERS),
+        state.has_guild_permission(guild_id, MOVE_MEMBERS),
+    );
+    if !(can_mute || can_deafen || can_move) {
+        return;
+    }
+    ui.separator();
+    let mut change = None;
+    if can_mute && ui.selectable(if voice.mute { "Server Unmute" } else { "Server Mute" }) {
+        change = Some(VoiceMemberChange::Mute(!voice.mute));
+    }
+    if can_deafen && ui.selectable(if voice.deaf { "Server Undeafen" } else { "Server Deafen" }) {
+        change = Some(VoiceMemberChange::Deafen(!voice.deaf));
+    }
+    if can_move {
+        let mut targets: Vec<(i32, String, String)> = state.guild_channels.get(guild_id).into_iter().flatten()
+            .filter(|c| matches!(c.kind, rustcord_client::models::ChannelType::GuildVoice | rustcord_client::models::ChannelType::GuildStageVoice))
+            .filter(|c| voice.channel_id.as_deref() != Some(c.id.as_str()))
+            .map(|c| (c.position.unwrap_or(0), c.id.clone(), c.name.clone().unwrap_or_default()))
+            .collect();
+        targets.sort();
+        if !targets.is_empty() {
+            if let Some(_menu) = ui.begin_menu("Move To") {
+                for (_, channel_id, name) in targets {
+                    if ui.menu_item(format!("{name}##move_{channel_id}")) {
+                        change = Some(VoiceMemberChange::Move(Some(channel_id)));
+                    }
+                }
+            }
+        }
+        if ui.selectable("Disconnect") {
+            change = Some(VoiceMemberChange::Move(None));
+        }
+    }
+    if let Some(change) = change {
+        let _ = cmd_tx.send(UiCommand::ModifyVoiceMember { guild_id: guild_id.to_string(), user_id: member_id.to_string(), change });
     }
 }
 
@@ -7007,99 +7261,129 @@ fn draw_user_volume_controls(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSe
 }
 
 #[cfg(feature = "screenshare")]
-const CALL_PANEL_HEIGHT: f32 = 230.0;
-#[cfg(not(feature = "screenshare"))]
-const CALL_PANEL_HEIGHT: f32 = 130.0;
+fn dm_call_panel_height(state: &AppState, available: f32) -> f32 {
+    let share = if state.watching_stream.is_some() { 0.62 } else { 0.42 };
+    (available * share).max(if state.watching_stream.is_some() { 380.0 } else { 300.0 }).min(available - 120.0).max(260.0)
+}
 
 #[cfg(feature = "screenshare")]
-fn draw_server_call_fullscreen(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
-    let Some((Some(guild_id), channel_id)) = state.connected_voice_channel.clone() else { return };
+fn draw_call_stage(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, embedded: bool) {
+    let Some((guild_id, channel_id)) = state.connected_voice_channel.clone() else { return };
+    let dm_name = guild_id.is_none().then(|| state.dm_channels.iter().find(|dm| dm.id == channel_id).map(|dm| state.dm_title(dm))).flatten();
     let stream_key = state.watching_stream.clone();
     let owner_id = stream_key.as_ref().and_then(|key| state.active_streams.iter().find_map(|(user_id, active_key)| (active_key == key).then(|| user_id.clone())));
     let owner_name = owner_id.as_ref().and_then(|id| state.known_users.get(id))
         .map(|user| user.global_name.clone().unwrap_or_else(|| user.username.clone()))
         .or(owner_id.clone())
         .unwrap_or_else(|| "No stream selected".into());
-    let channel_name = state.connected_voice_channel_name().unwrap_or_else(|| channel_id.clone());
+    let call_name = dm_name.clone().or_else(|| state.connected_voice_channel_name()).unwrap_or_else(|| channel_id.clone());
     let [width, height] = ui.window_size();
-    let origin = ui.cursor_screen_pos();
-    let draw_list = ui.get_window_draw_list();
-    draw_list.add_rect(origin, [origin[0] + width, origin[1] + height], [0.035, 0.035, 0.045, 1.0]).filled(true).build();
-    drop(draw_list);
+    let origin = ui.window_pos();
+    ui.get_window_draw_list().add_rect(origin, [origin[0] + width, origin[1] + height], [0.035, 0.035, 0.045, 1.0]).filled(true).build();
 
     ui.set_cursor_pos([20.0, 14.0]);
-    ui.text_colored([0.92, 0.92, 0.96, 1.0], if stream_key.is_some() { format!("{channel_name}  ·  Live: {owner_name}") } else { format!("Voice channel  ·  {channel_name}") });
-    let button_width = if stream_key.is_some() { 330.0 } else { 120.0 };
-    ui.set_cursor_pos([(width - button_width).max(12.0), 10.0]);
+    let kind = if dm_name.is_some() { "Call" } else { "Voice channel" };
+    ui.text_colored([0.92, 0.92, 0.96, 1.0], if stream_key.is_some() { format!("{call_name}  ·  Live: {owner_name}") } else { format!("{kind}  ·  {call_name}") });
+    let mut buttons: Vec<&str> = Vec::new();
     if stream_key.is_some() {
-        if ui.small_button(if state.server_call_focus_stream { "Show tiles##server_call" } else { "Expand stream##server_call" }) {
-            state.server_call_focus_stream = !state.server_call_focus_stream;
-        }
-        ui.same_line();
+        buttons.push(if state.server_call_focus_stream { "Show tiles" } else { "Expand stream" });
     }
-    if ui.small_button("Return to chat##server_call") {
-        state.server_call_minimized = true;
+    buttons.push(match (dm_name.is_some(), embedded) {
+        (true, true) => "Expand call",
+        (true, false) => "Collapse call",
+        (false, _) => "Return to chat",
+    });
+    if stream_key.is_some() {
+        buttons.push("Stop watching");
     }
-    if let Some(stream_key) = stream_key {
-        ui.same_line();
-        if ui.small_button("Stop watching##server_call") {
-            let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
-            state.unwatching_stream = Some(stream_key);
-            state.watching_stream = None;
-            state.server_call_minimized = false;
+    let style = ui.clone_style();
+    let buttons_w = buttons.iter().map(|label| ui.calc_text_size(label)[0] + style.frame_padding[0] * 2.0).sum::<f32>()
+        + style.item_spacing[0] * buttons.len().saturating_sub(1) as f32;
+    ui.set_cursor_pos([(width - buttons_w - 16.0).max(12.0), 10.0]);
+    for (index, label) in buttons.iter().enumerate() {
+        if index > 0 { ui.same_line(); }
+        if !ui.small_button(format!("{label}##call_stage")) { continue; }
+        match *label {
+            "Show tiles" | "Expand stream" => state.server_call_focus_stream = !state.server_call_focus_stream,
+            "Expand call" => state.server_call_minimized = false,
+            "Collapse call" | "Return to chat" => state.server_call_minimized = true,
+            _ => {
+                if let Some(key) = stream_key.clone() {
+                    stop_watching_stream(state, cmd_tx, key);
+                }
+            }
         }
     }
 
-    let stage_top = 48.0;
-    let stage_bottom = if state.server_call_focus_stream { height - 108.0 } else { height - 230.0 };
-    let stage_width = if state.server_call_focus_stream { width - 32.0 } else { width * 0.92 };
-    let stage_width = stage_width.clamp(1.0, (width - 48.0).max(1.0));
-    let stage_height = (stage_bottom - stage_top).max(100.0);
-    let remote_frame = owner_id.as_deref().and_then(|id| textures.live_video(id));
-    let local_preview = state.current_user.as_ref()
-        .filter(|user| owner_id.as_deref() == Some(user.id.as_str()) && state.screen_sharing)
-        .and_then(|user| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)));
-    let showing_local_preview = remote_frame.is_none() && local_preview.is_some();
-    let frame = remote_frame.or(local_preview);
-    if let Some((texture_id, source)) = frame {
-        let scale = (stage_width / source[0].max(1.0)).min(stage_height / source[1].max(1.0));
-        let size = [source[0] * scale, source[1] * scale];
-        let pos = [(width - size[0]) * 0.5, stage_top + (stage_height - size[1]) * 0.5];
-        ui.set_cursor_pos(pos);
-        imgui::Image::new(texture_id, size).build(ui);
-        if showing_local_preview {
-            ui.set_cursor_pos([20.0, stage_top + 8.0]);
-            ui.text_colored([0.7, 0.8, 0.85, 1.0], "Preparing your local preview");
-        }
-    } else if state.watching_stream.is_some() {
-        let text = "Connecting to the stream…";
-        let text_size = ui.calc_text_size(text);
-        ui.set_cursor_pos([(width - text_size[0]) * 0.5, stage_top + stage_height * 0.5]);
-        ui.text_disabled(text);
-    }
-
-    let participants: Vec<(rustcord_client::models::User, bool)> = state.members_in_voice_channel(&guild_id, &channel_id)
-        .into_iter()
-        .filter_map(|voice_state| {
-            let user = state.known_users.get(&voice_state.user_id)
-                .or_else(|| voice_state.member.as_ref().and_then(|m| m.user.as_ref()))
-                .or_else(|| state.current_user.as_ref().filter(|u| u.id == voice_state.user_id))?;
-            Some((user.clone(), state.voice_speaking_users.contains(&voice_state.user_id)))
-        })
-        .collect();
-    if state.watching_stream.is_some() {
-        if !state.server_call_focus_stream {
-            draw_call_participant_tiles(ui, state, textures, cmd_tx, &participants, origin, width, height, false);
+    let top = 44.0;
+    let bottom = height - 104.0;
+    let participants = call_participants(state);
+    if let Some(stream_key) = state.watching_stream.clone() {
+        let strip = !state.server_call_focus_stream && bottom - top >= 360.0;
+        let stage_bottom = if strip { bottom - 118.0 - 12.0 } else { bottom };
+        let stage = [16.0, top, width - 16.0, stage_bottom];
+        draw_stream_stage(ui, state, textures, cmd_tx, &stream_key, owner_id.as_deref(), stage);
+        if strip {
+            draw_call_participant_tiles(ui, state, textures, cmd_tx, &participants, bottom - 118.0, bottom, false);
         }
     } else {
-        if !state.active_streams.is_empty() {
-            ui.set_cursor_pos([20.0, 51.0]);
-            ui.text_disabled("Right-click a LIVE participant in the channel list to watch their stream.");
-        }
-        draw_call_participant_tiles(ui, state, textures, cmd_tx, &participants, origin, width, height, true);
+        draw_call_participant_tiles(ui, state, textures, cmd_tx, &participants, top, bottom, true);
     }
 
-    draw_server_call_controls(ui, state, textures, cmd_tx, Some(guild_id), &channel_id);
+    draw_server_call_controls(ui, state, textures, cmd_tx, guild_id, &channel_id);
+}
+
+#[cfg(feature = "screenshare")]
+const STREAM_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[cfg(feature = "screenshare")]
+fn draw_stream_stage(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, stream_key: &str, owner_id: Option<&str>, rect: [f32; 4]) {
+    let origin = ui.window_pos();
+    let [left, top, right, bottom] = rect;
+    let (stage_w, stage_h) = ((right - left).max(1.0), (bottom - top).max(1.0));
+    let remote_frame = owner_id.and_then(|id| textures.live_video(id));
+    let local_preview = state.current_user.as_ref()
+        .filter(|user| owner_id == Some(user.id.as_str()) && state.screen_sharing)
+        .and_then(|user| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)));
+    let showing_local_preview = remote_frame.is_none() && local_preview.is_some();
+    let Some((texture_id, source)) = remote_frame.or(local_preview) else {
+        let timed_out = state.watching_since.is_some_and(|since| since.elapsed() > STREAM_START_TIMEOUT);
+        let text = if timed_out { "The stream didn't start." } else { "Connecting to the stream…" };
+        let text_size = ui.calc_text_size(text);
+        ui.set_cursor_pos([left + (stage_w - text_size[0]) * 0.5, top + stage_h * 0.5 - text_size[1]]);
+        ui.text_disabled(text);
+        if timed_out {
+            let label = "Try again##stream_retry";
+            let button_w = ui.calc_text_size("Try again")[0] + 24.0;
+            ui.set_cursor_pos([left + (stage_w - button_w) * 0.5, top + stage_h * 0.5 + 8.0]);
+            if ui.button_with_size(label, [button_w, 0.0]) {
+                watch_stream(state, cmd_tx, stream_key.to_string());
+            }
+        }
+        return;
+    };
+    let scale = (stage_w / source[0].max(1.0)).min(stage_h / source[1].max(1.0));
+    let size = [source[0] * scale, source[1] * scale];
+    let min = [origin[0] + left + (stage_w - size[0]) * 0.5, origin[1] + top + (stage_h - size[1]) * 0.5];
+    let max = [min[0] + size[0], min[1] + size[1]];
+    let hovered = state.stream_zoom.interact(ui, min, max);
+    let (uv_min, uv_max) = state.stream_zoom.uv();
+    let dl = ui.get_window_draw_list();
+    dl.add_image(texture_id, min, max).uv_min(uv_min).uv_max(uv_max).build();
+    if showing_local_preview {
+        dl.add_text([min[0] + 10.0, min[1] + 8.0], [0.7, 0.8, 0.85, 1.0], "Your stream (local preview)");
+    }
+    if state.stream_zoom.zoomed() || hovered {
+        let label = if state.stream_zoom.zoomed() {
+            format!("{:.1}×  ·  drag to move  ·  double-click to reset", state.stream_zoom.scale)
+        } else {
+            "Scroll or double-click to zoom".to_string()
+        };
+        let label_size = ui.calc_text_size(&label);
+        let pill_min = [max[0] - label_size[0] - 26.0, max[1] - label_size[1] - 22.0];
+        dl.add_rect(pill_min, [max[0] - 10.0, max[1] - 10.0], [0.0, 0.0, 0.0, 0.6]).filled(true).rounding(8.0).build();
+        dl.add_text([pill_min[0] + 8.0, pill_min[1] + 6.0], [0.92, 0.92, 0.96, 1.0], &label);
+    }
 }
 
 #[cfg(feature = "screenshare")]
@@ -7142,6 +7426,10 @@ fn draw_watched_stream_panel(ui: &Ui, state: &mut AppState, textures: &mut Textu
     panel_height
 }
 
+#[cfg(not(feature = "screenshare"))]
+const CALL_PANEL_HEIGHT: f32 = 130.0;
+
+#[cfg(not(feature = "screenshare"))]
 fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache, cmd_tx: &UnboundedSender<UiCommand>, dm: &rustcord_client::models::Channel) {
     const SIZE: f32 = 56.0;
     const GAP: f32 = 16.0;
@@ -7158,53 +7446,14 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
             Some((user.clone(), state.voice_speaking_users.contains(&vs.user_id)))
         })
         .collect();
-    let in_call = state.connected_voice_channel.as_ref().is_some_and(|(_, cid)| *cid == channel_id);
-    #[cfg(feature = "screenshare")]
-    let live_videos: Vec<_> = members
-        .iter()
-        .map(|(user, _)| textures.live_video(&user.id)
-            .or_else(|| textures.live_video(&crate::app_state::camera_video_key(&user.id)))
-            .or_else(|| state.current_user.as_ref().filter(|me| me.id == user.id)
-                .and_then(|_| textures.live_video(&crate::app_state::screen_preview_video_key(&user.id)))))
-        .collect();
     ui.child_window("dm_call_panel").size([0.0, CALL_PANEL_HEIGHT]).build(|| {
         let width = ui.window_size()[0];
-        #[cfg(feature = "screenshare")]
-        let row_w = live_videos.iter().map(|live| if live.is_some() { 180.0 } else { SIZE }).sum::<f32>()
-            + members.len().saturating_sub(1) as f32 * GAP;
-        #[cfg(not(feature = "screenshare"))]
         let row_w = members.len() as f32 * SIZE + members.len().saturating_sub(1) as f32 * GAP;
         ui.set_cursor_pos([(width - row_w) / 2.0, 12.0]);
-        let mut row_height = SIZE;
         for (member_index, (user, speaking)) in members.iter().enumerate() {
             let p = ui.cursor_screen_pos();
-            #[cfg(feature = "screenshare")]
-            let live = live_videos.get(member_index).and_then(|v| *v);
-            #[cfg(feature = "screenshare")]
-            let tile_size = if let Some((_, source_size)) = live {
-                let scale = (180.0 / source_size[0].max(1.0)).min(112.0 / source_size[1].max(1.0));
-                [source_size[0] * scale, source_size[1] * scale]
-            } else {
-                [SIZE, SIZE]
-            };
-            #[cfg(not(feature = "screenshare"))]
-            let tile_size = [SIZE, SIZE];
-            row_height = row_height.max(tile_size[1]);
-            let center = [p[0] + tile_size[0] / 2.0, p[1] + tile_size[1] / 2.0];
+            let center = [p[0] + SIZE / 2.0, p[1] + SIZE / 2.0];
             let url = rustcord_client::cdn::avatar_url(user, 128).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(user));
-            #[cfg(feature = "screenshare")]
-            if let Some((texture_id, _)) = live {
-                imgui::Image::new(texture_id, tile_size).build(ui);
-            } else {
-                match textures.get(&url) {
-                    Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
-                    None => {
-                        textures.request(&url, cmd_tx);
-                        ui.dummy([SIZE, SIZE]);
-                    }
-                }
-            }
-            #[cfg(not(feature = "screenshare"))]
             match textures.get(&url) {
                 Some((texture_id, _)) => draw_circular_image(ui, texture_id, [SIZE, SIZE]),
                 None => {
@@ -7236,28 +7485,10 @@ fn draw_dm_call_panel(ui: &Ui, state: &mut AppState, textures: &mut TextureCache
             if ui.selectable("Profile") {
                 state.profile_popout = known;
             }
-            #[cfg(feature = "screenshare")]
-            if let Some(stream_key) = state.active_streams.get(&member_id).cloned() {
-                if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
-                    if ui.selectable("Stop watching") {
-                        let _ = cmd_tx.send(UiCommand::StopWatchingStream { stream_key: stream_key.clone() });
-                        state.unwatching_stream = Some(stream_key.clone());
-                        state.watching_stream = None;
-                        state.server_call_minimized = false;
-                    }
-                } else if ui.selectable("Watch screen share") {
-                    let _ = cmd_tx.send(UiCommand::WatchStream { stream_key: stream_key.clone() });
-                    state.watching_stream = Some(stream_key);
-                    state.server_call_minimized = false;
-                    state.server_call_focus_stream = false;
-                }
-            }
             draw_user_volume_controls(ui, state, cmd_tx, &member_id);
         });
-        if in_call {
-            ui.set_cursor_pos([0.0, 12.0 + row_height + 18.0]);
-            draw_voice_controls(ui, state, textures, cmd_tx, None, &channel_id, true);
-        }
+        ui.set_cursor_pos([0.0, 12.0 + SIZE + 18.0]);
+        draw_voice_controls(ui, state, textures, cmd_tx, None, &channel_id, true);
     });
 }
 
@@ -7285,7 +7516,7 @@ fn draw_channel_header(
             let avatar = dm.recipients.first().map(|u| {
                 rustcord_client::cdn::avatar_url(u, 64).unwrap_or_else(|| rustcord_client::cdn::default_avatar_url(u))
             });
-            (AppState::dm_display_name(dm), None, avatar)
+            (state.dm_title(dm), None, avatar)
         }
         (None, Some(channel)) => (
             match channel.parent_id.as_deref().filter(|_| channel.is_thread()).and_then(|id| state.find_guild_channel(id)) {
@@ -7923,7 +8154,7 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             ui.text_disabled("No friends found.");
         }
         for user in &friends {
-            let name = user.global_name.clone().unwrap_or_else(|| user.username.clone());
+            let name = state.person_name(user);
             let status = state.presence_for(&user.id);
             let platform = state.platform_for(&user.id).map(str::to_string);
             let activity = state.activity_for(&user.id);
@@ -7933,7 +8164,30 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             } else if result.row_clicked {
                 let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
             }
+            if result.right_clicked {
+                state.context_friend = Some(user.clone());
+                ui.open_popup("friend_context");
+            }
         }
+        let mut edit_nickname = None;
+        ui.popup("friend_context", || {
+            let Some(user) = state.context_friend.clone() else { return };
+            ui.text_disabled(state.person_name(&user));
+            ui.separator();
+            if ui.selectable("Profile") {
+                state.profile_popout = Some(user.clone());
+            }
+            if ui.selectable("Message") {
+                let _ = cmd_tx.send(UiCommand::OpenDmWithUser { user_id: user.id.clone() });
+            }
+            if ui.selectable("Set Friend Nickname") {
+                edit_nickname = Some(user.id.clone());
+            }
+        });
+        if let Some(user_id) = edit_nickname {
+            open_friend_nickname_editor(ui, state, &user_id);
+        }
+        draw_friend_nickname_editor(ui, state, cmd_tx);
         return;
     }
 
@@ -7953,9 +8207,15 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         .map(|dm| {
             let recipient = (dm.kind == rustcord_client::models::ChannelType::Dm).then(|| dm.recipients.first().cloned()).flatten();
             let icon = dm.icon.as_deref().map(|hash| rustcord_client::cdn::channel_icon_url(&dm.id, hash, 64));
-            (dm.id.clone(), AppState::dm_display_name(dm), recipient, dm.last_message_id.clone(), dm.recipients.len() + 1, icon)
+            (dm.id.clone(), state.dm_title(dm), recipient, dm.last_message_id.clone(), dm.recipients.len() + 1, icon)
         })
         .collect();
+    if group.is_none() {
+        draw_message_requests(ui, state, cmd_tx, textures);
+        if state.show_message_requests {
+            return;
+        }
+    }
     if dms.is_empty() {
         ui.text_disabled(if group.is_some() { "Empty group. Right-click a DM to add it." } else { "No direct messages." });
     }
@@ -7999,8 +8259,20 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         }
     }
 
+    let mut edit_nickname = None;
     ui.popup("dm_context", || {
         let Some(channel_id) = state.context_dm.clone() else { return };
+        let friend = state.dm_channels.iter()
+            .find(|dm| dm.id == channel_id && dm.kind == rustcord_client::models::ChannelType::Dm)
+            .and_then(|dm| dm.recipients.first())
+            .filter(|user| state.relationships.iter().any(|r| r.user.id == user.id && r.kind == rustcord_client::models::RelationshipType::Friend))
+            .map(|user| user.id.clone());
+        if let Some(user_id) = friend {
+            if ui.selectable("Set Friend Nickname") {
+                edit_nickname = Some(user_id);
+            }
+            ui.separator();
+        }
         if let Some(mute) = mute_menu(ui, "conversation", state.channel_mute_is_direct(None, &channel_id, chrono::Utc::now())) {
             let fields = crate::app_state::mute_patch(mute.is_some(), mute.unwrap_or(-1), chrono::Utc::now());
             let patch = rustcord_client::models::channel_override_patch(&channel_id, fields);
@@ -8026,6 +8298,102 @@ fn draw_dm_sidebar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
             state.save_groups();
         }
     });
+    if let Some(user_id) = edit_nickname {
+        open_friend_nickname_editor(ui, state, &user_id);
+    }
+    draw_friend_nickname_editor(ui, state, cmd_tx);
+}
+
+fn open_friend_nickname_editor(ui: &Ui, state: &mut AppState, user_id: &str) {
+    let current = state.friend_nickname(user_id).unwrap_or_default().to_string();
+    state.friend_nickname_edit = Some((user_id.to_string(), current));
+    ui.open_popup("Friend Nickname##edit");
+}
+
+fn draw_friend_nickname_editor(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    let Some(_modal) = ui.modal_popup_config("Friend Nickname##edit").always_auto_resize(true).begin_popup() else { return };
+    let Some((user_id, mut buffer)) = state.friend_nickname_edit.clone() else {
+        ui.close_current_popup();
+        return;
+    };
+    let name = state.relationships.iter().find(|r| r.user.id == user_id).map(|r| r.user.display_name().to_string()).unwrap_or_default();
+    ui.text(format!("Nickname for {name}"));
+    ui.text_colored(state.theme.text_muted, "Only you can see it. Leave it empty to remove it.");
+    if ui.is_window_appearing() {
+        ui.set_keyboard_focus_here();
+    }
+    ui.set_next_item_width(280.0);
+    let submitted = ui.input_text("##friend_nickname", &mut buffer).enter_returns_true(true).build();
+    let mut close = false;
+    if ui.button("Cancel") || ui.is_key_pressed(imgui::Key::Escape) {
+        close = true;
+    }
+    ui.same_line();
+    if ui.button("Save") || submitted {
+        let nickname = Some(buffer.trim().to_string()).filter(|n| !n.is_empty());
+        if let Some(relationship) = state.relationships.iter_mut().find(|r| r.user.id == user_id) {
+            relationship.nickname = nickname.clone();
+        }
+        let _ = cmd_tx.send(UiCommand::SetFriendNickname { user_id: user_id.clone(), nickname });
+        close = true;
+    }
+    if close {
+        state.friend_nickname_edit = None;
+        ui.close_current_popup();
+    } else {
+        state.friend_nickname_edit = Some((user_id, buffer));
+    }
+}
+
+fn draw_message_requests(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
+    let requests: Vec<(String, String, Option<rustcord_client::models::User>, bool)> = state.message_requests().into_iter()
+        .map(|dm| (dm.id.clone(), state.dm_title(dm), dm.recipients.first().cloned(), dm.is_spam))
+        .collect();
+    if requests.is_empty() {
+        state.show_message_requests = false;
+        return;
+    }
+    let label = if state.show_message_requests { "< Back to DMs".to_string() } else { format!("Message Requests  ({})", requests.len()) };
+    if ui.selectable(&label) {
+        state.show_message_requests = !state.show_message_requests;
+    }
+    ui.separator();
+    if !state.show_message_requests {
+        return;
+    }
+    ui.text_wrapped("People you don't share a server or friendship with. They aren't told if you ignore them.");
+    ui.dummy([0.0, 4.0]);
+    for (channel_id, name, user, spam) in requests {
+        let _id = ui.push_id(&channel_id);
+        let is_selected = state.selected_channel.as_deref() == Some(channel_id.as_str());
+        let clicked = match &user {
+            Some(user) => {
+                let status = state.presence_for(&user.id);
+                let note = if spam { Some("Possible spam") } else { None };
+                draw_user_row(ui, cmd_tx, textures, user, &name, is_selected, status, None, note, None, state.theme.panel, None).row_clicked
+            }
+            None => ui.selectable_config(&name).selected(is_selected).build(),
+        };
+        if clicked {
+            state.open_dm(&channel_id, cmd_tx);
+        }
+        if ui.small_button("Accept") {
+            if let Some(dm) = state.dm_channels.iter_mut().find(|dm| dm.id == channel_id) {
+                dm.is_message_request = false;
+                dm.is_spam = false;
+            }
+            let _ = cmd_tx.send(UiCommand::AnswerMessageRequest { channel_id: channel_id.clone(), accept: true });
+        }
+        ui.same_line();
+        if ui.small_button("Ignore") {
+            state.dm_channels.retain(|dm| dm.id != channel_id);
+            if is_selected {
+                state.selected_channel = None;
+            }
+            let _ = cmd_tx.send(UiCommand::AnswerMessageRequest { channel_id: channel_id.clone(), accept: false });
+        }
+        ui.dummy([0.0, 4.0]);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9229,6 +9597,36 @@ fn draw_settings_notifications(ui: &Ui, state: &mut AppState) {
         "There's no system tray here, so closing the window quits. On GNOME, the AppIndicator extension adds one."
     };
     ui.text_colored(state.theme.text_muted, note);
+    ui.dummy([0.0, 12.0]);
+    draw_settings_sounds(ui, state);
+}
+
+fn draw_settings_sounds(ui: &Ui, state: &mut AppState) {
+    use rustcord_client::sounds::Sound;
+    ui.text_colored(state.theme.text_muted, "Sounds");
+    let mut percent = state.sound_volume * 100.0;
+    ui.set_next_item_width(-1.0);
+    if ui.slider_config("##sound_volume", 0.0, 200.0).display_format("Volume %.0f%%").build(&mut percent) {
+        state.sound_volume = percent / 100.0;
+        rustcord_client::sounds::set_volume(state.sound_volume);
+    }
+    if ui.is_item_deactivated_after_edit() {
+        rustcord_client::sounds::play(Sound::Message);
+        persist_settings(state);
+    }
+    let groups: [(&str, fn(&mut AppState) -> &mut bool, Sound); 3] = [
+        ("Joining, leaving, mute and deafen", |state| &mut state.call_sounds, Sound::Join),
+        ("Streams starting and stopping, and viewers", |state| &mut state.stream_sounds, Sound::StreamStart),
+        ("Messages and mentions", |state| &mut state.message_sounds, Sound::Mention),
+    ];
+    for (label, field, preview) in groups {
+        if ui.checkbox(label, field(state)) {
+            if *field(state) {
+                rustcord_client::sounds::play(preview);
+            }
+            persist_settings(state);
+        }
+    }
 }
 
 fn draw_settings_activity(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, textures: &mut TextureCache) {
@@ -9810,6 +10208,14 @@ mod link_tests {
     use super::*;
 
     #[test]
+    fn call_elapsed_shows_hours_only_once_they_pass() {
+        assert_eq!(format_call_elapsed(1_000, 1_000), "00:00");
+        assert_eq!(format_call_elapsed(1_000 + 23 * 60 + 5, 1_000), "23:05");
+        assert_eq!(format_call_elapsed(1_000 + 3_725, 1_000), "1:02:05");
+        assert_eq!(format_call_elapsed(10, 1_000), "00:00");
+    }
+
+    #[test]
     fn guild_acronyms_take_each_words_first_letter() {
         assert_eq!(guild_acronym("My Cool Server"), "MCS");
         assert_eq!(guild_acronym("rustcord"), "r");
@@ -10040,7 +10446,7 @@ fn search_scope_for(state: &AppState) -> Option<(crate::backend::SearchScope, St
         .dm_channels
         .iter()
         .find(|c| c.id == channel_id)
-        .map(AppState::dm_display_name)
+        .map(|dm| state.dm_title(dm))
         .unwrap_or_else(|| "this conversation".to_string());
     Some((SearchScope::Channel { channel_id }, name))
 }

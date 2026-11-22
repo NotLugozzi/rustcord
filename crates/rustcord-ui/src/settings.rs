@@ -16,6 +16,10 @@ pub struct Settings {
     pub self_deaf: bool,
     pub close_to_tray: Option<bool>,
     pub share_game: Option<bool>,
+    pub sound_volume: Option<f32>,
+    pub call_sounds: Option<bool>,
+    pub stream_sounds: Option<bool>,
+    pub message_sounds: Option<bool>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
