@@ -10,6 +10,64 @@ const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
 const ENTITY_BASE_MS: i64 = 1_577_836_800_000;
 const ME: &str = "me";
 
+#[cfg_attr(not(feature = "screenshare"), allow(dead_code))]
+pub struct Feed {
+    pub key: String,
+    pub frame: image::RgbaImage,
+}
+
+#[cfg(feature = "screenshare")]
+fn call_feeds(call: &Call, b: &Builder, state: &mut AppState) -> Result<Vec<Feed>, String> {
+    let mut feeds = Vec::new();
+    for (index, key) in call.cameras.iter().enumerate() {
+        feeds.push(Feed { key: crate::app_state::camera_video_key(&b.user_id(key)?), frame: camera_frame(index) });
+    }
+    if let Some(key) = &call.watching {
+        let user_id = b.user_id(key)?;
+        let stream_key = state.active_streams.get(&user_id).cloned().ok_or_else(|| format!("call.watching \"{key}\" is not streaming"))?;
+        state.watching_stream = Some(stream_key);
+        feeds.push(Feed { key: user_id, frame: stream_frame() });
+    }
+    Ok(feeds)
+}
+
+#[cfg(not(feature = "screenshare"))]
+fn call_feeds(_: &Call, _: &Builder, _: &mut AppState) -> Result<Vec<Feed>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(feature = "screenshare")]
+fn camera_frame(index: usize) -> image::RgbaImage {
+    let palette = [[88u8, 101, 242], [235, 69, 158], [87, 242, 135], [254, 231, 92], [237, 66, 69]];
+    let tint = palette[index % palette.len()];
+    image::RgbaImage::from_fn(640, 360, |x, y| {
+        let (dx, dy) = (x as f32 - 320.0, y as f32 - 170.0);
+        let head = dx * dx + dy * dy < 70.0 * 70.0;
+        let body = y > 250 && (x as f32 - 320.0).abs() < 150.0 - (360.0 - y as f32) * 0.4;
+        let shade = 0.35 + 0.4 * (y as f32 / 360.0);
+        let [r, g, b] = if head || body { [230, 200, 180] } else { tint.map(|c| (c as f32 * shade) as u8) };
+        image::Rgba([r, g, b, 255])
+    })
+}
+
+#[cfg(feature = "screenshare")]
+fn stream_frame() -> image::RgbaImage {
+    image::RgbaImage::from_fn(1280, 720, |x, y| {
+        let window = (120..760).contains(&x) && (90..560).contains(&y);
+        let sidebar = (800..1180).contains(&x) && (90..640).contains(&y);
+        let title = window && y < 120 || sidebar && y < 120;
+        let line = window && y > 150 && (y - 150) % 36 < 14 && x < 200 + (y * 7 % 480);
+        let [r, g, b] = match () {
+            _ if title => [60, 63, 70],
+            _ if line => [120, 170, 255],
+            _ if window => [30, 31, 34],
+            _ if sidebar => [43, 45, 49],
+            _ => [18 + (y / 24) as u8, 22, 40 + (x / 32) as u8],
+        };
+        image::Rgba([r, g, b, 255])
+    })
+}
+
 pub enum Source {
     Bundled,
     File(PathBuf),
@@ -102,6 +160,7 @@ struct Person {
     #[serde(default)]
     bot: bool,
     friend: Option<bool>,
+    nickname: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -180,6 +239,10 @@ struct ChannelDef {
     #[serde(default)]
     streaming: Vec<String>,
     #[serde(default)]
+    cameras: Vec<String>,
+    started_minutes_ago: Option<u64>,
+    status: Option<String>,
+    #[serde(default)]
     messages: Vec<MessageDef>,
 }
 
@@ -188,6 +251,8 @@ struct ChannelDef {
 struct Dm {
     with: Vec<String>,
     name: Option<String>,
+    #[serde(default)]
+    request: bool,
     #[serde(default)]
     unread: bool,
     #[serde(default)]
@@ -230,11 +295,18 @@ struct ImageDef {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(not(feature = "screenshare"), allow(dead_code))]
 struct Call {
-    server: String,
-    channel: String,
+    server: Option<String>,
+    channel: Option<String>,
+    dm: Option<String>,
     #[serde(default)]
     speaking: Vec<String>,
+    #[serde(default)]
+    cameras: Vec<String>,
+    #[serde(default)]
+    streaming: Vec<String>,
+    watching: Option<String>,
     #[serde(default)]
     minutes_in: u64,
     #[serde(default = "yes")]
@@ -374,7 +446,7 @@ fn read_up_to(state: &mut AppState, channel_id: &str, messages: &[Message], unre
     state.last_read_message_id.insert(channel_id.to_string(), seen);
 }
 
-pub fn apply(data: DemoFile, state: &mut AppState) -> Result<(), String> {
+pub fn apply(data: DemoFile, state: &mut AppState) -> Result<Vec<Feed>, String> {
     let mut b = Builder { next_entity: 0, next_message: 0, now_ms: chrono::Utc::now().timestamp_millis(), users: HashMap::new() };
     let me_id = b.id();
     let me = person_user(&data.me, me_id)?;
@@ -390,7 +462,7 @@ pub fn apply(data: DemoFile, state: &mut AppState) -> Result<(), String> {
         let user = person_user(person, id)?;
         presences.push(json!({ "user": { "id": user.id }, "status": person.status.presence(), "activities": activities(person) }));
         if person.friend.unwrap_or(!person.bot) {
-            relationships.push(json!({ "id": user.id, "type": 1, "user": user }));
+            relationships.push(json!({ "id": user.id, "type": 1, "user": user, "nickname": person.nickname }));
         }
         b.users.insert(key, user);
     }
@@ -481,10 +553,17 @@ pub fn apply(data: DemoFile, state: &mut AppState) -> Result<(), String> {
                         "self_mute": def.muted.contains(key) || def.deafened.contains(key),
                         "self_deaf": def.deafened.contains(key),
                         "self_stream": def.streaming.contains(key),
+                        "self_video": def.cameras.contains(key),
                         "member": { "nick": null, "user": user },
                     }))
                     .map_err(|e| format!("bad demo voice state: {e}"))?,
                 );
+            }
+            if let Some(minutes) = def.started_minutes_ago {
+                state.voice_started.insert(channel_id.clone(), (b.now_ms / 1000) as u64 - minutes * 60);
+            }
+            if let Some(status) = &def.status {
+                state.voice_status.insert(channel_id.clone(), status.clone());
             }
             read_up_to(state, &channel_id, &messages, def.unread, def.mentions);
             if !messages.is_empty() {
@@ -506,7 +585,7 @@ pub fn apply(data: DemoFile, state: &mut AppState) -> Result<(), String> {
         let messages = b.messages(&channel_id, None, &dm.messages)?;
         let kind = if recipients.len() == 1 { 1 } else { 3 };
         state.dm_channels.push(
-            serde_json::from_value(json!({ "id": channel_id, "type": kind, "name": dm.name, "recipients": recipients, "last_message_id": messages.last().map(|m| m.id.clone()) }))
+            serde_json::from_value(json!({ "id": channel_id, "type": kind, "name": dm.name, "recipients": recipients, "last_message_id": messages.last().map(|m| m.id.clone()), "is_message_request": dm.request }))
                 .map_err(|e| format!("bad demo dm: {e}"))?,
         );
         read_up_to(state, &channel_id, &messages, dm.unread, dm.mentions);
@@ -516,30 +595,49 @@ pub fn apply(data: DemoFile, state: &mut AppState) -> Result<(), String> {
         dm_ids.insert(dm.name.clone().unwrap_or_else(|| dm.with.join(",")), channel_id);
     }
 
+    let mut feeds = Vec::new();
     if let Some(call) = &data.call {
-        let (guild_id, channel_id) = channel_ids
-            .get(&(call.server.clone(), call.channel.clone()))
-            .cloned()
-            .ok_or_else(|| format!("call refers to unknown channel \"{}\" in \"{}\"", call.channel, call.server))?;
-        let def = data.servers.iter().find(|s| s.name == call.server).and_then(|s| s.channels.iter().find(|c| c.name == call.channel));
-        state.self_deafened = def.is_some_and(|d| d.deafened.iter().any(|k| k == ME));
-        state.self_muted = state.self_deafened || def.is_some_and(|d| d.muted.iter().any(|k| k == ME));
-        state.apply_voice_state(
-            serde_json::from_value(json!({
-                "guild_id": guild_id,
-                "channel_id": channel_id,
-                "user_id": me.id,
-                "session_id": "demo",
-                "self_mute": state.self_muted,
-                "self_deaf": state.self_deafened,
-                "member": { "nick": null, "user": me },
-            }))
-            .map_err(|e| format!("bad demo voice state: {e}"))?,
-        );
+        let (guild_id, channel_id, others, muted, deafened) = match (&call.dm, &call.server, &call.channel) {
+            (Some(dm), _, _) => {
+                let channel_id = dm_ids.get(dm).cloned().ok_or_else(|| format!("call.dm \"{dm}\" matches no dm (use the user key, or the group name)"))?;
+                let others = data.dms.iter().find(|d| d.name.clone().unwrap_or_else(|| d.with.join(",")) == *dm).map(|d| d.with.clone()).unwrap_or_default();
+                (None, channel_id, others, false, false)
+            }
+            (None, Some(server), Some(channel)) => {
+                let (guild_id, channel_id) = channel_ids
+                    .get(&(server.clone(), channel.clone()))
+                    .cloned()
+                    .ok_or_else(|| format!("call refers to unknown channel \"{channel}\" in \"{server}\""))?;
+                let def = data.servers.iter().find(|s| s.name == *server).and_then(|s| s.channels.iter().find(|c| c.name == *channel));
+                let deafened = def.is_some_and(|d| d.deafened.iter().any(|k| k == ME));
+                let muted = deafened || def.is_some_and(|d| d.muted.iter().any(|k| k == ME));
+                (Some(guild_id), channel_id, Vec::new(), muted, deafened)
+            }
+            _ => return Err("call needs either dm, or server and channel".into()),
+        };
+        state.self_deafened = deafened;
+        state.self_muted = muted;
+        for key in others.iter().map(String::as_str).chain([ME]) {
+            let user = b.user(key)?.clone();
+            state.apply_voice_state(
+                serde_json::from_value(json!({
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "user_id": user.id,
+                    "session_id": "demo",
+                    "self_mute": key == ME && state.self_muted,
+                    "self_deaf": key == ME && state.self_deafened,
+                    "self_stream": key != ME && call.streaming.iter().any(|k| k == key),
+                    "member": { "nick": null, "user": user },
+                }))
+                .map_err(|e| format!("bad demo voice state: {e}"))?,
+            );
+        }
         for key in &call.speaking {
             state.voice_speaking_users.insert(b.user_id(key)?);
         }
-        state.connected_voice_channel = Some((Some(guild_id), channel_id));
+        feeds = call_feeds(call, &b, state)?;
+        state.connected_voice_channel = Some((guild_id, channel_id));
         state.voice_joined_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(call.minutes_in * 60)).or_else(|| Some(std::time::Instant::now()));
         state.server_call_minimized = !call.open;
     }
@@ -565,7 +663,7 @@ pub fn apply(data: DemoFile, state: &mut AppState) -> Result<(), String> {
     state.logged_in = true;
     state.gateway_connected = true;
     state.login_status = None;
-    Ok(())
+    Ok(feeds)
 }
 
 #[cfg(test)]
@@ -578,7 +676,8 @@ mod tests {
         apply(load(&Source::Bundled).unwrap(), &mut state).unwrap();
         assert!(state.logged_in);
         assert_eq!(state.guilds.len(), 4);
-        assert_eq!(state.dm_channels.len(), 4);
+        assert_eq!(state.dm_channels.len(), 5);
+        assert_eq!(state.message_requests().len(), 1);
         let (Some(guild_id), channel_id) = state.connected_voice_channel.clone().unwrap() else { panic!("not in a server call") };
         assert_eq!(state.members_in_voice_channel(&guild_id, &channel_id).len(), 5);
         let general = state.selected_channel.clone().unwrap();

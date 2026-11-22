@@ -337,6 +337,35 @@ static UPLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u
 pub(crate) static VOICE_MEDIA_STATE: std::sync::Mutex<Option<rustcord_client::voice_gateway::VoiceMediaState>> = std::sync::Mutex::new(None);
 static ACTIVE_STREAM_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static WATCH_STREAM_KEY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static OWN_STREAM_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static WATCHED_STREAM_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static VOICE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn stream_task_slot(publish: bool) -> &'static std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> {
+    if publish { &OWN_STREAM_TASK } else { &WATCHED_STREAM_TASK }
+}
+
+fn stop_stream_task(publish: bool) {
+    if let Some(task) = stream_task_slot(publish).lock().unwrap().take() {
+        task.abort();
+    }
+}
+
+fn send_gateway(frame: serde_json::Value) {
+    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+        let _ = tx.send(frame.to_string());
+    }
+}
+
+fn stop_watching(stream_key: &str) {
+    let mut watched = WATCH_STREAM_KEY.lock().unwrap();
+    if watched.as_deref() == Some(stream_key) {
+        *watched = None;
+        stop_stream_task(false);
+    }
+    drop(watched);
+    send_gateway(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }));
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilters {
@@ -456,6 +485,10 @@ pub enum UiCommand {
     CreateGuild { name: String },
     RequestGuildMembers { guild_id: String },
     KickMember { guild_id: String, user_id: String, reason: Option<String> },
+    ModifyVoiceMember { guild_id: String, user_id: String, change: rustcord_client::rest::VoiceMemberChange },
+    LeaveGuild { guild_id: String },
+    SetFriendNickname { user_id: String, nickname: Option<String> },
+    AnswerMessageRequest { channel_id: String, accept: bool },
     BanMember { guild_id: String, user_id: String, reason: Option<String>, delete_message_seconds: u32 },
     SetPresence { status: String, custom_status: Option<String> },
     SetManualActivity { name: String, details: String, state: String },
@@ -642,6 +675,7 @@ pub fn spawn(
                                 let _ = event_tx.send(BackendEvent::GuildChannelsLoaded { guild_id: guild_id.clone(), channels });
                                 if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                                     let _ = tx.send(rustcord_client::member_list::subscription_frame(&guild_id, None));
+                                    let _ = tx.send(rustcord_client::gateway::channel_info_request_frame(&guild_id));
                                 }
                             }
                             Err(e) => {
@@ -1100,7 +1134,6 @@ pub fn spawn(
                                 notification.image_path(&path.to_string_lossy());
                             }
                             crate::show_notification(&notification);
-                            rustcord_client::voice_audio::play_notification_sound();
                         })
                         .await;
                     });
@@ -1359,6 +1392,35 @@ pub fn spawn(
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                         let frame = rustcord_client::gateway::request_guild_members_frame(&guild_id);
                         let _ = tx.send(frame);
+                    }
+                }
+                UiCommand::ModifyVoiceMember { guild_id, user_id, change } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.modify_member_voice(&guild_id, &user_id, change).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to change their voice: {e}")));
+                        }
+                    }
+                }
+                UiCommand::LeaveGuild { guild_id } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.leave_guild(&guild_id).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to leave the server: {e}")));
+                        }
+                    }
+                }
+                UiCommand::SetFriendNickname { user_id, nickname } => {
+                    if let Some(client) = &rest {
+                        if let Err(e) = client.set_friend_nickname(&user_id, nickname.as_deref()).await {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to set the friend nickname: {e}")));
+                        }
+                    }
+                }
+                UiCommand::AnswerMessageRequest { channel_id, accept } => {
+                    if let Some(client) = &rest {
+                        let result = if accept { client.accept_message_request(&channel_id).await } else { client.ignore_message_request(&channel_id).await };
+                        if let Err(e) = result {
+                            let _ = event_tx.send(BackendEvent::Error(format!("failed to answer the message request: {e}")));
+                        }
                     }
                 }
                 UiCommand::KickMember { guild_id, user_id, reason } => {
@@ -1787,14 +1849,19 @@ pub fn spawn(
                     if let Some(state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
                         state.screen_sharing.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
+                    if let Some(stream_key) = WATCH_STREAM_KEY.lock().unwrap().clone() {
+                        stop_watching(&stream_key);
+                    }
+                    if let Some(stream_key) = ACTIVE_STREAM_KEY.lock().unwrap().take() {
+                        send_gateway(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }));
+                    }
+                    stop_stream_task(true);
                     if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
                         let frame = rustcord_client::gateway::voice_state_update_frame(guild_id.as_deref(), None, false, false, false);
                         let _ = tx.send(frame);
-                        if let Some(stream_key) = ACTIVE_STREAM_KEY.lock().unwrap().take() {
-                            let _ = tx.send(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }).to_string());
-                        }
                     }
                     *VOICE_MEDIA_STATE.lock().unwrap() = None;
+                    VOICE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = event_tx.send(BackendEvent::VoiceDisconnected);
                 }
                 UiCommand::SetVoiceMuteDeaf { guild_id, channel_id, self_mute, self_deaf } => {
@@ -1890,18 +1957,16 @@ pub fn spawn(
                     });
                 }
                 UiCommand::WatchStream { stream_key } => {
-                    *WATCH_STREAM_KEY.lock().unwrap() = Some(stream_key.clone());
-                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                        let _ = tx.send(serde_json::json!({ "op": 20, "d": { "stream_key": stream_key } }).to_string());
+                    let previous = WATCH_STREAM_KEY.lock().unwrap().clone();
+                    if let Some(previous) = previous.filter(|previous| *previous != stream_key) {
+                        stop_watching(&previous);
                     }
+                    stop_stream_task(false);
+                    *WATCH_STREAM_KEY.lock().unwrap() = Some(stream_key.clone());
+                    send_gateway(serde_json::json!({ "op": 20, "d": { "stream_key": stream_key } }));
                 }
                 UiCommand::StopWatchingStream { stream_key } => {
-                    if WATCH_STREAM_KEY.lock().unwrap().as_deref() == Some(stream_key.as_str()) {
-                        *WATCH_STREAM_KEY.lock().unwrap() = None;
-                    }
-                    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                        let _ = tx.send(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }).to_string());
-                    }
+                    stop_watching(&stream_key);
                 }
                 UiCommand::SetMicProcessing { gain, denoise } => {
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
@@ -1920,6 +1985,7 @@ pub fn spawn(
                     }
                 }
                 UiCommand::SetVoiceOutputDevice { device } => {
+                    rustcord_client::sounds::set_output_device(device.clone());
                     if let Some(media_state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
                         *media_state.output_device.lock().unwrap() = device;
                     }
@@ -1982,7 +2048,6 @@ fn try_spawn_stream_gateway(
     pending: &mut StreamPending,
     session_id: &Option<String>,
     user_id: &Option<String>,
-    stream_task: &mut Option<tokio::task::JoinHandle<()>>,
     forward_tx: &mpsc::UnboundedSender<BackendEvent>,
     publish_stream: bool,
 ) {
@@ -2005,9 +2070,7 @@ fn try_spawn_stream_gateway(
         media_state.screen_sharing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
     tracing::info!(publish_stream, "starting screen share RTC gateway");
-    if let Some(task) = stream_task.take() {
-        task.abort();
-    }
+    stop_stream_task(publish_stream);
     *pending = StreamPending::default();
 
     let gateway = rustcord_client::voice_gateway::VoiceGateway::new(
@@ -2069,12 +2132,17 @@ fn try_spawn_stream_gateway(
             }
         }
     });
-        let _ = stream_key;
-    *stream_task = Some(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(error) = gateway.run(event_tx, outgoing_rx).await {
             tracing::warn!("screen stream voice gateway exited: {error}");
         }
-    }));
+    });
+    let watched_elsewhere = !publish_stream && WATCH_STREAM_KEY.lock().unwrap().as_deref() != Some(stream_key.as_str());
+    if watched_elsewhere {
+        task.abort();
+    } else {
+        *stream_task_slot(publish_stream).lock().unwrap() = Some(task);
+    }
 }
 
 fn try_spawn_voice_gateway(
@@ -2114,16 +2182,18 @@ fn try_spawn_voice_gateway(
     let (vg_tx, mut vg_rx) = mpsc::unbounded_channel();
     let (_vg_out_tx, vg_out_rx) = mpsc::unbounded_channel();
     let forward_tx = forward_tx.clone();
+    let generation = VOICE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let current = move || VOICE_GENERATION.load(std::sync::atomic::Ordering::Relaxed) == generation;
     tokio::spawn(async move {
         while let Some(ev) = vg_rx.recv().await {
             use rustcord_client::voice_gateway::VoiceGatewayEvent;
             match ev {
                 VoiceGatewayEvent::Connecting => {}
                 VoiceGatewayEvent::Ready => {}
-                VoiceGatewayEvent::MediaConnected => {
+                VoiceGatewayEvent::MediaConnected if current() => {
                     let _ = forward_tx.send(BackendEvent::VoiceConnected);
                 }
-                VoiceGatewayEvent::Disconnected { .. } => {
+                VoiceGatewayEvent::Disconnected { .. } if current() => {
                     let _ = forward_tx.send(BackendEvent::VoiceDisconnected);
                 }
                 VoiceGatewayEvent::ScreenShareStopped => {
@@ -2438,8 +2508,8 @@ async fn start_session(
         let mut my_user_id: Option<String> = None;
         let mut my_session_id: Option<String> = None;
         let mut pending_session: Option<VoicePending> = None;
-        let mut stream_pending = StreamPending::default();
-        let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut own_pending = StreamPending::default();
+        let mut watched_pending = StreamPending::default();
         while let Some(ev) = gw_rx.recv().await {
             match &ev {
                 GatewayEvent::Ready { user, .. } => {
@@ -2471,11 +2541,12 @@ async fn start_session(
                     } else {
                         my_session_id = None;
                         pending_session = None;
-                        stream_pending = StreamPending::default();
-                        if let Some(task) = stream_task.take() {
-                            task.abort();
-                        }
+                        own_pending = StreamPending::default();
+                        watched_pending = StreamPending::default();
+                        stop_stream_task(true);
+                        stop_stream_task(false);
                         *ACTIVE_STREAM_KEY.lock().unwrap() = None;
+                        *WATCH_STREAM_KEY.lock().unwrap() = None;
                     }
                 }
                 GatewayEvent::VoiceServerUpdate { token: voice_server_token, guild_id, endpoint } => {
@@ -2487,58 +2558,70 @@ async fn start_session(
                 }
                 GatewayEvent::StreamCreate { stream_key, rtc_server_id, rtc_channel_id } => {
                     let is_ours = my_user_id.as_ref().is_some_and(|id| stream_key.rsplit(':').next() == Some(id.as_str()));
-                    tracing::info!(is_ours, stream_key_present = !stream_key.is_empty(), rtc_ids_present = !rtc_server_id.is_empty() && !rtc_channel_id.is_empty(), "handling screen share announcement");
+                    let is_watched = WATCH_STREAM_KEY.lock().unwrap().as_deref() == Some(stream_key.as_str());
+                    tracing::info!(is_ours, is_watched, rtc_ids_present = !rtc_server_id.is_empty() && !rtc_channel_id.is_empty(), "handling screen share announcement");
+                    if is_ours || is_watched {
+                        let pending = if is_ours { &mut own_pending } else { &mut watched_pending };
+                        if pending.stream_key.as_deref() != Some(stream_key.as_str()) {
+                            *pending = StreamPending::default();
+                        }
+                        pending.stream_key = Some(stream_key.clone());
+                        pending.rtc_server_id = Some(rtc_server_id.clone());
+                        pending.rtc_channel_id = Some(rtc_channel_id.clone());
+                    }
                     if is_ours {
-                        stream_pending.stream_key = Some(stream_key.clone());
-                        stream_pending.rtc_server_id = Some(rtc_server_id.clone());
-                        stream_pending.rtc_channel_id = Some(rtc_channel_id.clone());
                         *ACTIVE_STREAM_KEY.lock().unwrap() = Some(stream_key.clone());
                         let sharing = VOICE_MEDIA_STATE.lock().unwrap().as_ref()
                             .is_some_and(|state| state.screen_sharing.load(std::sync::atomic::Ordering::Relaxed));
                         if sharing {
-                            try_spawn_stream_gateway(&mut stream_pending, &my_session_id, &my_user_id, &mut stream_task, &forward_tx, true);
-                        } else if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
-                            let _ = tx.send(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }).to_string());
+                            send_gateway(serde_json::json!({ "op": 22, "d": { "stream_key": stream_key, "paused": false } }));
+                            try_spawn_stream_gateway(&mut own_pending, &my_session_id, &my_user_id, &forward_tx, true);
+                        } else {
+                            send_gateway(serde_json::json!({ "op": 19, "d": { "stream_key": stream_key } }));
                         }
-                    } else if WATCH_STREAM_KEY.lock().unwrap().as_deref() == Some(stream_key.as_str()) {
-                        stream_pending.stream_key = Some(stream_key.clone());
-                        stream_pending.rtc_server_id = Some(rtc_server_id.clone());
-                        stream_pending.rtc_channel_id = Some(rtc_channel_id.clone());
-                        try_spawn_stream_gateway(&mut stream_pending, &my_session_id, &my_user_id, &mut stream_task, &forward_tx, false);
+                    } else if is_watched {
+                        try_spawn_stream_gateway(&mut watched_pending, &my_session_id, &my_user_id, &forward_tx, false);
                     }
                 }
                 GatewayEvent::StreamServerUpdate { stream_key, token, endpoint } => {
-                    let matches_stream = stream_pending.stream_key.as_deref().is_none_or(|key| key == stream_key);
                     let is_ours = my_user_id.as_ref().is_some_and(|id| stream_key.rsplit(':').next() == Some(id.as_str()));
                     let is_watched = WATCH_STREAM_KEY.lock().unwrap().as_deref() == Some(stream_key.as_str());
-                    tracing::info!(matches_stream, is_ours, is_watched, has_endpoint = endpoint.is_some(), "handling screen share server update");
-                    if matches_stream && (is_ours || is_watched) {
-                        stream_pending.stream_key = Some(stream_key.clone());
-                        stream_pending.token = Some(token.clone());
-                        stream_pending.endpoint = endpoint.clone();
+                    tracing::info!(is_ours, is_watched, has_endpoint = endpoint.is_some(), "handling screen share server update");
+                    if is_ours || is_watched {
+                        let pending = if is_ours { &mut own_pending } else { &mut watched_pending };
+                        if pending.stream_key.as_deref().is_some_and(|key| key != stream_key) {
+                            *pending = StreamPending::default();
+                        }
+                        pending.stream_key = Some(stream_key.clone());
+                        pending.token = Some(token.clone());
+                        pending.endpoint = endpoint.clone();
                         if endpoint.is_some() {
-                            try_spawn_stream_gateway(&mut stream_pending, &my_session_id, &my_user_id, &mut stream_task, &forward_tx, is_ours);
-                        } else if let Some(task) = stream_task.take() {
-                            task.abort();
+                            try_spawn_stream_gateway(pending, &my_session_id, &my_user_id, &forward_tx, is_ours);
+                        } else {
+                            stop_stream_task(is_ours);
                         }
                     }
                 }
-                GatewayEvent::StreamDelete { stream_key } => {
+                GatewayEvent::StreamDelete { stream_key, reason } => {
                     let own_stream = my_user_id.as_ref().is_some_and(|id| stream_key.rsplit(':').next() == Some(id.as_str()));
-                    let watched_stream = WATCH_STREAM_KEY.lock().unwrap().as_deref() == Some(stream_key.as_str());
-                    if own_stream || stream_pending.stream_key.as_deref() == Some(stream_key.as_str())
-                        || ACTIVE_STREAM_KEY.lock().unwrap().as_deref() == Some(stream_key.as_str()) || watched_stream
-                    {
-                        stream_pending = StreamPending::default();
+                    tracing::info!(own_stream, reason = reason.as_deref().unwrap_or("none"), "screen share ended");
+                    if own_stream {
+                        own_pending = StreamPending::default();
                         *ACTIVE_STREAM_KEY.lock().unwrap() = None;
-                        if let Some(task) = stream_task.take() {
-                            task.abort();
+                        stop_stream_task(true);
+                        let was_sharing = VOICE_MEDIA_STATE.lock().unwrap().as_ref()
+                            .is_some_and(|state| state.screen_sharing.swap(false, std::sync::atomic::Ordering::Relaxed));
+                        if was_sharing {
+                            let _ = forward_tx.send(BackendEvent::ScreenShareStopped);
                         }
-                        if watched_stream {
-                            *WATCH_STREAM_KEY.lock().unwrap() = None;
+                    } else {
+                        if watched_pending.stream_key.as_deref() == Some(stream_key.as_str()) {
+                            watched_pending = StreamPending::default();
                         }
-                        if let Some(state) = VOICE_MEDIA_STATE.lock().unwrap().as_ref() {
-                            state.screen_sharing.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let mut watched = WATCH_STREAM_KEY.lock().unwrap();
+                        if watched.as_deref() == Some(stream_key.as_str()) {
+                            *watched = None;
+                            stop_stream_task(false);
                         }
                     }
                 }

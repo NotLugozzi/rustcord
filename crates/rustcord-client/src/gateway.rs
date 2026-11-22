@@ -32,7 +32,8 @@ pub enum GatewayEvent {
     VoiceServerUpdate { token: String, guild_id: String, endpoint: Option<String> },
     StreamCreate { stream_key: String, rtc_server_id: String, rtc_channel_id: String },
     StreamServerUpdate { stream_key: String, token: String, endpoint: Option<String> },
-    StreamDelete { stream_key: String },
+    StreamDelete { stream_key: String, reason: Option<String> },
+    StreamUpdate { stream_key: String, viewer_ids: Vec<String> },
     InitialVoiceStates(Vec<VoiceState>),
     GuildCreate { guild_id: String, roles: Vec<Role>, member_roles: Vec<(String, Vec<String>)> },
     GuildMembersChunk { guild_id: String, members: Vec<GuildMember>, presences: Vec<Presence> },
@@ -67,6 +68,10 @@ pub enum GatewayEvent {
     ThreadMembersUpdate { thread_id: String, guild_id: String, member_count: Option<u32>, added: Vec<String>, removed: Vec<String> },
     RelationshipAdd(Relationship),
     RelationshipRemove { user_id: String },
+    RelationshipNickname { user_id: String, nickname: Option<String> },
+    VoiceChannelInfo { guild_id: String, channels: Vec<VoiceChannelInfo> },
+    VoiceChannelStart { channel_id: String, started: Option<u64> },
+    VoiceChannelStatus { channel_id: String, status: Option<String> },
     Unknown { op_name: String, raw: Value },
 }
 
@@ -493,6 +498,10 @@ impl Gateway {
                 | "GUILD_STICKERS_UPDATE"
                 | "USER_GUILD_SETTINGS_UPDATE"
                 | "RELATIONSHIP_ADD"
+                | "RELATIONSHIP_UPDATE"
+                | "CHANNEL_INFO"
+                | "VOICE_CHANNEL_START_TIME_UPDATE"
+                | "VOICE_CHANNEL_STATUS_UPDATE"
                 | "RELATIONSHIP_REMOVE"),
             ) => match parse_entity_dispatch(name, &data) {
                 Some(event) => event,
@@ -664,6 +673,11 @@ impl Gateway {
             },
             Some("STREAM_DELETE") => GatewayEvent::StreamDelete {
                 stream_key: data["stream_key"].as_str().unwrap_or_default().to_string(),
+                reason: data["reason"].as_str().map(str::to_string),
+            },
+            Some("STREAM_UPDATE") => GatewayEvent::StreamUpdate {
+                stream_key: data["stream_key"].as_str().unwrap_or_default().to_string(),
+                viewer_ids: data["viewer_ids"].as_array().map(|ids| ids.iter().filter_map(|id| id.as_str().map(str::to_string)).collect()).unwrap_or_default(),
             },
             Some(other) => {
                 if other.starts_with("STREAM_") {
@@ -730,8 +744,41 @@ fn parse_entity_dispatch(name: &str, data: &Value) -> Option<GatewayEvent> {
         "USER_GUILD_SETTINGS_UPDATE" => serde_json::from_value(data.clone()).ok().map(|s| GatewayEvent::GuildSettings(vec![s])),
         "RELATIONSHIP_ADD" => serde_json::from_value(data.clone()).ok().map(GatewayEvent::RelationshipAdd),
         "RELATIONSHIP_REMOVE" => Some(GatewayEvent::RelationshipRemove { user_id: text("id")? }),
+        "CHANNEL_INFO" => Some(GatewayEvent::VoiceChannelInfo {
+            guild_id: guild_id()?,
+            channels: data["channels"].as_array().into_iter().flatten().filter_map(|channel| {
+                Some(VoiceChannelInfo {
+                    channel_id: channel["id"].as_str()?.to_string(),
+                    started: voice_start_time(&channel["voice_start_time"]),
+                    status: channel["status"].as_str().filter(|s| !s.trim().is_empty()).map(str::to_string),
+                })
+            }).collect(),
+        }),
+        "VOICE_CHANNEL_START_TIME_UPDATE" => Some(GatewayEvent::VoiceChannelStart { channel_id: text("id")?, started: voice_start_time(&data["voice_start_time"]) }),
+        "VOICE_CHANNEL_STATUS_UPDATE" => Some(GatewayEvent::VoiceChannelStatus { channel_id: text("id")?, status: text("status").filter(|s| !s.trim().is_empty()) }),
+        "RELATIONSHIP_UPDATE" => Some(GatewayEvent::RelationshipNickname { user_id: text("id")?, nickname: text("nickname").filter(|n| !n.is_empty()) }),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceChannelInfo {
+    pub channel_id: String,
+    pub started: Option<u64>,
+    pub status: Option<String>,
+}
+
+fn voice_start_time(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(seconds) => seconds.as_u64(),
+        Value::String(text) => text.parse().ok().or_else(|| chrono::DateTime::parse_from_rfc3339(text).ok().and_then(|t| u64::try_from(t.timestamp()).ok())),
+        _ => None,
+    }
+    .filter(|seconds| *seconds > 0)
+}
+
+pub fn channel_info_request_frame(guild_id: &str) -> String {
+    json!({ "op": 43, "d": { "guild_id": guild_id, "fields": ["status", "voice_start_time"] } }).to_string()
 }
 
 fn parse_initial_voice_states(guilds: Option<&Value>) -> Vec<VoiceState> {
@@ -1001,6 +1048,33 @@ mod tests {
         assert!(matches!(
             parse_entity_dispatch("RELATIONSHIP_REMOVE", &json!({ "id": "1", "type": 1 })),
             Some(GatewayEvent::RelationshipRemove { user_id }) if user_id == "1"
+        ));
+        assert!(matches!(
+            parse_entity_dispatch("RELATIONSHIP_UPDATE", &json!({ "id": "1", "type": 1, "nickname": "bestie" })),
+            Some(GatewayEvent::RelationshipNickname { user_id, nickname: Some(nick) }) if user_id == "1" && nick == "bestie"
+        ));
+        assert!(matches!(
+            parse_entity_dispatch("RELATIONSHIP_UPDATE", &json!({ "id": "1", "type": 1, "nickname": null })),
+            Some(GatewayEvent::RelationshipNickname { nickname: None, .. })
+        ));
+    }
+
+    #[test]
+    fn voice_channel_start_times_read_seconds_or_iso_and_null_ends_the_call() {
+        let info = json!({ "guild_id": "g", "channels": [
+            { "id": "1", "voice_start_time": 1_767_225_600, "status": "ranked grind" },
+            { "id": "2", "voice_start_time": "2026-01-01T00:10:00+00:00", "status": "" },
+            { "id": "3" },
+        ]});
+        let Some(GatewayEvent::VoiceChannelInfo { guild_id, channels }) = parse_entity_dispatch("CHANNEL_INFO", &info) else { panic!("no channel info") };
+        assert_eq!(guild_id, "g");
+        assert_eq!(channels[0], VoiceChannelInfo { channel_id: "1".into(), started: Some(1_767_225_600), status: Some("ranked grind".into()) });
+        assert_eq!(channels[1].started, Some(1_767_226_200));
+        assert_eq!(channels[1].status, None);
+        assert_eq!(channels[2].started, None);
+        assert!(matches!(
+            parse_entity_dispatch("VOICE_CHANNEL_START_TIME_UPDATE", &json!({ "id": "1", "guild_id": "g", "voice_start_time": null })),
+            Some(GatewayEvent::VoiceChannelStart { started: None, .. })
         ));
     }
 

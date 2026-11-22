@@ -24,6 +24,7 @@ pub mod screen_audio;
 pub mod screen_decode;
 #[cfg(feature = "screenshare")]
 pub mod screen_encode;
+pub mod sounds;
 pub mod games;
 pub mod gateway;
 pub mod voice_audio;

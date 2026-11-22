@@ -704,7 +704,8 @@ impl ApplicationHandler for App {
         let cadence = continuous_redraw_interval(active, animating || typing, uploading);
         let since_draw = window.last_redraw.elapsed();
         let due = cadence.is_some_and(|interval| since_draw >= interval);
-        if self.needs_redraw || due || !self.event_rx.is_empty() {
+        let timer_tick = since_draw >= Duration::from_secs(1) && self.state.shows_call_timer();
+        if self.needs_redraw || due || timer_tick || !self.event_rx.is_empty() {
             window.window.request_redraw();
             self.needs_redraw = false;
         }

@@ -464,6 +464,34 @@ impl RestClient {
         self.send_empty(|| self.http.delete(format!("{API_BASE}/users/@me/relationships/{user_id}"))).await
     }
 
+    pub async fn set_friend_nickname(&self, user_id: &str, nickname: Option<&str>) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "nickname": nickname });
+        self.send_empty(|| self.http.patch(format!("{API_BASE}/users/@me/relationships/{user_id}")).json(&body)).await
+    }
+
+    pub async fn accept_message_request(&self, channel_id: &str) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "consent_status": 2 });
+        self.send_empty(|| self.http.put(format!("{API_BASE}/channels/{channel_id}/recipients/@me")).json(&body)).await
+    }
+
+    pub async fn ignore_message_request(&self, channel_id: &str) -> Result<(), ClientError> {
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/channels/{channel_id}/recipients/@me"))).await
+    }
+
+    pub async fn leave_guild(&self, guild_id: &str) -> Result<(), ClientError> {
+        let body = serde_json::json!({ "lurking": false });
+        self.send_empty(|| self.http.delete(format!("{API_BASE}/users/@me/guilds/{guild_id}")).json(&body)).await
+    }
+
+    pub async fn modify_member_voice(&self, guild_id: &str, user_id: &str, change: VoiceMemberChange) -> Result<(), ClientError> {
+        let body = match change {
+            VoiceMemberChange::Mute(mute) => serde_json::json!({ "mute": mute }),
+            VoiceMemberChange::Deafen(deaf) => serde_json::json!({ "deaf": deaf }),
+            VoiceMemberChange::Move(channel_id) => serde_json::json!({ "channel_id": channel_id }),
+        };
+        self.send_empty(|| self.http.patch(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}")).json(&body)).await
+    }
+
     pub async fn kick_member(&self, guild_id: &str, user_id: &str, reason: Option<&str>) -> Result<(), ClientError> {
         self.send_empty(|| with_reason(self.http.delete(format!("{API_BASE}/guilds/{guild_id}/members/{user_id}")), reason)).await
     }
@@ -1009,6 +1037,13 @@ pub struct StickerDetails {
     pub name: String,
     pub description: String,
     pub tags: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceMemberChange {
+    Mute(bool),
+    Deafen(bool),
+    Move(Option<String>),
 }
 
 fn with_reason(request: reqwest::RequestBuilder, reason: Option<&str>) -> reqwest::RequestBuilder {

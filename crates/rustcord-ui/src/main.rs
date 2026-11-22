@@ -30,6 +30,7 @@ mod ui;
 mod video;
 #[cfg(feature = "video")]
 mod video_audio;
+mod zoom;
 
 use app_state::AppState;
 use backend::{BackendEvent, UiCommand};
@@ -72,6 +73,7 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<BackendEvent>();
+    let demo_events = event_tx.clone();
     backend::spawn(&rt, cmd_rx, event_tx);
 
     let saved_settings = settings::load();
@@ -102,9 +104,15 @@ fn main() {
         self_deafened: saved_settings.self_deaf,
         close_to_tray: saved_settings.close_to_tray.unwrap_or(true),
         share_game: saved_settings.share_game.unwrap_or(true),
+        sound_volume: saved_settings.sound_volume.unwrap_or(1.0),
+        call_sounds: saved_settings.call_sounds.unwrap_or(true),
+        stream_sounds: saved_settings.stream_sounds.unwrap_or(true),
+        message_sounds: saved_settings.message_sounds.unwrap_or(true),
         ..Default::default()
     };
     presence::set_game_sharing(state.share_game);
+    rustcord_client::sounds::set_volume(state.sound_volume);
+    rustcord_client::sounds::set_output_device(state.selected_output_device.clone());
     theme::Theme::install_bundled();
     if let Some(dir) = theme::Theme::themes_dir() {
         let selected_file = saved_settings.theme_file.unwrap_or_else(|| "discord-dark.toml".into());
@@ -117,10 +125,26 @@ fn main() {
     }
 
     if let Some(source) = demo {
-        if let Err(error) = demo::load(&source).and_then(|data| demo::apply(data, &mut state)) {
-            eprintln!("demo mode: {error}");
-            std::process::exit(1);
+        let feeds = match demo::load(&source).and_then(|data| demo::apply(data, &mut state)) {
+            Ok(feeds) => feeds,
+            Err(error) => {
+                eprintln!("demo mode: {error}");
+                std::process::exit(1);
+            }
+        };
+        #[cfg(feature = "screenshare")]
+        if !feeds.is_empty() {
+            std::thread::spawn(move || loop {
+                for feed in &feeds {
+                    if demo_events.send(BackendEvent::RemoteVideoFrame { user_id: feed.key.clone(), rgba: feed.frame.clone() }).is_err() {
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            });
         }
+        #[cfg(not(feature = "screenshare"))]
+        let _ = (feeds, demo_events);
         renderer::run(state, cmd_tx, event_rx, rt.handle().clone());
         return;
     }
@@ -147,11 +171,17 @@ fn main() {
 }
 
 fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
-    if !state.notifications_enabled || !state.should_notify(message, chrono::Utc::now()) {
+    if !state.should_notify(message, chrono::Utc::now()) {
         return;
     }
     let watching = state.window_focused && state.selected_channel.as_deref() == Some(message.channel_id.as_str());
     if watching {
+        return;
+    }
+    if state.message_sounds {
+        rustcord_client::sounds::play(if state.mentions_me(message) { rustcord_client::sounds::Sound::Mention } else { rustcord_client::sounds::Sound::Message });
+    }
+    if !state.notifications_enabled {
         return;
     }
     let title = message.author.global_name.clone().unwrap_or_else(|| message.author.username.clone());
@@ -388,6 +418,38 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::RelationshipRemove { user_id }) => {
                 state.remove_relationship(&user_id);
             }
+            BackendEvent::Gateway(GatewayEvent::VoiceChannelInfo { guild_id, channels }) => {
+                let voice_ids: Vec<String> = state.guild_channels.get(&guild_id).into_iter().flatten().map(|c| c.id.clone()).collect();
+                for id in &voice_ids {
+                    state.voice_started.remove(id);
+                    state.voice_status.remove(id);
+                }
+                for channel in channels {
+                    if let Some(started) = channel.started {
+                        state.voice_started.insert(channel.channel_id.clone(), started);
+                    }
+                    if let Some(status) = channel.status {
+                        state.voice_status.insert(channel.channel_id, status);
+                    }
+                }
+            }
+            BackendEvent::Gateway(GatewayEvent::VoiceChannelStart { channel_id, started }) => {
+                match started {
+                    Some(started) => state.voice_started.insert(channel_id, started),
+                    None => state.voice_started.remove(&channel_id),
+                };
+            }
+            BackendEvent::Gateway(GatewayEvent::VoiceChannelStatus { channel_id, status }) => {
+                match status {
+                    Some(status) => state.voice_status.insert(channel_id, status),
+                    None => state.voice_status.remove(&channel_id),
+                };
+            }
+            BackendEvent::Gateway(GatewayEvent::RelationshipNickname { user_id, nickname }) => {
+                if let Some(relationship) = state.relationships.iter_mut().find(|r| r.user.id == user_id) {
+                    relationship.nickname = nickname;
+                }
+            }
             BackendEvent::Gateway(GatewayEvent::TypingStart { channel_id, user_id }) => {
                 state.note_typing(channel_id, user_id);
             }
@@ -413,11 +475,16 @@ pub fn drain_backend_events(
                 state.clear_reactions(&channel_id, &message_id);
             }
             BackendEvent::Gateway(GatewayEvent::VoiceStateUpdate(voice_state)) => {
-                state.ding_for_voice_state(&voice_state);
+                for sound in state.voice_state_sounds(&voice_state) {
+                    rustcord_client::sounds::play(sound);
+                }
                 if state.current_user.as_ref().is_some_and(|u| u.id == voice_state.user_id) {
                     let new_channel = voice_state.channel_id.clone().map(|cid| (voice_state.guild_id.clone(), cid));
                     if new_channel != state.connected_voice_channel {
                         state.voice_joined_at = new_channel.is_some().then(std::time::Instant::now);
+                        if new_channel.is_none() && state.sounded_voice_channel.take().is_some() && state.call_sounds {
+                            rustcord_client::sounds::play(rustcord_client::sounds::Sound::Leave);
+                        }
                     }
                     state.connected_voice_channel = new_channel;
                     if let Some(cid) = &voice_state.channel_id {
@@ -439,15 +506,28 @@ pub fn drain_backend_events(
                 }
             }
             BackendEvent::Gateway(GatewayEvent::StreamServerUpdate { .. }) => {}
-            BackendEvent::Gateway(GatewayEvent::StreamDelete { stream_key }) => {
+            BackendEvent::Gateway(GatewayEvent::StreamUpdate { stream_key, viewer_ids }) => {
+                for sound in state.viewer_sounds(&stream_key, &viewer_ids) {
+                    rustcord_client::sounds::play(sound);
+                }
+                state.stream_viewers.insert(stream_key, viewer_ids);
+            }
+            BackendEvent::Gateway(GatewayEvent::StreamDelete { stream_key, reason }) => {
+                state.stream_viewers.remove(&stream_key);
                 let left_only_this_view = state.unwatching_stream.as_deref() == Some(stream_key.as_str());
                 if left_only_this_view {
                     state.unwatching_stream = None;
+                } else if matches!(reason.as_deref(), Some("stream_full" | "unauthorized")) {
+                    state.status_message = Some(match reason.as_deref() {
+                        Some("stream_full") => "That stream is full.".into(),
+                        _ => "You aren't allowed to watch that stream.".into(),
+                    });
                 } else {
                     state.active_streams.retain(|_, key| key != &stream_key);
                 }
                 if state.watching_stream.as_deref() == Some(stream_key.as_str()) {
                     state.watching_stream = None;
+                    state.watching_since = None;
                     state.screen_share_stats = Default::default();
                     state.screen_share_history.clear();
                 }
@@ -479,7 +559,6 @@ pub fn drain_backend_events(
                             if state.notifications_enabled {
                                 std::thread::spawn(|| {
                                     crate::show_notification(&notify_rust::Notification::new().summary("Incoming call"));
-                                    rustcord_client::voice_audio::play_notification_sound();
                                 });
                             }
                             state.incoming_calls.push(channel_id);
@@ -495,11 +574,21 @@ pub fn drain_backend_events(
             }
             BackendEvent::VoiceConnected => {
                 state.voice_connecting = false;
+                let channel = state.connected_voice_channel.as_ref().map(|(_, channel_id)| channel_id.clone());
+                if channel.is_some() && channel != state.sounded_voice_channel {
+                    if state.call_sounds {
+                        rustcord_client::sounds::play(rustcord_client::sounds::Sound::Join);
+                    }
+                    state.sounded_voice_channel = channel;
+                }
                 state.screen_sharing = false;
                 state.camera_on = false;
             }
             BackendEvent::VoiceDisconnected => {
                 state.voice_connecting = false;
+                if state.sounded_voice_channel.take().is_some() && state.call_sounds {
+                    rustcord_client::sounds::play(rustcord_client::sounds::Sound::Leave);
+                }
                 state.screen_sharing = false;
                 state.camera_on = false;
                 state.connected_voice_channel = None;
