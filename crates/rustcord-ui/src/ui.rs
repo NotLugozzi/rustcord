@@ -1521,7 +1521,7 @@ fn draw_rail_items(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCom
         lit_ink: [1.0, 1.0, 1.0, 1.0],
         pill: false,
     };
-    if rail_tile(ui, textures, &state.theme, "add_server_button", RAIL_ICON_SIZE, add_look, false, false) {
+    if rail_tile(ui, textures, &state.theme, "add_server_button", RAIL_ICON_SIZE, add_look, false, false) || std::mem::take(&mut state.open_join_server) {
         ui.open_popup("add_server_popup");
     }
     if ui.is_item_hovered() {
@@ -5265,6 +5265,7 @@ fn draw_user_bar(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiComma
         ] {
             if ui.selectable_config(label).selected(state.my_status == st).build() {
                 state.my_status = st;
+                state.refresh_own_presence();
                 let custom = Some(state.custom_status_input.clone());
                 let _ = cmd_tx.send(UiCommand::SetPresence { status: key.into(), custom_status: custom });
             }
@@ -6623,6 +6624,28 @@ fn draw_highlighted_label(ui: &Ui, theme: &crate::theme::Theme, label: &str, hit
         run.push(ch);
     }
     flush(&mut run, run_is_hit, &mut first);
+}
+
+pub fn open_link(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, link: crate::links::Link) {
+    use crate::links::Link;
+    state.show_settings = false;
+    match link {
+        Link::Guild { guild_id } => apply_switcher_target(state, cmd_tx, crate::switcher::Target::Guild { guild_id }),
+        Link::Channel { guild_id, channel_id, message_id } => {
+            let target = match guild_id {
+                Some(guild_id) => crate::switcher::Target::Channel { guild_id, channel_id: channel_id.clone() },
+                None => crate::switcher::Target::Dm { channel_id: channel_id.clone() },
+            };
+            apply_switcher_target(state, cmd_tx, target);
+            if let Some(message_id) = message_id {
+                let _ = cmd_tx.send(UiCommand::JumpToMessage { channel_id, message_id });
+            }
+        }
+        Link::Invite { code } => {
+            state.join_invite_input = code;
+            state.open_join_server = true;
+        }
+    }
 }
 
 fn apply_switcher_target(state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>, target: crate::switcher::Target) {
@@ -8799,13 +8822,19 @@ fn draw_settings_dialog(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<
                     SettingsCategory::VoiceVideo => draw_settings_voice(ui, state, cmd_tx),
                     SettingsCategory::Keybinds => draw_settings_keybinds(ui, state),
                     SettingsCategory::Appearance => draw_settings_appearance(ui, state),
-                    SettingsCategory::About => draw_settings_about(ui, state, textures),
+                    SettingsCategory::Luna => draw_settings_luna(ui, state),
+                    SettingsCategory::About => draw_settings_about(ui, state, textures, cmd_tx),
                 }
             });
         });
     if logged_out {
         let theme = state.theme.clone();
-        *state = AppState { theme, ..Default::default() };
+        let luna = std::mem::take(&mut state.luna);
+        let luna_client = state.luna_client.take();
+        let luna_plugins = std::mem::take(&mut state.luna_plugins);
+        let luna_enabled = state.luna_enabled;
+        let update_channel = state.update_channel;
+        *state = AppState { theme, luna, luna_client, luna_plugins, luna_enabled, update_channel, ..Default::default() };
     }
 }
 
@@ -9585,6 +9614,219 @@ fn draw_settings_account(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender
     false
 }
 
+fn luna_send(state: &mut AppState, request: crate::luna::LunaRequest) {
+    let sent = state.luna_client.as_ref().is_some_and(|client| client.send(request));
+    if !sent {
+        state.luna.last_action = Some(crate::luna::ActionOutcome { ok: false, message: "Luna isn't responding. Try again in a moment.".into() });
+    }
+}
+
+fn luna_remember(state: &mut AppState, id: &rustcord_plugins::PluginId, enabled: bool) {
+    state.luna_plugins.retain(|wanted| wanted != id.as_str());
+    if enabled {
+        state.luna_plugins.push(id.to_string());
+    }
+    persist_settings(state);
+}
+
+fn luna_error_parts(error: &rustcord_plugins::PluginError) -> (String, String, Option<String>) {
+    match error {
+        rustcord_plugins::PluginError::Script(script) => {
+            let location = match (script.source(), script.line()) {
+                (Some(source), Some(line)) => Some(format!("{source}:{line}")),
+                (Some(source), None) => Some(source.to_string()),
+                _ => None,
+            };
+            (format!("{} in {}", error.category().label(), script.phase()), script.message().to_string(), location)
+        }
+        other => (other.category().label().to_string(), other.to_string(), None),
+    }
+}
+
+fn draw_settings_luna(ui: &Ui, state: &mut AppState) {
+    use crate::luna::{ApiStatus, LunaRequest, PluginStatus};
+    let muted = state.theme.text_muted;
+    let good = state.theme.call_active();
+    let bad = state.theme.danger();
+
+    ui.text_colored(muted, "General");
+    let mut enabled = state.luna_enabled;
+    if ui.checkbox("Enable Luna plugins", &mut enabled) {
+        state.luna_enabled = enabled;
+        persist_settings(state);
+        luna_send(state, LunaRequest::SetRuntimeEnabled(enabled));
+    }
+    let installed = state.luna.plugins.len();
+    let runtime = if !state.luna.available || state.luna_client.is_none() {
+        ("Unavailable: there is no folder for plugin data", bad)
+    } else if state.luna.runtime_enabled {
+        ("Running", good)
+    } else {
+        ("Off", muted)
+    };
+    ui.text("Runtime:");
+    ui.same_line();
+    ui.text_colored(runtime.1, runtime.0);
+    ui.text(format!("Installed plugins: {installed}, {} enabled", state.luna.enabled_count()));
+    match state.luna.plugins_dir.clone() {
+        Some(dir) => {
+            ui.text_colored(muted, format!("Plugins folder: {}", dir.display()));
+            if ui.button("Open plugins folder") {
+                if let Err(error) = open::that(&dir) {
+                    state.luna.last_action = Some(crate::luna::ActionOutcome { ok: false, message: format!("Could not open the folder: {error}") });
+                }
+            }
+            ui.same_line();
+        }
+        None => ui.text_colored(muted, "Plugins folder: none on this system"),
+    }
+    if ui.button("Rescan##luna") {
+        luna_send(state, LunaRequest::Rescan);
+    }
+    if let Some(error) = &state.luna.scan_error {
+        ui.text_colored(bad, format!("Could not read the plugins folder: {error}"));
+    }
+    if let Some(action) = &state.luna.last_action {
+        let wrap = ui.push_text_wrap_pos_with_pos(0.0);
+        ui.text_colored(if action.ok { good } else { bad }, &action.message);
+        wrap.end();
+    }
+
+    ui.dummy([0.0, 12.0]);
+    ui.text_colored(muted, format!("Installed plugins ({installed})"));
+    if installed == 0 {
+        ui.text_colored(muted, "No plugins yet. Put a plugin's folder, with its manifest.json, in the plugins folder and press Rescan.");
+    }
+    let runtime_on = state.luna.runtime_enabled;
+    let plugins = state.luna.plugins.clone();
+    for plugin in &plugins {
+        let _id = ui.push_id(plugin.directory.to_string_lossy().as_ref());
+        ui.separator();
+        ui.text(&plugin.name);
+        if let Some(version) = &plugin.version {
+            ui.same_line();
+            ui.text_colored(muted, version);
+        }
+        ui.same_line();
+        let status_color = match plugin.status {
+            PluginStatus::Enabled => good,
+            PluginStatus::Failed(_) => bad,
+            _ => muted,
+        };
+        ui.text_colored(status_color, format!("· {}", plugin.status.label()));
+        let identity = plugin.id.as_ref().map_or_else(|| plugin.directory.display().to_string(), ToString::to_string);
+        let api = match &plugin.api {
+            ApiStatus::Compatible(version) => (format!("API {version}, compatible"), muted),
+            ApiStatus::Unsupported(version) => (format!("Needs API {version}, which this version of Rustcord doesn't support"), bad),
+            ApiStatus::Invalid(error) => (error.clone(), bad),
+        };
+        ui.text_colored(muted, &identity);
+        ui.same_line();
+        ui.text_colored(api.1, format!("· {}", api.0));
+        if let Some(description) = &plugin.description {
+            let wrap = ui.push_text_wrap_pos_with_pos(0.0);
+            ui.text(description);
+            wrap.end();
+        }
+        if let (Some(id), ApiStatus::Compatible(_)) = (&plugin.id, &plugin.api) {
+            match plugin.status {
+                PluginStatus::Enabled => {
+                    if ui.button("Disable") {
+                        luna_remember(state, id, false);
+                        luna_send(state, LunaRequest::Disable(id.clone()));
+                    }
+                }
+                _ => {
+                    let disabled = ui.begin_disabled(!runtime_on);
+                    let label = if matches!(plugin.status, PluginStatus::Failed(_)) { "Try again" } else { "Enable" };
+                    if ui.button(label) {
+                        luna_remember(state, id, true);
+                        luna_send(state, LunaRequest::Enable(id.clone()));
+                    }
+                    disabled.end();
+                    if !runtime_on && ui.is_item_hovered_with_flags(imgui::ItemHoveredFlags::ALLOW_WHEN_DISABLED) {
+                        ui.tooltip_text("Turn Luna on to enable plugins");
+                    }
+                    ui.same_line();
+                    if matches!(plugin.status, PluginStatus::NotLoaded) {
+                        if ui.button("Load") {
+                            luna_send(state, LunaRequest::Load(plugin.directory.clone()));
+                        }
+                    } else if ui.button("Unload") {
+                        luna_remember(state, id, false);
+                        luna_send(state, LunaRequest::Unload(id.clone()));
+                    }
+                }
+            }
+            ui.same_line();
+        }
+        let open = state.luna_details.contains(&plugin.directory);
+        if ui.button(if open { "Hide details" } else { "Details" }) {
+            if open {
+                state.luna_details.remove(&plugin.directory);
+            } else {
+                state.luna_details.insert(plugin.directory.clone());
+            }
+        }
+        if open {
+            ui.indent();
+            ui.text_colored(muted, format!("Folder: {}", plugin.directory.display()));
+            let events = if plugin.subscriptions.is_empty() { "none".to_string() } else { plugin.subscriptions.join(", ") };
+            ui.text_colored(muted, format!("Listening for: {events}"));
+            if let PluginStatus::Failed(error) = &plugin.status {
+                let (category, message, location) = luna_error_parts(error);
+                ui.text_colored(bad, &category);
+                let wrap = ui.push_text_wrap_pos_with_pos(0.0);
+                ui.text(&message);
+                wrap.end();
+                if let Some(location) = location {
+                    ui.text_colored(muted, format!("At {location}"));
+                }
+            }
+            ui.unindent();
+        }
+    }
+
+    ui.dummy([0.0, 12.0]);
+    ui.text_colored(muted, format!("Recent errors ({})", state.luna.errors.len()));
+    ui.same_line();
+    if ui.small_button("Clear##luna_diagnostics") {
+        luna_send(state, LunaRequest::ClearDiagnostics);
+    }
+    ui.child_window("luna_errors").size([0.0, 150.0]).border(true).build(|| {
+        if state.luna.errors.is_empty() {
+            ui.text_colored(muted, "No errors.");
+        }
+        let wrap = ui.push_text_wrap_pos_with_pos(0.0);
+        for line in state.luna.errors.iter().rev() {
+            let (category, message, location) = luna_error_parts(&line.error);
+            ui.text_colored(muted, format!("{} {}", line.at.format("%H:%M:%S"), line.plugin_id));
+            ui.same_line();
+            ui.text_colored(bad, &category);
+            let at = location.map(|location| format!(" ({location})")).unwrap_or_default();
+            ui.text(format!("{message}{at}"));
+        }
+        wrap.end();
+    });
+    ui.dummy([0.0, 6.0]);
+    ui.text_colored(muted, format!("Plugin logs ({})", state.luna.logs.len()));
+    ui.child_window("luna_logs").size([0.0, 180.0]).border(true).build(|| {
+        if state.luna.logs.is_empty() {
+            ui.text_colored(muted, "Nothing logged yet.");
+        }
+        let wrap = ui.push_text_wrap_pos_with_pos(0.0);
+        for line in &state.luna.logs {
+            ui.text_colored(muted, format!("{} {}", line.at.format("%H:%M:%S"), line.plugin_id));
+            ui.same_line();
+            ui.text(&line.message);
+        }
+        wrap.end();
+        if ui.scroll_y() >= ui.scroll_max_y() - 4.0 {
+            ui.set_scroll_here_y_with_ratio(1.0);
+        }
+    });
+}
+
 fn draw_settings_notifications(ui: &Ui, state: &mut AppState) {
     ui.checkbox("Desktop notifications for DMs and mentions", &mut state.notifications_enabled);
     ui.dummy([0.0, 8.0]);
@@ -9837,7 +10079,94 @@ fn draw_settings_keybinds(ui: &Ui, state: &mut AppState) {
     }
 }
 
-fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache) {
+fn draw_about_updates(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    use crate::updates::{Channel, Outcome};
+    ui.dummy([0.0, 10.0]);
+    ui.separator();
+    ui.dummy([0.0, 6.0]);
+    ui.text("Updates");
+    ui.text_disabled("Ask GitHub now and then whether a newer rustcord is out. Nothing is downloaded or installed for you.");
+    ui.set_next_item_width(300.0);
+    if let Some(_combo) = ui.begin_combo("##update_channel", state.update_channel.label()) {
+        for channel in Channel::ALL {
+            if ui.selectable_config(channel.label()).selected(state.update_channel == channel).build() && state.update_channel != channel {
+                state.update_channel = channel;
+                state.update_check = None;
+                state.update_checking = channel != Channel::Off;
+                persist_settings(state);
+                let _ = cmd_tx.send(UiCommand::SetUpdateChannel(channel));
+            }
+        }
+    }
+    if state.update_channel == Channel::Off {
+        return;
+    }
+    ui.same_line();
+    let busy = ui.begin_disabled(state.update_checking);
+    if ui.button("Check now") {
+        state.update_checking = true;
+        let _ = cmd_tx.send(UiCommand::CheckForUpdates(state.update_channel));
+    }
+    busy.end();
+    if state.update_checking {
+        ui.text_disabled("Checking...");
+        return;
+    }
+    let Some(check) = state.update_check.clone() else { return };
+    let when = check.at.format("%H:%M");
+    match check.outcome {
+        Outcome::UpToDate { latest } => {
+            ui.text_colored(state.theme.call_active(), format!("You're up to date. Latest is {latest}, checked at {when}."));
+        }
+        Outcome::Available { latest, behind_by, url } => {
+            let behind = behind_by.map(|count| format!(", {count} commits ahead of yours")).unwrap_or_default();
+            ui.text_colored(state.theme.accent, format!("{latest} is available{behind}."));
+            let label = if check.channel == Channel::Builds { "Open the build on GitHub" } else { "Open the release page" };
+            if ui.button(label) {
+                let _ = open::that(&url);
+            }
+            if check.channel == Channel::Builds {
+                ui.same_line();
+                ui.text_disabled("Downloading build artifacts needs a GitHub account.");
+            }
+        }
+        Outcome::Failed(error) => {
+            ui.text_colored(state.theme.danger(), format!("Couldn't check at {when}: {error}"));
+        }
+    }
+}
+
+fn draw_about_links(ui: &Ui, state: &mut AppState, cmd_tx: &UnboundedSender<UiCommand>) {
+    if !crate::desktop::CAN_HANDLE_LINKS {
+        return;
+    }
+    if !state.link_handler_queried {
+        state.link_handler_queried = true;
+        let _ = cmd_tx.send(UiCommand::CheckLinkHandler);
+    }
+    ui.dummy([0.0, 10.0]);
+    ui.separator();
+    ui.dummy([0.0, 6.0]);
+    ui.text("Discord links");
+    ui.text_disabled("discord:// links from your browser and other apps can open here, in the window that's already running.");
+    match &state.link_handler {
+        None => ui.text_disabled("Checking which app opens them..."),
+        Some((true, _)) => ui.text_colored(state.theme.call_active(), "rustcord opens discord:// links."),
+        Some((false, current)) => {
+            let current = current.as_deref().unwrap_or("nothing");
+            ui.text(format!("They currently open with: {current}"));
+            if ui.button("Open discord:// links with rustcord") {
+                state.link_handler = None;
+                let _ = cmd_tx.send(UiCommand::RegisterLinkHandler);
+            }
+        }
+    }
+    if let Some(error) = &state.link_handler_error {
+        ui.text_colored(state.theme.danger(), format!("Couldn't set that up: {error}"));
+    }
+}
+
+fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache, cmd_tx: &UnboundedSender<UiCommand>) {
     use crate::build_info;
 
     const LOGO_SIZE: f32 = 44.0;
@@ -9908,6 +10237,9 @@ fn draw_settings_about(ui: &Ui, state: &mut AppState, textures: &TextureCache) {
     if ui.small_button("Copy##copy_properties") {
         crate::clipboard::write_text(&properties);
     }
+
+    draw_about_updates(ui, state, cmd_tx);
+    draw_about_links(ui, state, cmd_tx);
 
     ui.dummy([0.0, 10.0]);
     ui.separator();

@@ -17,16 +17,19 @@ section = "net"
 priority = "optional"
 assets = [
     ["../../target/release/rustcord", "usr/bin/", "755"],
+    ["rustcord.desktop", "usr/share/applications/", "644"],
 ]
 
 [package.metadata.generate-rpm]
 name = "rustcord"
 assets = [
     { source = "../../target/release/rustcord", dest = "/usr/bin/rustcord", mode = "755" },
+    { source = "rustcord.desktop", dest = "/usr/share/applications/rustcord.desktop", mode = "644" },
 ]
 
 [dependencies]
 rustcord-client = { path = "../rustcord-client" }
+rustcord-plugins = { path = "../rustcord-plugins" }
 emojis = "0.9"
 imgui = { version = "0.12", features = ["tables-api"] }
 imgui-winit-support = "0.13"

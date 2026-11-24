@@ -3,5 +3,6 @@
   "name": "Hello World",
   "version": "1.0.0",
   "api_version": 1,
+  "description": "Greets you when Rustcord starts and counts how many times it has.",
   "entry": "main.lua"
 }

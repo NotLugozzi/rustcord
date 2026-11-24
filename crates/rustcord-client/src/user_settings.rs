@@ -1,6 +1,7 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
+const STATUS: u64 = 11;
 const GUILD_FOLDERS: u64 = 14;
 const FOLDERS: u64 = 1;
 const GUILD_POSITIONS: u64 = 2;
@@ -101,6 +102,38 @@ fn wrapped_string(wrapper: &[u8]) -> Option<String> {
         Field::Bytes(text) if number == 1 => Some(String::from_utf8_lossy(text).into_owned()),
         _ => None,
     })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusSettings {
+    pub status: Option<String>,
+    pub custom_text: Option<String>,
+    pub custom_expires_at_ms: Option<u64>,
+}
+
+pub fn status_settings(encoded: &str) -> Option<StatusSettings> {
+    let data = STANDARD.decode(encoded.trim()).ok()?;
+    let status = fields(&data).find_map(|(number, field)| match field {
+        Field::Bytes(bytes) if number == STATUS => Some(bytes),
+        _ => None,
+    })?;
+    let mut settings = StatusSettings::default();
+    for (number, field) in fields(status) {
+        match (number, field) {
+            (1, Field::Bytes(wrapper)) => settings.status = wrapped_string(wrapper).filter(|status| !status.is_empty()),
+            (2, Field::Bytes(custom)) => {
+                for (number, field) in fields(custom) {
+                    match (number, field) {
+                        (1, Field::Bytes(text)) => settings.custom_text = Some(String::from_utf8_lossy(text).into_owned()).filter(|text| !text.trim().is_empty()),
+                        (4, Field::Fixed64(expires)) if expires > 0 => settings.custom_expires_at_ms = Some(expires),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(settings)
 }
 
 pub fn server_rail(encoded: &str) -> Option<Vec<RailEntry>> {
@@ -207,6 +240,45 @@ pub fn new_folder_id() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return out;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    fn bytes_field(number: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = varint(number << 3 | BYTES);
+        out.extend(varint(payload.len() as u64));
+        out.extend(payload);
+        out
+    }
+
+    #[test]
+    fn status_settings_read_the_status_and_custom_status() {
+        let status = bytes_field(1, &bytes_field(1, b"dnd"));
+        let mut custom = bytes_field(1, b"shipping rustcord");
+        custom.extend(varint(4 << 3 | FIXED64));
+        custom.extend(1_900_000_000_000u64.to_le_bytes());
+        let mut settings = status.clone();
+        settings.extend(bytes_field(2, &custom));
+        let mut proto = bytes_field(GUILD_FOLDERS, &[]);
+        proto.extend(bytes_field(STATUS, &settings));
+        let parsed = status_settings(&STANDARD.encode(&proto)).unwrap();
+        assert_eq!(parsed.status.as_deref(), Some("dnd"));
+        assert_eq!(parsed.custom_text.as_deref(), Some("shipping rustcord"));
+        assert_eq!(parsed.custom_expires_at_ms, Some(1_900_000_000_000));
+        assert_eq!(status_settings(&STANDARD.encode(bytes_field(GUILD_FOLDERS, &[]))), None);
+        let bare = status_settings(&STANDARD.encode(bytes_field(STATUS, &status))).unwrap();
+        assert_eq!(bare.custom_text, None);
+    }
+
     use super::*;
 
     fn sample() -> Vec<RailEntry> {

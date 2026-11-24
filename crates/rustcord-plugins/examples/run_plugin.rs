@@ -1,5 +1,6 @@
-use rustcord_plugins::PluginManager;
+use rustcord_plugins::{ApplicationEvent, PluginManager};
 use std::path::PathBuf;
+use std::time::Duration;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let plugin_dir = std::env::args()
@@ -13,18 +14,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut manager = PluginManager::new(storage_dir);
     let plugin_id = manager.load(&plugin_dir)?;
     manager.enable(&plugin_id)?;
-    while manager.state(&plugin_id)? == rustcord_plugins::PluginState::Enabled {
-        for (failed_id, error) in manager.poll()? {
-            return Err(
-                std::io::Error::other(format!("plugin {failed_id} failed: {error}")).into(),
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    manager.dispatch(ApplicationEvent::Started);
+    std::thread::sleep(Duration::from_millis(100));
+    manager.dispatch(ApplicationEvent::Shutdown);
+    let failures = manager.shutdown(Duration::from_secs(2));
     for log in manager.take_logs() {
-        println!("[{}] {}", log.plugin_id, log.message);
+        println!("[{}] {}", log.plugin_id(), log.message());
     }
-    manager.disable(&plugin_id)?;
+    for (failed_id, error) in &failures {
+        eprintln!(
+            "plugin {failed_id} failed ({}): {error}",
+            error.category().label()
+        );
+    }
     manager.unload(&plugin_id)?;
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("a plugin reported errors").into())
+    }
 }

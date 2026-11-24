@@ -7020,7 +7020,6 @@ dependencies = [
  "mlua",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -7048,6 +7047,7 @@ dependencies = [
  "resvg",
  "rfd",
  "rustcord-client",
+ "rustcord-plugins",
  "serde",
  "serde_json",
  "tokio",

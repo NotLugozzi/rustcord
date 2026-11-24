@@ -128,7 +128,7 @@ pub fn set_enabled(conn_id: u64, enabled: bool) {
 }
 
 pub fn publish(event_tx: &UnboundedSender<BackendEvent>) {
-    let (frame, infos) = with(|s| {
+    let frame = with(|s| {
         let activities = gather(s);
         let status = if s.status.is_empty() { "online" } else { &s.status };
         let infos = s
@@ -143,11 +143,14 @@ pub fn publish(event_tx: &UnboundedSender<BackendEvent>) {
                 image_url: a.image_url.clone(),
             })
             .collect::<Vec<_>>();
-        (rustcord_client::gateway::presence_frame(status, &activities), infos)
+        let frame = (!s.status.is_empty()).then(|| rustcord_client::gateway::presence_frame(status, &activities));
+        (frame, activities, infos)
     });
-    if let Some(tx) = GATEWAY_TX.lock().unwrap().as_ref() {
+    let (frame, activities, infos) = (frame.0, frame.1, frame.2);
+    if let (Some(frame), Some(tx)) = (frame, GATEWAY_TX.lock().unwrap().as_ref()) {
         let _ = tx.send(frame);
     }
+    let _ = event_tx.send(BackendEvent::OwnActivities(activities));
     let _ = event_tx.send(BackendEvent::RpcApps(infos));
 }
 

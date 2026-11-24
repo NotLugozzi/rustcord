@@ -1,6 +1,6 @@
 use crate::error::ClientError;
 use crate::identity::{ClientIdentity, GatewayProperties};
-use crate::models::{Channel, Emoji, Guild, GuildSettings, Sticker, GuildMember, MergedPresences, Message, Presence, ReactionEmoji, Relationship, Role, User, VoiceState};
+use crate::models::{Activity, Channel, Emoji, Guild, GuildSettings, Sticker, GuildMember, MergedPresences, Message, Presence, PresenceStatus, ReactionEmoji, Relationship, Role, User, VoiceState};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -58,6 +58,7 @@ pub enum GatewayEvent {
     ConnectedAccounts(Vec<crate::spotify::ConnectedAccount>),
     ConnectionsChanged,
     UserSettingsProto(String),
+    OwnSessions(SessionPresence),
     MemberListUpdate(crate::member_list::MemberListUpdate),
     CommandIndexStale { guild_id: Option<String> },
     InteractionCreated { id: String, nonce: String },
@@ -441,8 +442,19 @@ impl Gateway {
                 if !read_state.is_empty() {
                     let _ = tx.send(GatewayEvent::ReadState(read_state));
                 }
-                GatewayEvent::Ready { user, guilds, friend_presences }
+                let ready = GatewayEvent::Ready { user, guilds, friend_presences };
+                match own_sessions(data.get("sessions")) {
+                    Some(sessions) => {
+                        let _ = tx.send(ready);
+                        GatewayEvent::OwnSessions(sessions)
+                    }
+                    None => ready,
+                }
             }
+            Some("SESSIONS_REPLACE") => match own_sessions(Some(&data)) {
+                Some(sessions) => GatewayEvent::OwnSessions(sessions),
+                None => return Ok(()),
+            },
             Some("RESUMED") => GatewayEvent::Resumed,
             Some("READY_SUPPLEMENTAL") => {
                 let mut presences = parse_presence_list(data.get("presences"));
@@ -920,6 +932,41 @@ fn parse_merged_presences(value: &Value) -> Vec<Presence> {
     parse_presence_list(value.get("friends"))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SessionPresence {
+    pub status: Option<PresenceStatus>,
+    pub activities: Vec<Activity>,
+}
+
+fn own_sessions(value: Option<&Value>) -> Option<SessionPresence> {
+    let sessions = value?.as_array()?;
+    let parse = |session: &Value| -> (Option<PresenceStatus>, Vec<Activity>) {
+        let status = serde_json::from_value(session["status"].clone()).ok();
+        let activities = session["activities"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|activity| serde_json::from_value::<Activity>(activity.clone()).ok())
+            .collect();
+        (status, activities)
+    };
+    if let Some(all) = sessions.iter().find(|session| session["session_id"].as_str() == Some("all")) {
+        let (status, activities) = parse(all);
+        return Some(SessionPresence { status, activities });
+    }
+    let mut merged = SessionPresence::default();
+    for session in sessions {
+        let (status, activities) = parse(session);
+        merged.status = merged.status.or(status);
+        for activity in activities {
+            if !merged.activities.iter().any(|known| known.kind == activity.kind && known.name == activity.name) {
+                merged.activities.push(activity);
+            }
+        }
+    }
+    Some(merged)
+}
+
 fn deduplicate_presences(presences: &mut Vec<Presence>) {
     let mut seen = std::collections::HashSet::new();
     presences.retain(|presence| seen.insert(presence.user.id.clone()));
@@ -927,6 +974,26 @@ fn deduplicate_presences(presences: &mut Vec<Presence>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn own_sessions_prefer_the_combined_session_and_otherwise_merge() {
+        let combined = json!([
+            { "session_id": "abc", "status": "online", "activities": [{ "type": 0, "name": "Celeste" }] },
+            { "session_id": "all", "status": "dnd", "activities": [{ "type": 0, "name": "Celeste" }, { "type": 2, "name": "Spotify" }] }
+        ]);
+        let own = own_sessions(Some(&combined)).unwrap();
+        assert_eq!(own.status, Some(PresenceStatus::Dnd));
+        assert_eq!(own.activities.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Celeste", "Spotify"]);
+        let separate = json!([
+            { "session_id": "a", "status": "idle", "activities": [{ "type": 0, "name": "Celeste" }] },
+            { "session_id": "b", "status": "online", "activities": [{ "type": 0, "name": "Celeste" }, { "type": 0, "name": "osu!" }] }
+        ]);
+        let own = own_sessions(Some(&separate)).unwrap();
+        assert_eq!(own.status, Some(PresenceStatus::Idle));
+        assert_eq!(own.activities.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["Celeste", "osu!"]);
+        assert!(own_sessions(Some(&json!({ "not": "a list" }))).is_none());
+        assert!(own_sessions(None).is_none());
+    }
+
     use super::*;
 
     #[test]
