@@ -20,6 +20,9 @@ pub struct Settings {
     pub call_sounds: Option<bool>,
     pub stream_sounds: Option<bool>,
     pub message_sounds: Option<bool>,
+    pub luna_enabled: Option<bool>,
+    pub luna_plugins: Vec<String>,
+    pub update_channel: Option<String>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RustCord
+GenericName=Discord Client
+Comment=A native Discord client
+Exec=rustcord %u
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+MimeType=x-scheme-handler/discord;
+StartupWMClass=rustcord

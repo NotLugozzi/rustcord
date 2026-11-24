@@ -39,17 +39,19 @@ pub enum SettingsCategory {
     VoiceVideo,
     Keybinds,
     Appearance,
+    Luna,
     About,
 }
 
 impl SettingsCategory {
-    pub const ALL: [SettingsCategory; 7] = [
+    pub const ALL: [SettingsCategory; 8] = [
         SettingsCategory::Account,
         SettingsCategory::Notifications,
         SettingsCategory::Activity,
         SettingsCategory::VoiceVideo,
         SettingsCategory::Keybinds,
         SettingsCategory::Appearance,
+        SettingsCategory::Luna,
         SettingsCategory::About,
     ];
 
@@ -61,6 +63,7 @@ impl SettingsCategory {
             SettingsCategory::VoiceVideo => "Voice & Video",
             SettingsCategory::Keybinds => "Keybinds",
             SettingsCategory::Appearance => "Appearance",
+            SettingsCategory::Luna => "Luna Plugins",
             SettingsCategory::About => "About",
         }
     }
@@ -541,6 +544,19 @@ pub struct AppState {
     pub focus_compose: bool,
     pub my_status: rustcord_client::models::PresenceStatus,
     pub custom_status_input: String,
+    pub presence_seeded: bool,
+    pub raise_requested: bool,
+    pub pending_link: Option<crate::links::Link>,
+    pub open_join_server: bool,
+    pub update_channel: crate::updates::Channel,
+    pub update_check: Option<crate::updates::Check>,
+    pub update_checking: bool,
+    pub update_announced: Option<String>,
+    pub link_handler: Option<(bool, Option<String>)>,
+    pub link_handler_error: Option<String>,
+    pub link_handler_queried: bool,
+    pub own_local_activities: Vec<rustcord_client::models::Activity>,
+    pub own_session_activities: Vec<rustcord_client::models::Activity>,
     pub guild_channels: HashMap<String, Vec<Channel>>,
     pub guild_roles: HashMap<String, Vec<rustcord_client::models::Role>>,
     pub my_guild_roles: HashMap<String, Vec<String>>,
@@ -730,6 +746,11 @@ pub struct AppState {
     pub message_sounds: bool,
     pub stream_viewers: HashMap<String, Vec<String>>,
     pub sounded_voice_channel: Option<String>,
+    pub luna: crate::luna::LunaSnapshot,
+    pub luna_client: Option<crate::luna::LunaClient>,
+    pub luna_enabled: bool,
+    pub luna_plugins: Vec<String>,
+    pub luna_details: std::collections::HashSet<std::path::PathBuf>,
     pub tray_available: bool,
     pub rail_sync_pending: bool,
     pub member_lists: HashMap<String, rustcord_client::member_list::MemberList>,
@@ -1585,6 +1606,41 @@ impl AppState {
         self.compact_folders();
         self.rail_order.push(RailItem::Guild(guild_id.to_string()));
         self.save_rail();
+    }
+
+    pub fn refresh_own_presence(&mut self) {
+        use rustcord_client::models::{ClientStatus, PartialUser, Presence};
+        let Some(me) = self.current_user.as_ref().map(|user| user.id.clone()) else { return };
+        let mut activities = self.own_local_activities.clone();
+        for activity in &self.own_session_activities {
+            if !activities.iter().any(|known| known.kind == activity.kind && known.name == activity.name) {
+                activities.push(activity.clone());
+            }
+        }
+        activities.sort_by_key(|activity| activity.kind != 4);
+        let client_status = ClientStatus { desktop: Some(self.my_status), ..Default::default() };
+        self.presences.insert(me.clone(), Presence { user: PartialUser { id: me }, status: self.my_status, client_status, activities });
+    }
+
+    pub fn apply_status_settings(&mut self, settings: Option<rustcord_client::user_settings::StatusSettings>, now_ms: u64) -> Option<(String, Option<String>)> {
+        use rustcord_client::models::PresenceStatus;
+        let settings = match settings {
+            Some(settings) => settings,
+            None if !self.presence_seeded => Default::default(),
+            None => return None,
+        };
+        let key = settings.status.unwrap_or_else(|| "online".into());
+        self.my_status = match key.as_str() {
+            "idle" => PresenceStatus::Idle,
+            "dnd" => PresenceStatus::Dnd,
+            "invisible" => PresenceStatus::Invisible,
+            _ => PresenceStatus::Online,
+        };
+        let custom = settings.custom_text.filter(|_| settings.custom_expires_at_ms.is_none_or(|expires| expires > now_ms));
+        self.custom_status_input = custom.clone().unwrap_or_default();
+        self.presence_seeded = true;
+        self.refresh_own_presence();
+        Some((key, custom))
     }
 
     pub fn activity_for(&self, user_id: &str) -> Option<String> {
@@ -3123,6 +3179,9 @@ impl AppState {
             call_sounds: Some(self.call_sounds),
             stream_sounds: Some(self.stream_sounds),
             message_sounds: Some(self.message_sounds),
+            luna_enabled: Some(self.luna_enabled),
+            luna_plugins: self.luna_plugins.clone(),
+            update_channel: Some(self.update_channel.key().to_string()),
             ..Default::default()
         }
     }
@@ -3726,6 +3785,36 @@ mod tests {
         state.voice_joined_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
         state.apply_voice_state(voice("2", Some("vc"), false));
         state
+    }
+
+    #[test]
+    fn your_own_presence_merges_this_client_with_your_other_sessions() {
+        let mut state = notifying_state();
+        let me = state.current_user.as_ref().unwrap().id.clone();
+        let activity = |kind: u8, name: &str| -> rustcord_client::models::Activity {
+            serde_json::from_value(serde_json::json!({ "type": kind, "name": name })).unwrap()
+        };
+        state.own_local_activities = vec![activity(0, "Celeste"), activity(4, "Custom Status")];
+        state.own_session_activities = vec![activity(0, "Celeste"), activity(2, "Spotify")];
+        state.refresh_own_presence();
+        let names: Vec<_> = state.presences[&me].activities.iter().map(|a| a.name.clone()).collect();
+        assert_eq!(names, ["Custom Status", "Celeste", "Spotify"]);
+        assert_eq!(state.activity_for(&me).as_deref(), Some(state.presences[&me].activities[1].summary_title().as_str()));
+    }
+
+    #[test]
+    fn saved_status_settings_seed_the_presence_once_and_drop_expired_custom_status() {
+        use rustcord_client::user_settings::StatusSettings;
+        let mut state = notifying_state();
+        let seeded = state.apply_status_settings(None, 0);
+        assert_eq!(seeded, Some(("online".into(), None)));
+        assert_eq!(state.apply_status_settings(None, 0), None);
+        let settings = StatusSettings { status: Some("dnd".into()), custom_text: Some("busy".into()), custom_expires_at_ms: Some(1_000) };
+        assert_eq!(state.apply_status_settings(Some(settings.clone()), 500), Some(("dnd".into(), Some("busy".into()))));
+        assert_eq!(state.my_status, rustcord_client::models::PresenceStatus::Dnd);
+        assert_eq!(state.custom_status_input, "busy");
+        assert_eq!(state.apply_status_settings(Some(settings), 2_000), Some(("dnd".into(), None)));
+        assert!(state.custom_status_input.is_empty());
     }
 
     #[test]

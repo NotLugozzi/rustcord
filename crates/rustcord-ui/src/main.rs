@@ -31,6 +31,11 @@ mod video;
 #[cfg(feature = "video")]
 mod video_audio;
 mod zoom;
+mod luna;
+mod instance;
+mod links;
+mod desktop;
+mod updates;
 
 use app_state::AppState;
 use backend::{BackendEvent, UiCommand};
@@ -71,9 +76,34 @@ fn main() {
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let launch_link = links::from_args(std::env::args());
+    let instance = match demo {
+        Some(_) => None,
+        None => {
+            let message = launch_link.clone().map_or(instance::Message::Show, instance::Message::Open);
+            match instance::claim(&message, rt.handle()) {
+                instance::Claim::Forwarded => {
+                    tracing::info!("rustcord is already running; handed this launch to it");
+                    return;
+                }
+                instance::Claim::Primary(listener) => Some(listener),
+                instance::Claim::Unavailable => None,
+            }
+        }
+    };
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<BackendEvent>();
+    if let Some(listener) = instance {
+        let instance_events = event_tx.clone();
+        listener.serve(rt.handle(), move |message| {
+            let _ = instance_events.send(BackendEvent::Instance(message));
+        });
+    }
+    if let Some(link) = launch_link {
+        let _ = event_tx.send(BackendEvent::Instance(instance::Message::Open(link)));
+    }
     let demo_events = event_tx.clone();
+    let luna_events = event_tx.clone();
     backend::spawn(&rt, cmd_rx, event_tx);
 
     let saved_settings = settings::load();
@@ -108,6 +138,9 @@ fn main() {
         call_sounds: saved_settings.call_sounds.unwrap_or(true),
         stream_sounds: saved_settings.stream_sounds.unwrap_or(true),
         message_sounds: saved_settings.message_sounds.unwrap_or(true),
+        luna_enabled: saved_settings.luna_enabled.unwrap_or(true),
+        luna_plugins: saved_settings.luna_plugins.clone(),
+        update_channel: updates::Channel::from_key(saved_settings.update_channel.as_deref().unwrap_or_default()),
         ..Default::default()
     };
     presence::set_game_sharing(state.share_game);
@@ -123,6 +156,9 @@ fn main() {
             tracing::warn!("saved theme {} could not be loaded; using the default theme", path.display());
         }
     }
+
+    let luna = luna::LunaHost::start(luna::LunaConfig::from_paths(state.luna_enabled, state.luna_plugins.clone()), luna_events);
+    state.luna_client = Some(luna.client());
 
     if let Some(source) = demo {
         let feeds = match demo::load(&source).and_then(|data| demo::apply(data, &mut state)) {
@@ -146,7 +182,13 @@ fn main() {
         #[cfg(not(feature = "screenshare"))]
         let _ = (feeds, demo_events);
         renderer::run(state, cmd_tx, event_rx, rt.handle().clone());
+        luna.shutdown();
         return;
+    }
+
+    if state.update_channel != updates::Channel::Off {
+        state.update_checking = true;
+        let _ = cmd_tx.send(UiCommand::SetUpdateChannel(state.update_channel));
     }
 
     match session_store::load_token() {
@@ -168,6 +210,7 @@ fn main() {
     }
 
     renderer::run(state, cmd_tx, event_rx, rt.handle().clone());
+    luna.shutdown();
 }
 
 fn notify_if_relevant(state: &AppState, message: &rustcord_client::models::Message, cmd_tx: &mpsc::UnboundedSender<UiCommand>) {
@@ -311,7 +354,11 @@ pub fn drain_backend_events(
                 for presence in friend_presences {
                     state.presences.insert(presence.user.id.clone(), presence);
                 }
+                state.refresh_own_presence();
                 let _ = cmd_tx.send(UiCommand::LoadAllGuildEmojis { guild_ids });
+                if let Some(link) = state.pending_link.take() {
+                    ui::open_link(state, cmd_tx, link);
+                }
             }
             BackendEvent::Gateway(GatewayEvent::Presences(presences)) => {
                 for presence in presences {
@@ -454,7 +501,20 @@ pub fn drain_backend_events(
                 state.note_typing(channel_id, user_id);
             }
             BackendEvent::Gateway(GatewayEvent::PresenceUpdate(presence)) => {
-                state.presences.insert(presence.user.id.clone(), presence);
+                if state.current_user.as_ref().is_some_and(|me| me.id == presence.user.id) {
+                    state.own_session_activities = presence.activities;
+                    state.refresh_own_presence();
+                } else {
+                    state.presences.insert(presence.user.id.clone(), presence);
+                }
+            }
+            BackendEvent::Gateway(GatewayEvent::OwnSessions(sessions)) => {
+                state.own_session_activities = sessions.activities;
+                state.refresh_own_presence();
+            }
+            BackendEvent::OwnActivities(activities) => {
+                state.own_local_activities = activities.into_iter().filter_map(|activity| serde_json::from_value(activity).ok()).collect();
+                state.refresh_own_presence();
             }
             BackendEvent::Gateway(GatewayEvent::MessageUpdate { channel_id, id, content, edited_timestamp, call, poll }) => {
                 state.update_message(&channel_id, &id, content, edited_timestamp, call, poll);
@@ -568,6 +628,33 @@ pub fn drain_backend_events(
                     _ => {}
                 }
                 state.sync_ringtone();
+            }
+            BackendEvent::Instance(message) => {
+                state.raise_requested = true;
+                if let instance::Message::Open(link) = message {
+                    match links::parse(&link) {
+                        Some(link) if state.gateway_connected => ui::open_link(state, cmd_tx, link),
+                        Some(link) => state.pending_link = Some(link),
+                        None => state.status_message = Some("That link isn't one rustcord can open.".into()),
+                    }
+                }
+            }
+            BackendEvent::UpdateChecked(check) => {
+                state.update_checking = false;
+                if let updates::Outcome::Available { latest, .. } = &check.outcome {
+                    if state.update_announced.as_ref() != Some(latest) {
+                        state.status_message = Some(format!("A newer rustcord is available: {latest}. See Settings > About."));
+                        state.update_announced = Some(latest.clone());
+                    }
+                }
+                state.update_check = Some(check);
+            }
+            BackendEvent::LinkHandler { ours, current, error } => {
+                state.link_handler = Some((ours, current));
+                state.link_handler_error = error;
+            }
+            BackendEvent::Luna(snapshot) => {
+                state.luna = *snapshot;
             }
             BackendEvent::VoiceConnecting => {
                 state.voice_connecting = true;
@@ -745,6 +832,10 @@ pub fn drain_backend_events(
             BackendEvent::Gateway(GatewayEvent::UserSettingsProto(encoded)) => {
                 if let Some(entries) = rustcord_client::user_settings::server_rail(&encoded) {
                     state.apply_discord_rail(entries);
+                }
+                let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                if let Some((status, custom_status)) = state.apply_status_settings(rustcord_client::user_settings::status_settings(&encoded), now_ms) {
+                    let _ = cmd_tx.send(UiCommand::SyncPresence { status, custom_status });
                 }
             }
             BackendEvent::Gateway(

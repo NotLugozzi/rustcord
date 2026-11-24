@@ -647,6 +647,14 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         rustcord_client::captcha::pump_main_thread();
         let Some(window) = self.window.as_mut() else { return };
+        if std::mem::take(&mut self.state.raise_requested) {
+            window.window.set_visible(true);
+            window.window.set_minimized(false);
+            window.window.focus_window();
+            window.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            self.hidden = false;
+            self.needs_redraw = true;
+        }
         if let Some(tray) = self.tray.as_mut() {
             tray.set_unread(self.state.has_unread_attention());
             while let Some(event) = tray.next_event() {

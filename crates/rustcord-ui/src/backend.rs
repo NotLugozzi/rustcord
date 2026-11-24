@@ -491,6 +491,11 @@ pub enum UiCommand {
     AnswerMessageRequest { channel_id: String, accept: bool },
     BanMember { guild_id: String, user_id: String, reason: Option<String>, delete_message_seconds: u32 },
     SetPresence { status: String, custom_status: Option<String> },
+    SyncPresence { status: String, custom_status: Option<String> },
+    SetUpdateChannel(crate::updates::Channel),
+    CheckForUpdates(crate::updates::Channel),
+    CheckLinkHandler,
+    RegisterLinkHandler,
     SetManualActivity { name: String, details: String, state: String },
     SetRpcEnabled { conn_id: u64, enabled: bool },
     JoinVoiceChannel { guild_id: Option<String>, channel_id: String, ring: bool },
@@ -537,6 +542,8 @@ pub enum InviteFailure {
 }
 
 pub enum BackendEvent {
+    Instance(crate::instance::Message),
+    Luna(Box<crate::luna::LunaSnapshot>),
     MfaRequired { ticket: String },
     CaptchaInProgress,
     LoginFailed(String),
@@ -546,6 +553,9 @@ pub enum BackendEvent {
     QrLoginDone(rustcord_client::remote_auth::Outcome),
     Error(String),
     RpcApps(Vec<crate::presence::RpcAppInfo>),
+    OwnActivities(Vec<serde_json::Value>),
+    UpdateChecked(crate::updates::Check),
+    LinkHandler { ours: bool, current: Option<String>, error: Option<String> },
     ProfileLoaded { user_id: String, profile: rustcord_client::models::UserProfile, user: Option<rustcord_client::models::User> },
     Gateway(GatewayEvent),
     GuildChannelsLoaded { guild_id: String, channels: Vec<rustcord_client::models::Channel> },
@@ -1792,6 +1802,10 @@ pub fn spawn(
                     presence::set_status(&status, custom_status.as_deref());
                     presence::publish(&event_tx);
                 }
+                UiCommand::SyncPresence { status, custom_status } => {
+                    presence::set_status(&status, custom_status.as_deref());
+                    presence::publish(&event_tx);
+                }
                 UiCommand::SetManualActivity { name, details, state } => {
                     let field = |s: String| (!s.is_empty()).then_some(s);
                     let activity = field(name.trim().to_string()).map(|name| {
@@ -1800,6 +1814,31 @@ pub fn spawn(
                     presence::set_manual(activity);
                     presence::publish(&event_tx);
                 }
+                UiCommand::SetUpdateChannel(channel) => {
+                    if let Some(task) = UPDATE_TASK.lock().unwrap().take() {
+                        task.abort();
+                    }
+                    if channel != crate::updates::Channel::Off {
+                        let event_tx = event_tx.clone();
+                        *UPDATE_TASK.lock().unwrap() = Some(tokio::spawn(async move {
+                            let client = reqwest::Client::new();
+                            loop {
+                                let outcome = crate::updates::check(&client, channel).await;
+                                let _ = event_tx.send(BackendEvent::UpdateChecked(crate::updates::Check { channel, outcome, at: chrono::Local::now() }));
+                                tokio::time::sleep(crate::updates::CHECK_EVERY).await;
+                            }
+                        }));
+                    }
+                }
+                UiCommand::CheckForUpdates(channel) => {
+                    let event_tx = event_tx.clone();
+                    tokio::spawn(async move {
+                        let outcome = crate::updates::check(&reqwest::Client::new(), channel).await;
+                        let _ = event_tx.send(BackendEvent::UpdateChecked(crate::updates::Check { channel, outcome, at: chrono::Local::now() }));
+                    });
+                }
+                UiCommand::CheckLinkHandler => report_link_handler(event_tx.clone(), false),
+                UiCommand::RegisterLinkHandler => report_link_handler(event_tx.clone(), true),
                 UiCommand::SetRpcEnabled { conn_id, enabled } => {
                     presence::set_enabled(conn_id, enabled);
                     presence::publish(&event_tx);
@@ -2375,9 +2414,17 @@ fn attempt_login<'a>(
 }
 
 static SPOTIFY_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
+static UPDATE_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
 static GAME_TASK: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> = std::sync::Mutex::new(None);
 const GAME_SCAN_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
 const GAME_LIST_RETRY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+fn report_link_handler(event_tx: mpsc::UnboundedSender<BackendEvent>, register: bool) {
+    tokio::task::spawn_blocking(move || {
+        let error = register.then(crate::desktop::register_link_handler).and_then(Result::err);
+        let _ = event_tx.send(BackendEvent::LinkHandler { ours: crate::desktop::handles_links(), current: crate::desktop::link_handler(), error });
+    });
+}
 
 fn follow_spotify(accounts: Vec<rustcord_client::spotify::ConnectedAccount>, client: RestClient, event_tx: mpsc::UnboundedSender<BackendEvent>) {
     if let Some(task) = SPOTIFY_TASK.lock().unwrap().take() {
